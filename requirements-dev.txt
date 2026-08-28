@@ -1,0 +1,3 @@
+# Dev-only: not installed in either container image (see dashboard/requirements.txt
+# for the actual runtime deps). Needed to run tests/ (pytest, no Docker required).
+pytest>=8.0

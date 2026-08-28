@@ -192,23 +192,36 @@ connection rather than caching a verdict.
 ## Testing notes
 
 This sandbox has no Docker daemon, so `docker compose up --build` itself
-hasn't been run. What *has* been tested, faithfully (using the real
-hardcoded `/opt/parental-proxy` path the container uses, not a `PYTHONPATH`
-substitute):
+hasn't been run. What *has* been tested is a real, runnable suite under
+[`tests/`](tests/README.md) (`pip install pytest && pytest`, no Docker or
+network needed -- see that file for what's covered):
 
 - All three Squid helper scripts (`basic_auth_helper.py`, `sni_helper.py`
-  in all three modes, `authz_helper.py`) driven through simulated Squid
-  protocol input -- correct auth, correct per-user domain/show decisions,
-  correct LAN/authentication fail-closed behavior, correct access logging
-  with dedupe.
+  in all three modes, `authz_helper.py`), including the shared stdin/stdout
+  protocol loop itself -- correct auth, correct per-user domain/show
+  decisions, correct LAN/authentication fail-closed behavior, correct
+  access logging with dedupe.
 - The full dashboard workflow via Flask's test client: admin auth, user
-  CRUD, domain CRUD, per-user domain assignment, and -- specifically -- the
-  click-to-approve flow for both a blocked site and a blocked show,
-  confirmed to actually grant access afterward (not just show a success
-  message).
-- `seed_defaults.py` idempotency (run twice, no duplicates/errors).
-- Squid config template, Dockerfiles, docker-compose.yml, and both shell
-  scripts for syntax validity.
+  CRUD, domain CRUD, per-user domain assignment, the CSRF/cross-origin
+  guard, and -- specifically -- the click-to-approve flow for both a
+  blocked site and a blocked show, confirmed to actually grant access
+  afterward (not just show a success message).
+- `seed_defaults.py` idempotency (run twice, no duplicates/errors), plus
+  regression cases for the `crunchyrollcdn.com` mode bug and the missing
+  `crunchyrollsvc.com` playback host.
+- `common/matching.py` domain-suffix anchoring (including the substring/
+  suffix bypass cases), path matching, and the LAN CIDR check.
+- `common/cr_urls.py` request classification and `common/auth.py` password
+  hashing, including malformed/tampered-input edge cases.
+- `common/cr_api.py` (token refresh/retry-on-401/error handling) and
+  `common/series_resolve.py`'s cache (positive/negative TTL, and the S2.6
+  stale-on-error fallback -- writing this test caught a real bug where the
+  stale entry was being deleted before the fallback could serve it; now
+  fixed, see `docs/review-2026-08-28.md`).
+
+Separately (not part of the `pytest` suite, just a manual syntax check):
+Squid config template, Dockerfiles, docker-compose.yml, and both shell
+scripts for syntax validity.
 
 **Not tested here, and worth doing before relying on this:** an actual
 `docker compose up --build` and a real device going through the full flow

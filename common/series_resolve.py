@@ -59,7 +59,12 @@ def _cache_get(
         return True, None
 
     if expired and not allow_stale:
-        conn.execute("DELETE FROM series_cache WHERE object_id = ?", (object_id,))
+        # Report a miss but leave the row in place -- resolve_series_ids()
+        # checks every id this way *before* ever calling the resolver, so
+        # deleting here would destroy the positive entry the allow_stale
+        # fallback is supposed to serve if that resolver call then fails
+        # (see module docstring / S2.6). A successful re-resolve overwrites
+        # this row anyway via _cache_put's ON CONFLICT UPDATE.
         return False, None
     return True, series_id
 
