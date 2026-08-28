@@ -106,9 +106,23 @@ http_access deny CONNECT !SSL_ports
 # Allow the CONNECT tunnel and TLS peek/bump negotiation for authenticated
 # clients -- the actual allow/deny decision happens in the ssl_bump rules
 # below (splice/bump/terminate) and, for bump-mode domains, in authz_allowed.
+#
+# step1/step2 MUST be qualified with CONNECT here, not left bare. Squid's
+# at_step state for a connection does not reset once ssl_bump reaches step2
+# -- the first decrypted HTTP request that follows a bump decision is *also*
+# evaluated with step2 still true. A bare `http_access allow step2` therefore
+# grants that real, decrypted request unconditional access via this rule,
+# before authz_allowed is ever reached -- completely bypassing per-domain,
+# per-path, and per-show enforcement for every bump-mode request (Crunchyroll
+# included). Confirmed against a real Squid instance: an unapproved show's
+# page loaded successfully with a bare `allow step2`, and was correctly
+# denied once qualified with CONNECT (see docs/review-2026-08-28.md). The
+# decrypted inner request's method is GET/POST/etc., never CONNECT, so
+# qualifying these rules with CONNECT confines them to the tunnel/negotiation
+# phase exactly as intended, leaving authz_allowed as the real gate.
 http_access allow CONNECT
-http_access allow step1
-http_access allow step2
+http_access allow CONNECT step1
+http_access allow CONNECT step2
 
 # Final decision for fully-decrypted (bump-mode) requests.
 http_access allow authz_allowed

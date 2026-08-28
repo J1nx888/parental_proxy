@@ -1,18 +1,24 @@
-"""Regression test for a real bug found running against a live Squid
-instance (2026-08-28 smoke test): every external_acl_type FORMAT string in
-squid.conf.template was missing an explicit %DATA macro. Squid always
-appends %DATA to an external_acl_type FORMAT unless it's already present
-(documented Squid behavior) -- so every helper was actually receiving one
-more field on the wire than its registered field_count expected, making
-every single line "malformed" and rejected as ERR. In practice this meant
-the entire SNI/authz decision layer never worked at all: every real request
-fell through to squid.conf's `ssl_bump terminate step2 all` catch-all.
+"""Regression tests for two real bugs found running against a live Squid
+instance (2026-08-28 smoke test), both in proxy/squid.conf.template.
+Neither is the kind of thing a pure Python unit test of the helper *logic*
+can catch -- both are about Squid's own ACL/protocol semantics -- so these
+tests check the config's text/structure directly instead.
 
-This test parses squid.conf.template's actual FORMAT lines and cross-checks
-them against the field_count each helper's main() registers with
-squid_helper.run(), so a future edit to either side alone (adding a %macro
-to the config without updating the helper, or vice versa) fails loudly here
-instead of silently breaking every request against a real Squid.
+1. Every external_acl_type FORMAT string was missing an explicit %DATA
+   macro. Squid always appends %DATA to an external_acl_type FORMAT unless
+   it's already present (documented Squid behavior), so every helper was
+   receiving one more field on the wire than its registered field_count
+   expected -- every line was rejected as malformed, and every real request
+   fell through to `ssl_bump terminate step2 all`. Fails closed (nothing
+   loads) but the entire SNI/authz decision layer never worked at all.
+
+2. `http_access allow step1`/`step2`, left bare, also grants access to the
+   real *decrypted* HTTP request that follows a bump decision -- Squid's
+   at_step state doesn't reset after step2 is reached. This bypassed
+   authz_allowed entirely for every bump-mode request (any Crunchyroll show,
+   approved or not) -- fails OPEN, the more serious direction. Fixed by
+   qualifying both with CONNECT, which only matches during the tunnel/
+   negotiation phase.
 """
 from __future__ import annotations
 
@@ -83,6 +89,32 @@ def test_authz_helper_field_count_matches_squid_conf_template(monkeypatch):
         f"authz_helper.py: registered field_count={actual} but "
         f"squid.conf.template's authz_check FORMAT actually sends {expected} fields"
     )
+
+
+def test_step_acls_in_http_access_are_qualified_with_connect():
+    """Regression for a real, security-relevant bug found in live testing:
+    a bare `http_access allow step2` (or step1) also grants access to the
+    real *decrypted* HTTP request that follows a bump decision -- Squid's
+    at_step state doesn't reset after step2 is reached, so that request is
+    still evaluated as "at step2" too. This let an authenticated user reach
+    ANY bump-mode content (any Crunchyroll show, approved or not) without
+    ever being checked by authz_allowed. Confirmed against a real Squid
+    instance and fixed by requiring CONNECT alongside step1/step2, which
+    only ever matches during the tunnel/negotiation phase (the decrypted
+    inner request's method is GET/POST/etc., never CONNECT). This test
+    can't reproduce Squid's own ACL semantics, but it stops the fix from
+    being silently reverted to a bare `allow step1`/`allow step2` line.
+    """
+    text = TEMPLATE_PATH.read_text()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.fullmatch(r"http_access\s+allow\s+step[12]", stripped):
+            raise AssertionError(
+                f"{stripped!r} must be qualified with CONNECT "
+                f"(e.g. 'http_access allow CONNECT step1') -- see "
+                f"docs/review-2026-08-28.md for why a bare step1/step2 "
+                f"bypasses authz_allowed entirely."
+            )
 
 
 def test_basic_auth_is_not_affected_by_the_data_macro_rule():
