@@ -56,10 +56,15 @@ if [ ! -f "$SSL_DIR/ca_cert.pem" ] || [ ! -f "$SSL_DIR/ca_key.pem" ]; then
 fi
 
 # Initialize Squid's SSL certificate cache database if this is the first run.
+# Unlike /var/spool/squid and /var/log/squid, the squid-openssl package does
+# not pre-create /var/lib/squid itself -- security_file_certgen -c creates
+# ssl_db but not a missing parent, so it fails with "Cannot create
+# /var/lib/squid/ssl_db" on a fresh container without this.
+mkdir -p /var/lib/squid
 if [ ! -d /var/lib/squid/ssl_db ]; then
   /usr/lib/squid/security_file_certgen -c -s /var/lib/squid/ssl_db -M 4MB
 fi
-chown -R proxy:proxy /var/lib/squid/ssl_db "$SSL_DIR" "$CONFIG_DIR" 2>/dev/null || true
+chown -R proxy:proxy /var/lib/squid "$SSL_DIR" "$CONFIG_DIR" 2>/dev/null || true
 
 # Render squid.conf, then conditionally append the friendly-block-page
 # redirect if DASHBOARD_URL is configured.

@@ -2,8 +2,12 @@
 """Squid `external_acl_type` helper for the HTTP-layer decision on bump-mode
 domains (the ones ssl_bump fully decrypts, per sni_helper.py's 'bump' check).
 
-Protocol (format `%LOGIN %>a %DST %PATH`): one line per request, four
-percent-encoded fields, respond "OK" or "ERR".
+Protocol (format `%LOGIN %>a %DST %PATH %DATA`): one line per request, five
+percent-encoded fields, respond "OK" or "ERR". The trailing %DATA field is
+always "-" (the `acl authz_allowed external authz_check` line passes no
+static argument) and is otherwise unused -- it must still be declared and
+consumed, because Squid always appends %DATA to an external_acl_type FORMAT
+that doesn't already include it (see squid.conf.template's comment).
 
 Decision order for a bump-mode domain:
   1. Client must be authenticated and inside the configured LAN.
@@ -39,7 +43,7 @@ def _split_host_port(dst: str) -> str:
     return dst.split(":", 1)[0]
 
 
-def decide(conn, login: str, client_ip: str, dst: str, path: str) -> bool:
+def decide(conn, login: str, client_ip: str, dst: str, path: str, _data: str = "-") -> bool:
     hostname = _split_host_port(dst)
     path = path or "/"
 
@@ -177,7 +181,7 @@ def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain
 
 
 def main() -> int:
-    return squid_helper.run("authz_helper", 4, decide)
+    return squid_helper.run("authz_helper", 5, decide)
 
 
 if __name__ == "__main__":

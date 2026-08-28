@@ -23,8 +23,12 @@ argument), each backing one ssl_bump rule, evaluated in this order:
                                   is a broken-looking connection instead of
                                   an explanation.
 
-Protocol (external_acl_type, format `%LOGIN %>a %ssl::>sni`): one line per
-request, three percent-encoded fields, respond "OK" or "ERR".
+Protocol (external_acl_type, format `%LOGIN %>a %ssl::>sni %DATA`): one line
+per request, four percent-encoded fields, respond "OK" or "ERR". The trailing
+%DATA field is always "-" (no `acl ... external ...` line below passes a
+static argument) and is otherwise unused -- it must still be declared and
+consumed, because Squid always appends %DATA to an external_acl_type FORMAT
+that doesn't already include it (see squid.conf.template's comment).
 
 Only 'splice' mode logs to access_log at this stage -- spliced connections
 are never decrypted, so this is the only point that traffic is ever
@@ -44,17 +48,17 @@ import matching
 import squid_helper
 
 
-def handle_bump(conn, login: str, client_ip: str, sni: str) -> bool:
+def handle_bump(conn, login: str, client_ip: str, sni: str, _data: str = "-") -> bool:
     domain = matching.find_domain(conn, sni)
     return domain is not None and domain["mode"] == "bump"
 
 
-def handle_trusted(conn, login: str, client_ip: str, sni: str) -> bool:
+def handle_trusted(conn, login: str, client_ip: str, sni: str, _data: str = "-") -> bool:
     domain = matching.find_domain(conn, sni)
     return domain is not None and domain["mode"] == "trusted"
 
 
-def handle_splice(conn, login: str, client_ip: str, sni: str) -> bool:
+def handle_splice(conn, login: str, client_ip: str, sni: str, _data: str = "-") -> bool:
     domain = matching.find_domain(conn, sni)
     if domain is None or domain["mode"] != "splice":
         return False
@@ -85,7 +89,7 @@ def handle_splice(conn, login: str, client_ip: str, sni: str) -> bool:
     return allowed
 
 
-def handle_block_page(conn, login: str, client_ip: str, sni: str) -> bool:
+def handle_block_page(conn, login: str, client_ip: str, sni: str, _data: str = "-") -> bool:
     # Reached only for connections none of the other three rules matched --
     # i.e. this is already going to be denied one way or another. The only
     # question is whether we bump it to explain that, or terminate outright.
@@ -109,7 +113,7 @@ def main() -> int:
         print("usage: sni_helper.py {bump|trusted|splice|block_page}", file=sys.stderr)
         return 2
     mode = sys.argv[1]
-    return squid_helper.run(f"sni_helper[{mode}]", 3, HANDLERS[mode])
+    return squid_helper.run(f"sni_helper[{mode}]", 4, HANDLERS[mode])
 
 
 if __name__ == "__main__":

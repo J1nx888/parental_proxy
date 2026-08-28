@@ -42,21 +42,32 @@ acl SSL_ports port 443
 # PER-DOMAIN MODE DECISIONS (checked via SNI, before decryption)
 # ==========================================================
 # Same script, three modes -- see proxy/sni_helper.py.
+#
+# The trailing %DATA on every external_acl_type line below is required, not
+# decorative: Squid always appends a %DATA field to the line it sends a
+# helper unless the FORMAT already includes one (squid.conf.documented,
+# external_acl_type). None of the `acl ... external ...` lines below pass a
+# static argument, so %DATA is always the literal string "-" -- but it is
+# still sent, making every line one field longer than its %macro count
+# suggests. Omitting it here previously meant every helper's field_count
+# was off by one, so every single request was rejected as a malformed line
+# and fell through to the terminate-all catch-all -- discovered against a
+# real Squid instance (see docs/review-2026-08-28.md).
 
 external_acl_type sni_bump_check children-max=10 ttl=0 negative_ttl=0 \
-%LOGIN %>a %ssl::>sni \
+%LOGIN %>a %ssl::>sni %DATA \
 /usr/bin/python3 /opt/parental-proxy/sni_helper.py bump
 
 external_acl_type sni_trusted_check children-max=10 ttl=0 negative_ttl=0 \
-%LOGIN %>a %ssl::>sni \
+%LOGIN %>a %ssl::>sni %DATA \
 /usr/bin/python3 /opt/parental-proxy/sni_helper.py trusted
 
 external_acl_type sni_splice_check children-max=10 ttl=0 negative_ttl=0 \
-%LOGIN %>a %ssl::>sni \
+%LOGIN %>a %ssl::>sni %DATA \
 /usr/bin/python3 /opt/parental-proxy/sni_helper.py splice
 
 external_acl_type sni_block_page_check children-max=10 ttl=0 negative_ttl=0 \
-%LOGIN %>a %ssl::>sni \
+%LOGIN %>a %ssl::>sni %DATA \
 /usr/bin/python3 /opt/parental-proxy/sni_helper.py block_page
 
 acl sni_bump external sni_bump_check
@@ -71,7 +82,7 @@ acl sni_show_block_page external sni_block_page_check
 # ==========================================================
 
 external_acl_type authz_check children-max=20 ttl=0 negative_ttl=0 \
-%LOGIN %>a %DST %PATH \
+%LOGIN %>a %DST %PATH %DATA \
 /usr/bin/python3 /opt/parental-proxy/authz_helper.py
 
 acl authz_allowed external authz_check

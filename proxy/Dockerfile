@@ -1,7 +1,13 @@
 FROM debian:bookworm-slim
 
+# squid-openssl, not squid: Debian's default `squid` package is built
+# --with-gnutls, which does not support SSL-Bump at all (on-the-fly leaf
+# certificate signing needs OpenSSL) -- `squid -k parse` fails with "Unknown
+# http_port option 'ssl-bump'" on the plain package. squid-openssl is the
+# same version, built --with-openssl instead, and is what this project's
+# entire ssl_bump config depends on.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        squid \
+        squid-openssl \
         openssl \
         python3 \
         ca-certificates \
