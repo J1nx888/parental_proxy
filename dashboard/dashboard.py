@@ -279,8 +279,13 @@ def users():
     rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
     out = []
     for u in rows:
+        # Matches what the "N assigned" link's ?user_id= filter on /domains
+        # actually shows: explicit assignments plus every global domain.
         domain_count = conn.execute(
-            "SELECT COUNT(*) c FROM user_domains WHERE user_id = ?", (u["id"],)
+            "SELECT COUNT(*) c FROM domains d "
+            "LEFT JOIN user_domains ud ON ud.domain_id = d.id AND ud.user_id = ? "
+            "WHERE d.is_global = 1 OR ud.user_id IS NOT NULL",
+            (u["id"],),
         ).fetchone()["c"]
         show_count = conn.execute(
             "SELECT COUNT(*) c FROM user_shows WHERE user_id = ?", (u["id"],)
@@ -493,6 +498,7 @@ DOMAINS_BODY = """
       <a class="btn small" href="{{ url_for('domain_detail', domain_id=d.id) }}">Manage</a>
       <form class="inline" method="post" action="{{ url_for('delete_domain') }}">
         <input type="hidden" name="domain_id" value="{{ d.id }}">
+        {% if filtered_user %}<input type="hidden" name="user_id" value="{{ filtered_user.id }}">{% endif %}
         <button class="danger small" type="submit" onclick="return confirm('Delete this domain rule?')">Delete</button>
       </form>
     </td>
@@ -503,6 +509,7 @@ DOMAINS_BODY = """
 </table>
 
 <form class="add-form" method="post" action="{{ url_for('add_domain') }}">
+  {% if filtered_user %}<input type="hidden" name="user_id" value="{{ filtered_user.id }}">{% endif %}
   <input type="text" name="pattern" placeholder="e.g. example\\.com" required>
   <select name="mode">
     <option value="splice">splice (host-only)</option>
@@ -527,16 +534,17 @@ def domains():
         filtered_user = conn.execute(
             "SELECT * FROM users WHERE id = ?", (filter_user_id,)
         ).fetchone()
+        if filtered_user is None:
+            return flash_redirect("domains", "That user no longer exists.", error=True)
     if filtered_user:
-        # Global domains apply to this user too, even without an explicit
-        # user_domains row -- same rule the proxy itself uses at request time.
-        rows = conn.execute(
-            "SELECT d.* FROM domains d "
-            "LEFT JOIN user_domains ud ON ud.domain_id = d.id AND ud.user_id = ? "
-            "WHERE d.is_global = 1 OR ud.user_id IS NOT NULL "
-            "ORDER BY d.is_global DESC, d.pattern",
-            (filter_user_id,),
-        ).fetchall()
+        # Same rule the proxy itself uses at request time (matching.py),
+        # reused here rather than reimplemented as a second copy of the
+        # "is this domain visible to this user" logic.
+        all_rows = conn.execute("SELECT * FROM domains ORDER BY is_global DESC, pattern").fetchall()
+        rows = [
+            d for d in all_rows
+            if bool(d["is_global"]) or matching.user_has_domain(conn, filter_user_id, d["id"])
+        ]
     else:
         rows = conn.execute("SELECT * FROM domains ORDER BY is_global DESC, pattern").fetchall()
     return render(
@@ -552,16 +560,20 @@ def add_domain():
     mode = request.form.get("mode", "splice")
     is_global = 1 if request.form.get("is_global") else 0
     note = request.form.get("note", "").strip() or None
+    # Preserves the Users-page "N assigned" filter (?user_id=) across this
+    # POST, so adding a domain from that filtered view doesn't silently
+    # drop the admin back into the unfiltered list.
+    redirect_kwargs = {"user_id": request.form["user_id"]} if request.form.get("user_id") else {}
     if not pattern:
-        return flash_redirect("domains", "Pattern is required.", error=True)
+        return flash_redirect("domains", "Pattern is required.", error=True, **redirect_kwargs)
     if mode not in ("splice", "bump", "trusted"):
-        return flash_redirect("domains", "Invalid mode.", error=True)
+        return flash_redirect("domains", "Invalid mode.", error=True, **redirect_kwargs)
     if len(pattern) > 200:
-        return flash_redirect("domains", "Pattern too long (200 characters max).", error=True)
+        return flash_redirect("domains", "Pattern too long (200 characters max).", error=True, **redirect_kwargs)
     try:
         re.compile(pattern)
     except re.error as exc:
-        return flash_redirect("domains", f"Not a valid regex: {exc}", error=True)
+        return flash_redirect("domains", f"Not a valid regex: {exc}", error=True, **redirect_kwargs)
     conn = get_db()
     try:
         conn.execute(
@@ -571,15 +583,16 @@ def add_domain():
         conn.commit()
     except Exception as exc:
         if "UNIQUE" in str(exc):
-            return flash_redirect("domains", f"{pattern!r} is already configured.", error=True)
+            return flash_redirect("domains", f"{pattern!r} is already configured.", error=True, **redirect_kwargs)
         raise
-    return flash_redirect("domains", f"Added {pattern}.")
+    return flash_redirect("domains", f"Added {pattern}.", **redirect_kwargs)
 
 
 @app.route("/domains/delete", methods=["POST"])
 @require_admin
 def delete_domain():
     domain_id = request.form.get("domain_id", "")
+    redirect_kwargs = {"user_id": request.form["user_id"]} if request.form.get("user_id") else {}
     conn = get_db()
     row = conn.execute("SELECT kind FROM domains WHERE id = ?", (domain_id,)).fetchone()
     if row and row["kind"] == "crunchyroll":
@@ -587,11 +600,11 @@ def delete_domain():
             "domains",
             "The Crunchyroll domain is built into the show-approval feature and can't be deleted "
             "(edit its mode/paths from Manage instead).",
-            error=True,
+            error=True, **redirect_kwargs,
         )
     conn.execute("DELETE FROM domains WHERE id = ?", (domain_id,))
     conn.commit()
-    return flash_redirect("domains", "Domain removed.")
+    return flash_redirect("domains", "Domain removed.", **redirect_kwargs)
 
 
 DOMAIN_DETAIL_BODY = """

@@ -35,9 +35,10 @@ never decrypted, so this is the only point that traffic is ever observed at
 all. 'bump' mode and the 'block_page' bump-for-denial path both log richly
 at the HTTP layer instead (authz_helper.py, once decrypted). 'block_page'
 also logs a domain-only entry itself, but *only* for a genuinely
-unconfigured domain in 'terminate' mode -- otherwise that case would never
-be recorded anywhere, since nothing downstream ever runs to log it either
-(GH #1). 'trusted' mode is deliberately never logged (see project README).
+unconfigured domain when not in 'redirect' mode -- otherwise that case
+would never be recorded anywhere, since nothing downstream ever runs to
+log it either (GH #1). 'trusted' mode is deliberately never logged (see
+project README).
 """
 from __future__ import annotations
 
@@ -61,16 +62,31 @@ def handle_trusted(conn, login: str, client_ip: str, sni: str, _data: str = "-")
     return domain is not None and domain["mode"] == "trusted"
 
 
+def _log_denial(conn, login: str, sni: str, reason: str) -> None:
+    """Log a denied SNI-layer decision -- domain only, no path, since
+    nothing is decrypted at this layer. Shared by handle_splice and
+    handle_block_page so the login-to-(user_id, username) resolution for
+    logging isn't duplicated between them."""
+    if login in ("-", "", None):
+        logging_util.log_access(
+            conn, user_id=None, username="(unauthenticated)", domain=sni,
+            path=None, allowed=False, reason=reason,
+        )
+    else:
+        user = matching.get_user_by_username(conn, login)
+        logging_util.log_access(
+            conn, user_id=user["id"] if user else None, username=login,
+            domain=sni, path=None, allowed=False, reason=reason,
+        )
+
+
 def handle_splice(conn, login: str, client_ip: str, sni: str, _data: str = "-") -> bool:
     domain = matching.find_domain(conn, sni)
     if domain is None or domain["mode"] != "splice":
         return False
 
     if login in ("-", "", None):
-        logging_util.log_access(
-            conn, user_id=None, username="(unauthenticated)", domain=sni,
-            path=None, allowed=False, reason="not_authenticated",
-        )
+        _log_denial(conn, login, sni, "not_authenticated")
         return False
 
     if not matching.ip_in_configured_lan(conn, client_ip):
@@ -101,14 +117,19 @@ def handle_block_page(conn, login: str, client_ip: str, sni: str, _data: str = "
     # authentication before any ssl_bump step is reached at all.)
     mode = db.get_setting(conn, "block_page_mode", "terminate")
 
-    # In 'terminate' mode this connection is never decrypted, so this is the
-    # only point in the whole SNI-layer decision chain that can ever record
-    # a genuinely *unconfigured* domain: sni_bump/sni_trusted/
-    # sni_splice_allowed each require a matching `domains` row before doing
-    # anything, so none of them log one, and authz_helper.py never runs
-    # either since nothing gets decrypted. Without this, an unconfigured
-    # domain a kid tries is completely invisible on the Report page under
-    # the safe default -- no way to reactively approve it (GH #1).
+    # Whenever this connection is going to be denied without decryption --
+    # i.e. any mode value other than 'redirect', not just the literal string
+    # 'terminate' -- this is the only point in the whole SNI-layer decision
+    # chain that can ever record a genuinely *unconfigured* domain:
+    # sni_bump/sni_trusted/sni_splice_allowed each require a matching
+    # `domains` row before doing anything, so none of them log one, and
+    # authz_helper.py never runs either since nothing gets decrypted.
+    # Without this, an unconfigured domain a kid tries is completely
+    # invisible on the Report page under the safe default -- no way to
+    # reactively approve it (GH #1). Matching the actual deny condition
+    # (`mode == "redirect"` below) rather than only the expected
+    # "terminate" value means an unrecognized/corrupted setting still gets
+    # logged instead of silently reintroducing this same blind spot.
     #
     # Skip logging when a domain row *does* exist: a configured splice-mode
     # domain the user isn't permitted is already logged by handle_splice
@@ -118,21 +139,22 @@ def handle_block_page(conn, login: str, client_ip: str, sni: str, _data: str = "
     # Skip logging entirely in 'redirect' mode: that path bumps the
     # connection so authz_helper.decide() logs this same case
     # (reason="unknown_domain") with the real path attached, which is
-    # strictly better information. Logging both would just mean the dedupe
-    # window (keyed without `path`, see GH #5) discards whichever one runs
-    # second.
-    if mode == "terminate" and matching.find_domain(conn, sni) is None:
-        if login in ("-", "", None):
-            logging_util.log_access(
-                conn, user_id=None, username="(unauthenticated)", domain=sni,
-                path=None, allowed=False, reason="unknown_domain",
-            )
-        else:
-            user = matching.get_user_by_username(conn, login)
-            logging_util.log_access(
-                conn, user_id=user["id"] if user else None, username=login,
-                domain=sni, path=None, allowed=False, reason="unknown_domain",
-            )
+    # strictly better information. If the admin switches from 'terminate'
+    # to 'redirect' between two attempts at the same domain, log_access()
+    # lets that later, richer entry through even though a path-less one
+    # from this layer was already logged for the same key -- see
+    # log_access()'s docstring/comment.
+    # Cost note: this runs a domain lookup, sometimes a user lookup, and a
+    # log_access() read+write for every connection to any unconfigured
+    # domain -- including ordinary ad/tracker/CDN noise, not just
+    # meaningful "kid tried a new site" attempts. That's the accepted
+    # tradeoff of making this visible at all (GH #1); the per-process
+    # find_domain() call also can't be shared with the other three
+    # sni_helper modes, since each mode is a separate long-lived helper
+    # process with no memory in common. Revisit if this shows up as real
+    # load or Report-page noise in practice.
+    if mode != "redirect" and matching.find_domain(conn, sni) is None:
+        _log_denial(conn, login, sni, "unknown_domain")
 
     return mode == "redirect"
 

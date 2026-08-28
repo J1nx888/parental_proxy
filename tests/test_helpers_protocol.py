@@ -223,6 +223,20 @@ def test_sni_handle_block_page_terminate_does_not_double_log_configured_domain(c
     assert conn.execute("SELECT * FROM access_log").fetchone() is None
 
 
+def test_sni_handle_block_page_unrecognized_mode_value_still_logs(conn):
+    """Code-review fix: the logging gate matches the actual deny condition
+    (mode != 'redirect'), not just the literal string 'terminate', so a
+    corrupted/unexpected setting value still denies-and-logs instead of
+    silently reintroducing the GH #1 blind spot."""
+    db.set_setting(conn, "block_page_mode", "some-unexpected-value")
+    conn.commit()
+    _add_user(conn, "kid1", "pw")
+    assert sni_helper.handle_block_page(conn, "kid1", "192.168.1.5", "unknown-site.example") is False
+    row = conn.execute("SELECT * FROM access_log").fetchone()
+    assert row is not None
+    assert row["reason"] == "unknown_domain"
+
+
 def test_sni_handle_block_page_redirect_does_not_log(conn):
     """In redirect mode, authz_helper.decide() logs this same case with the
     real path once the connection is bumped -- logging it here too would

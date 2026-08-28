@@ -33,14 +33,21 @@ def log_access(
     # NULLs still match) so two different blocked shows on the same domain
     # each get their own row instead of collapsing into one.
     recent = conn.execute(
-        "SELECT 1 FROM access_log "
+        "SELECT path FROM access_log "
         "WHERE username = ? AND domain = ? AND allowed = ? AND ts >= ? "
         "AND series_id IS ? "
-        "LIMIT 1",
+        "ORDER BY id DESC LIMIT 1",
         (username, domain, 1 if allowed else 0, cutoff_iso, series_id),
     ).fetchone()
     if recent is not None:
-        return
+        # Let a path-bearing entry through even if a path-less one for the
+        # same key was already logged in this window -- e.g. the SNI layer
+        # logs an unconfigured domain with no path (nothing is decrypted
+        # yet), and the HTTP layer later logs the same domain with the real
+        # path once it is. The path-less entry is strictly less useful, so
+        # it must not block the richer one from ever appearing.
+        if not (path is not None and recent["path"] is None):
+            return
     conn.execute(
         "INSERT INTO access_log "
         "(ts, user_id, username, domain, path, series_id, series_name, allowed, reason) "

@@ -52,6 +52,32 @@ def test_different_allowed_value_is_not_deduped(conn):
     assert len(_rows(conn)) == 2
 
 
+def test_path_bearing_call_is_not_suppressed_by_a_prior_path_less_entry(conn):
+    """Code-review fix: a path-less entry (e.g. sni_helper.py's SNI-layer
+    log, which never has a path since nothing is decrypted there) must not
+    block a later, richer path-bearing entry for the same dedupe key
+    (e.g. authz_helper.py logging the same domain once bumped) -- that
+    richer entry is strictly more useful and would otherwise be silently
+    dropped for the rest of the dedupe window."""
+    base = dict(user_id=1, username="kid1", domain="unknown-site.example", allowed=False, reason="unknown_domain")
+    logging_util.log_access(conn, path=None, **base)
+    assert len(_rows(conn)) == 1
+
+    logging_util.log_access(conn, path="/watch/some-real-path", **base)
+    rows = _rows(conn)
+    assert len(rows) == 2
+    assert rows[1]["path"] == "/watch/some-real-path"
+
+
+def test_path_less_call_is_suppressed_by_a_prior_path_bearing_entry(conn):
+    """The reverse must still dedupe normally: a later, less-informative
+    path-less entry should not push out an already-logged richer one."""
+    base = dict(user_id=1, username="kid1", domain="unknown-site.example", allowed=False, reason="unknown_domain")
+    logging_util.log_access(conn, path="/watch/some-real-path", **base)
+    logging_util.log_access(conn, path=None, **base)
+    assert len(_rows(conn)) == 1
+
+
 def test_window_expiry_allows_a_new_row(conn):
     kwargs = dict(
         user_id=1, username="kid1", domain="crunchyroll.com",

@@ -265,6 +265,23 @@ def test_series_id_of_type_series_branch():
     assert cr_api.series_id_of({"type": "series", "id": "abc"}) == "ABC"
 
 
+def test_series_id_of_top_level_series_id_fallback():
+    """Code-review fix: restored as defensive coverage for object types
+    never sampled against the real API (movie/musicvideo/concert) --
+    never observed on real episode/season/series data, but costs nothing
+    when absent and guards against silently failing closed on real
+    Crunchyroll content this project just hasn't hit in practice."""
+    assert cr_api.series_id_of({"series_id": "abc"}) == "ABC"
+
+
+def test_series_id_of_prefers_episode_metadata_over_top_level():
+    entry = {
+        "episode_metadata": {"series_id": "from_episode"},
+        "series_id": "from_top_level",
+    }
+    assert cr_api.series_id_of(entry) == "FROM_EPISODE"
+
+
 def test_series_id_of_no_match_returns_none():
     assert cr_api.series_id_of({"type": "episode", "id": "abc"}) is None
     assert cr_api.series_id_of({}) is None

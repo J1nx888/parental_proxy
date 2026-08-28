@@ -467,6 +467,60 @@ def test_users_page_sites_link_includes_user_id(client, db_conn):
     assert f"/domains?user_id={user_id}".encode() in resp.data
 
 
+def test_domains_filter_with_nonexistent_user_id_shows_error(client, db_conn):
+    """Code-review fix: an invalid/stale user_id must surface an error like
+    the rest of this file's "no longer exists" convention, not silently
+    fall back to the unfiltered list."""
+    resp = client.get("/domains?user_id=999999", headers=_auth_header())
+    assert resp.status_code == 302
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_users_page_assigned_count_includes_global_domains(client, db_conn):
+    """Code-review fix: the "N assigned" count must match what its own
+    ?user_id= link actually shows -- explicit assignments plus every
+    global domain, not just explicit assignments."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    client.post("/domains/add", data={"pattern": r"global\.example", "mode": "splice", "is_global": "on"}, headers=_auth_header())
+    resp = client.get("/users", headers=_auth_header())
+    assert b"1 assigned" in resp.data
+
+
+def test_add_domain_from_filtered_view_preserves_filter(client, db_conn):
+    """Code-review fix: add_domain must forward ?user_id= through its
+    redirect so the admin stays in the filtered view they were on."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    resp = client.post(
+        "/domains/add",
+        data={"pattern": r"new\.example", "mode": "splice", "user_id": str(user_id)},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    assert f"user_id={user_id}".encode() in resp.headers["Location"].encode()
+
+
+def test_delete_domain_from_filtered_view_preserves_filter(client, db_conn):
+    """Code-review fix: delete_domain must forward ?user_id= through its
+    redirect so the admin stays in the filtered view they were on."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    client.post("/domains/add", data={"pattern": r"new\.example", "mode": "splice"}, headers=_auth_header())
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"new\.example",)).fetchone()[0]
+    resp = client.post(
+        "/domains/delete", data={"domain_id": domain_id, "user_id": str(user_id)}, headers=_auth_header()
+    )
+    assert resp.status_code == 302
+    assert f"user_id={user_id}".encode() in resp.headers["Location"].encode()
+
+
+def test_add_domain_without_filter_does_not_add_user_id_to_redirect(client, db_conn):
+    resp = client.post(
+        "/domains/add", data={"pattern": r"unfiltered\.example", "mode": "splice"}, headers=_auth_header()
+    )
+    assert b"user_id" not in resp.headers["Location"].encode()
+
+
 # ============================================================
 # domain_detail / update_domain
 # ============================================================
