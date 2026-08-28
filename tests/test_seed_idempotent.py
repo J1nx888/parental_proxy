@@ -62,18 +62,18 @@ def test_crunchyroll_domain_seeded_as_global_bump(conn):
     assert row["is_global"] == 1
 
 
-def test_crunchyrollsvc_playback_host_is_seeded(conn):
-    """S1.2: the playback/token service host must be configured, or approved
-    shows fail to play at the manifest/token request."""
+def test_crunchyrollsvc_playback_host_is_not_seeded(conn):
+    """S1.2, resolved 2026-08-28: confirmed against Crunchyroll's own live
+    webpack bundle that production playback is served from
+    www.crunchyroll.com/playback (already covered by the crunchyroll.com
+    domain) -- crunchyrollsvc.com is dev-only in Crunchyroll's own config
+    and must NOT be seeded as a separate domain."""
     seed_defaults.seed(conn)
     conn.commit()
     row = conn.execute(
         "SELECT * FROM domains WHERE pattern = ?", (r"crunchyrollsvc\.com",)
     ).fetchone()
-    assert row is not None
-    assert row["mode"] == "bump"
-    assert row["kind"] == "crunchyroll"
-    assert row["is_global"] == 1
+    assert row is None
 
 
 def test_crunchyroll_paths_attached_to_crunchyroll_domain_only(conn):

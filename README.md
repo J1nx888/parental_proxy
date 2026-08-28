@@ -206,9 +206,10 @@ network needed -- see that file for what's covered):
   guard, and -- specifically -- the click-to-approve flow for both a
   blocked site and a blocked show, confirmed to actually grant access
   afterward (not just show a success message).
-- `seed_defaults.py` idempotency (run twice, no duplicates/errors), plus
-  regression cases for the `crunchyrollcdn.com` mode bug and the missing
-  `crunchyrollsvc.com` playback host.
+- `seed_defaults.py` idempotency (run twice, no duplicates/errors), plus a
+  regression case for the `crunchyrollcdn.com` mode bug and confirmation
+  that `crunchyrollsvc.com` -- confirmed dev-only in Crunchyroll's own
+  production config, and removed from the codebase -- is never seeded.
 - `common/matching.py` domain-suffix anchoring (including the substring/
   suffix bypass cases), path matching, and the LAN CIDR check.
 - `common/cr_urls.py` request classification and `common/auth.py` password

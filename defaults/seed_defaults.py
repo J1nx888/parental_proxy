@@ -97,17 +97,13 @@ def seed(conn) -> None:
         "VALUES ('crunchyroll\\.com', 'bump', 'crunchyroll', 1, 'Crunchyroll -- shows approved per-user', ?)",
         (db.now_iso(),),
     )
-    # Playback / manifest / token service. Current Crunchyroll web playback
-    # issues these from cr-play-service.prd.crunchyrollsvc.com, which is NOT a
-    # subdomain of crunchyroll.com -- without its own bump-mode entry the
-    # show-level check at manifest time is skipped and approved shows may not
-    # play. cr_urls.PLAYBACK_URL_RE already understands this host.
-    conn.execute(
-        "INSERT OR IGNORE INTO domains (pattern, mode, kind, is_global, note, created_at) "
-        "VALUES ('crunchyrollsvc\\.com', 'bump', 'crunchyroll', 1, "
-        "'Crunchyroll playback/token service (cr-play-service.*)', ?)",
-        (db.now_iso(),),
-    )
+    # No separate crunchyrollsvc.com playback-service domain: confirmed
+    # 2026-08-28 against Crunchyroll's own live webpack bundle that
+    # production playback is served from www.crunchyroll.com/playback (the
+    # cr-play-service.*.crunchyrollsvc.com host is explicitly dev-only in
+    # Crunchyroll's own config, never used by real traffic) -- already
+    # covered by the crunchyroll.com domain above. See
+    # docs/review-2026-08-28.md item 1.2.
     cr_row = conn.execute(
         "SELECT id FROM domains WHERE pattern = 'crunchyroll\\.com'"
     ).fetchone()

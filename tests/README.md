@@ -26,7 +26,7 @@ tests can run in any order and in parallel (`pytest -n auto`, with
 | `test_cr_urls.py` | Every `RequestKind`, including the fail-closed `BLOCKED_SHAPE` cases |
 | `test_auth.py` | PBKDF2 hash round-trip, and every way a stored hash can be malformed/tampered |
 | `test_logging_dedupe.py` | Access-log dedupe window, keyed by `(username, domain, allowed, series_id)` |
-| `test_seed_idempotent.py` | `seed_defaults.seed()` run twice is a no-op; the S2.2 (`crunchyrollcdn.com` mode) and S1.2 (`crunchyrollsvc.com` seeded) fixes |
+| `test_seed_idempotent.py` | `seed_defaults.seed()` run twice is a no-op; the S2.2 (`crunchyrollcdn.com` mode) fix, and that `crunchyrollsvc.com` (confirmed dev-only, removed) is never seeded |
 | `test_helpers_protocol.py` | The shared Squid stdin/stdout protocol (`common/squid_helper.py`) plus the actual decision logic of all three helpers (`basic_auth_helper`, `sni_helper`, `authz_helper`), including the Crunchyroll show-approval flow |
 | `test_cr_api.py` | `TokenManager` refresh/expiry, `SeriesResolver`'s retry-once-on-401, every `_read_json` error path (HTTP error, unreachable, timeout, malformed/non-dict JSON), and every `series_id_of` fallback branch |
 | `test_series_resolve.py` | The object-id -> series-id cache: positive/negative TTL, cache-hit short-circuiting, and the S2.6 stale-on-error fallback (see "Bug found" below) |

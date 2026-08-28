@@ -40,10 +40,8 @@ WATCH_URL_RE = re.compile(
 )
 
 PLAYBACK_URL_RE = re.compile(
-    r"^https://(?:"
-    r"www\.crunchyroll\.com/playback/"
-    r"|cr-play-service\.prd\.crunchyrollsvc\.com/"
-    r")v\d+/"
+    r"^https://www\.crunchyroll\.com/playback/"
+    r"v\d+/"
     r"(?:(?:manifest|token)/)?"
     r"([A-Za-z0-9]+)"
     r"(?:/.*)?$",
@@ -60,7 +58,6 @@ GUARDED_MARKERS = (
     "/watch/",
     "/playback/",
     "/cms/objects/",
-    "cr-play-service",
 )
 
 
