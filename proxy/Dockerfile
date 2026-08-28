@@ -7,7 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /opt/parental-proxy/defaults
+# Pre-create /config owned by the `proxy` user (uid 13 on Debian). If a fresh
+# named volume is first initialised by this container, Docker seeds it with
+# this ownership so the squid helper processes (which run as `proxy`) can
+# write the SQLite database. entrypoint.sh also re-chowns it on every start
+# to cover volumes created by the dashboard container.
+RUN mkdir -p /opt/parental-proxy/defaults /config \
+    && chown -R proxy:proxy /config
 
 COPY common/*.py /opt/parental-proxy/
 COPY proxy/basic_auth_helper.py proxy/sni_helper.py proxy/authz_helper.py /opt/parental-proxy/

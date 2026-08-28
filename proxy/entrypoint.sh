@@ -5,13 +5,29 @@ CONFIG_DIR=/config
 SSL_DIR="$CONFIG_DIR/ssl_cert"
 mkdir -p "$CONFIG_DIR" "$SSL_DIR"
 
+# Make the shared volume writable by the `proxy` user before anything opens
+# the database. The dashboard container also runs as `proxy` and both
+# processes read/write the same SQLite file (+ its -wal/-shm sidecars); a
+# root-owned file here means one side gets "attempt to write a readonly
+# database". This also repairs a volume left root-owned by an older build.
+chown -R proxy:proxy "$CONFIG_DIR" 2>/dev/null || true
+
 export PP_DB_PATH="$CONFIG_DIR/parental_proxy.db"
 
-# Seed defaults (idempotent -- safe to run every start, changes nothing on
-# an already-configured database). Also bootstraps local_network from env
-# on first run only.
-python3 /opt/parental-proxy/defaults/seed_defaults.py
-python3 - << PYEOF
+# Seed defaults (idempotent -- safe every start, changes nothing on an
+# already-configured database) and bootstrap the env-seeded settings. Run as
+# `proxy` (via runuser, util-linux) so the DB and WAL sidecars are created
+# with the right owner. If runuser somehow isn't present, fall back to root
+# -- the chown above and below still leaves the volume proxy-owned before
+# squid starts.
+if command -v runuser >/dev/null 2>&1; then
+  AS_PROXY="runuser -u proxy --"
+else
+  AS_PROXY=""
+fi
+
+$AS_PROXY python3 /opt/parental-proxy/defaults/seed_defaults.py
+$AS_PROXY python3 - << PYEOF
 import sys
 sys.path.insert(0, "/opt/parental-proxy")
 import db
@@ -27,10 +43,16 @@ PYEOF
 # leaves this container.
 if [ ! -f "$SSL_DIR/ca_cert.pem" ] || [ ! -f "$SSL_DIR/ca_key.pem" ]; then
   echo "Generating a new SSL-bump CA certificate..."
+  # basicConstraints=CA:TRUE and keyCertSign are required for Squid to mint
+  # per-site leaf certs from this key. openssl 3 (bookworm) usually adds them
+  # for -x509 via the default config, but make it explicit so cert generation
+  # doesn't silently depend on the base image's openssl.cnf.
   openssl req -new -newkey rsa:2048 -sha256 -days 3650 -nodes -x509 \
     -keyout "$SSL_DIR/ca_key.pem" \
     -out "$SSL_DIR/ca_cert.pem" \
-    -subj "/O=${CA_ORG:-Parental Proxy}/CN=${CA_COMMON_NAME:-Parental Proxy CA}"
+    -subj "/O=${CA_ORG:-Parental Proxy}/CN=${CA_COMMON_NAME:-Parental Proxy CA}" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign"
 fi
 
 # Initialize Squid's SSL certificate cache database if this is the first run.

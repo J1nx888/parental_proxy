@@ -22,7 +22,6 @@ Every decision is logged (deduped) via logging_util.
 from __future__ import annotations
 
 import sys
-import urllib.parse
 
 sys.path.insert(0, "/opt/parental-proxy")
 
@@ -31,6 +30,7 @@ import db
 import logging_util
 import matching
 import series_resolve
+import squid_helper
 
 
 def _split_host_port(dst: str) -> str:
@@ -177,24 +177,7 @@ def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain
 
 
 def main() -> int:
-    conn = db.get_conn()
-    db.init_db(conn)
-
-    for line in sys.stdin:
-        parts = line.strip().split()
-        if len(parts) != 4:
-            sys.stdout.write("ERR\n")
-            sys.stdout.flush()
-            continue
-        login, client_ip, dst, path = (urllib.parse.unquote(p) for p in parts)
-        try:
-            ok = decide(conn, login, client_ip, dst, path)
-        except Exception as exc:
-            print(f"authz_helper error: {exc}", file=sys.stderr, flush=True)
-            ok = False
-        sys.stdout.write(("OK\n" if ok else "ERR\n"))
-        sys.stdout.flush()
-    return 0
+    return squid_helper.run("authz_helper", 4, decide)
 
 
 if __name__ == "__main__":

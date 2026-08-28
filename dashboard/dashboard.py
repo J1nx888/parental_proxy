@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import sys
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, Response, redirect, render_template_string, request, send_file, url_for
 
@@ -32,6 +34,26 @@ import matching
 CA_CERT_PATH = Path(os.environ.get("PP_CA_CERT_PATH", "/config/ssl_cert/ca_cert.pem"))
 
 app = Flask(__name__)
+
+
+@app.before_request
+def _reject_cross_origin_writes():
+    """Lightweight CSRF guard. The dashboard authenticates with HTTP Basic,
+    so a browser that has logged in once will attach credentials to a
+    cross-site form POST automatically. Browsers always send an Origin
+    header on such POSTs; reject any whose Origin (or, failing that,
+    Referer) host isn't this dashboard. A request carrying neither header
+    is a non-browser client (curl, a script) with no ambient credentials to
+    abuse, so it's allowed through."""
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    for header in ("Origin", "Referer"):
+        value = request.headers.get(header)
+        if value:
+            if urlparse(value).netloc != request.host:
+                return Response("Cross-origin request blocked.", 403)
+            return None
+    return None
 
 
 def get_db():
@@ -49,11 +71,26 @@ def bootstrap_admin() -> None:
     try:
         env_user = os.environ.get("DASHBOARD_USER")
         env_pass = os.environ.get("DASHBOARD_PASSWORD")
-        if db.get_setting(conn, "admin_username") is None and env_user:
-            db.set_setting(conn, "admin_username", env_user)
-        if db.get_setting(conn, "admin_password_hash") is None and env_pass:
-            db.set_setting(conn, "admin_password_hash", auth.hash_password(env_pass))
+        if db.get_setting(conn, "admin_username") is None:
+            db.set_setting(conn, "admin_username", env_user or "admin")
+        if db.get_setting(conn, "admin_password_hash") is None:
+            if env_pass:
+                db.set_setting(conn, "admin_password_hash", auth.hash_password(env_pass))
+            else:
+                generated = secrets.token_urlsafe(12)
+                db.set_setting(conn, "admin_password_hash", auth.hash_password(generated))
+                username = db.get_setting(conn, "admin_username")
+                print(
+                    "\n" + "=" * 64
+                    + "\n  No DASHBOARD_PASSWORD was set. Generated an admin login:\n"
+                    + f"    username: {username}\n"
+                    + f"    password: {generated}\n"
+                    + "  Change it from the Settings page after logging in.\n"
+                    + "=" * 64 + "\n",
+                    file=sys.stderr, flush=True,
+                )
         db.set_setting_if_absent(conn, "local_network", os.environ.get("LOCAL_NETWORK", "192.168.1.0/24"))
+        db.set_setting_if_absent(conn, "secret_key", secrets.token_hex(32))
         conn.commit()
     finally:
         conn.close()
@@ -381,7 +418,7 @@ def add_show():
     series_id, suggested_name = parse_series_url(url)
     if series_id is None:
         return flash_redirect("user_detail", suggested_name, error=True, user_id=user_id)
-    name = override_name or suggested_name
+    name = override_name or cr_api.series_title(series_id) or suggested_name
     conn = get_db()
     conn.execute(
         "INSERT INTO user_shows (user_id, series_id, series_name) VALUES (?,?,?) "
@@ -492,6 +529,12 @@ def add_domain():
         return flash_redirect("domains", "Pattern is required.", error=True)
     if mode not in ("splice", "bump", "trusted"):
         return flash_redirect("domains", "Invalid mode.", error=True)
+    if len(pattern) > 200:
+        return flash_redirect("domains", "Pattern too long (200 characters max).", error=True)
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        return flash_redirect("domains", f"Not a valid regex: {exc}", error=True)
     conn = get_db()
     try:
         conn.execute(
@@ -657,6 +700,12 @@ def add_path():
     pattern = request.form.get("pattern", "").strip()
     if not pattern:
         return flash_redirect("domain_detail", "Pattern is required.", error=True, domain_id=domain_id)
+    if len(pattern) > 200:
+        return flash_redirect("domain_detail", "Pattern too long (200 characters max).", error=True, domain_id=domain_id)
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        return flash_redirect("domain_detail", f"Not a valid regex: {exc}", error=True, domain_id=domain_id)
     conn = get_db()
     conn.execute(
         "INSERT OR IGNORE INTO domain_paths (domain_id, pattern) VALUES (?,?)", (domain_id, pattern)
@@ -682,6 +731,15 @@ def delete_path():
 # ==========================================================
 
 REPORT_BODY = """
+{% if resolver_error %}
+<div class="flash error">
+  Crunchyroll metadata lookups are currently failing
+  (<code>{{ resolver_error }}</code>). Shows already resolved keep working from
+  cache; newly approved shows can't be verified until this clears. If it
+  persists, the anonymous Crunchyroll client id in
+  <code>common/cr_api.py</code> may need re-deriving.
+</div>
+{% endif %}
 <h2>Recent activity</h2>
 <form class="add-form" method="get" action="{{ url_for('report') }}">
   <select name="user">
@@ -744,6 +802,7 @@ def report():
     body = render_template_string(
         REPORT_BODY, rows=rows, all_users=all_users,
         filter_user=filter_user, filter_status=filter_status,
+        resolver_error=db.get_setting(conn, "cr_resolver_last_error"),
     )
     return render("report", body)
 
@@ -758,7 +817,7 @@ def approve_from_report():
         return flash_redirect("report", "Couldn't find that log entry.", error=True)
 
     if row["series_id"]:
-        name = fetch_series_title(row["series_id"]) or row["series_id"]
+        name = cr_api.series_title(row["series_id"]) or row["series_id"]
         conn.execute(
             "INSERT INTO user_shows (user_id, series_id, series_name) VALUES (?,?,?) "
             "ON CONFLICT(user_id, series_id) DO UPDATE SET series_name = excluded.series_name",
@@ -789,36 +848,6 @@ def approve_from_report():
     return flash_redirect("report", f"Approved {row['domain']} for {row['username']}.")
 
 
-_title_token_manager: cr_api.TokenManager | None = None
-
-
-def fetch_series_title(series_id: str) -> str | None:
-    """Best-effort lookup of a series' display name for the approve button.
-    Falls back to None (caller uses the raw ID) if the API is unreachable."""
-    global _title_token_manager
-    if _title_token_manager is None:
-        _title_token_manager = cr_api.TokenManager()
-    try:
-        token = _title_token_manager.token()
-        request_obj = cr_api.Request(
-            cr_api.OBJECTS_URL.format(ids=series_id.upper()) + "?locale=en-US",
-            headers={
-                "User-Agent": cr_api.USER_AGENT,
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-            },
-        )
-        payload = cr_api._read_json(request_obj, 5.0)
-        for entry in payload.get("data", []):
-            if isinstance(entry, dict) and str(entry.get("id", "")).upper() == series_id.upper():
-                title = entry.get("title")
-                if isinstance(title, str) and title:
-                    return title
-    except Exception:
-        pass
-    return None
-
-
 # ==========================================================
 # SETTINGS
 # ==========================================================
@@ -829,7 +858,7 @@ SETTINGS_BODY = """
   <input type="text" name="local_network" value="{{ local_network }}" style="flex:1; min-width:280px;">
   <button class="add" type="submit">Save</button>
 </form>
-<p class="hint">Space-separated CIDRs, e.g. <code>192.168.1.0/24 192.168.0.0/24</code>. Requests from outside these ranges are always denied, regardless of user/site rules.</p>
+<p class="hint">Space-separated CIDRs, e.g. <code>192.168.1.0/24 192.168.0.0/24</code>. Requests from outside these ranges are denied regardless of user/site rules. <strong>Leave blank to disable this check</strong> and rely only on per-person proxy logins &mdash; do that if the proxy runs under Docker Desktop or bridge networking, where it sees an internal gateway address instead of the real client IP and this check would otherwise block everyone.</p>
 
 <h2>Blocked-site experience</h2>
 <form class="add-form" method="post" action="{{ url_for('update_block_page_mode') }}">
@@ -874,11 +903,15 @@ def settings_page():
 @require_admin
 def update_local_network():
     value = request.form.get("local_network", "").strip()
-    if not value:
-        return flash_redirect("settings_page", "Local network can't be empty.", error=True)
     conn = get_db()
     db.set_setting(conn, "local_network", value)
     conn.commit()
+    if not value:
+        return flash_redirect(
+            "settings_page",
+            "Saved. LAN restriction disabled -- access is now controlled only "
+            "by each person's proxy login.",
+        )
     return flash_redirect("settings_page", "Saved.")
 
 
@@ -911,11 +944,18 @@ def update_admin():
 
 bootstrap_admin()
 
+_boot_conn = db.get_conn()
+app.secret_key = db.get_setting(_boot_conn, "secret_key") or secrets.token_hex(32)
+_boot_conn.close()
+
 
 def main() -> None:
     host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("DASHBOARD_PORT", "8787"))
-    app.run(host=host, port=port)
+    from waitress import serve
+
+    print(f"dashboard listening on http://{host}:{port}", file=sys.stderr, flush=True)
+    serve(app, host=host, port=port, threads=8)
 
 
 if __name__ == "__main__":

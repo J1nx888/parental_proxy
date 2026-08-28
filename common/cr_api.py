@@ -15,8 +15,6 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 TOKEN_URL = "https://www.crunchyroll.com/auth/v1/token"
 OBJECTS_URL = "https://www.crunchyroll.com/content/v2/cms/objects/{ids}"
-SEASONS_URL = "https://www.crunchyroll.com/content/v2/cms/series/{series_id}/seasons"
-EPISODES_URL = "https://www.crunchyroll.com/content/v2/cms/seasons/{season_id}/episodes"
 
 # base64("cr_web:"). This is Crunchyroll's public anonymous web client ID with
 # an empty secret. If token requests start returning 401 invalid_client, rederive
@@ -123,19 +121,6 @@ def series_id_of(entry: dict[str, Any]) -> str | None:
     return None
 
 
-def _entry_ids(payload: dict[str, Any]) -> list[str]:
-    entries = payload.get("data")
-    if not isinstance(entries, list):
-        raise ResolutionError("list response contained no data list")
-    ids: list[str] = []
-    for entry in entries:
-        if isinstance(entry, dict):
-            entry_id = entry.get("id")
-            if isinstance(entry_id, str) and entry_id:
-                ids.append(entry_id.upper())
-    return ids
-
-
 class SeriesResolver:
     """Resolve CMS object IDs to parent series IDs, retrying once on stale token."""
 
@@ -163,21 +148,6 @@ class SeriesResolver:
                     resolved[key] = series_id_of(entry)
         return resolved
 
-    def episodes_of_series(self, series_id: str) -> list[str]:
-        series_id = series_id.upper()
-        locale = urllib.parse.urlencode({"locale": "en-US"})
-        seasons_url = SEASONS_URL.format(series_id=series_id) + "?" + locale
-        seasons = _entry_ids(self._get_json(seasons_url))
-        episode_ids: list[str] = []
-        seen: set[str] = set()
-        for season_id in seasons:
-            episodes_url = EPISODES_URL.format(season_id=season_id) + "?" + locale
-            for episode_id in _entry_ids(self._get_json(episodes_url)):
-                if episode_id not in seen:
-                    seen.add(episode_id)
-                    episode_ids.append(episode_id)
-        return episode_ids
-
     def _get_json(self, url: str) -> dict[str, Any]:
         for force_refresh in (False, True):
             token = self._tokens.token(force_refresh=force_refresh)
@@ -195,3 +165,28 @@ class SeriesResolver:
                 if force_refresh or "HTTP 401" not in str(exc):
                     raise
         raise ResolutionError(f"could not fetch {url}")
+
+
+_shared_resolver: SeriesResolver | None = None
+
+
+def series_title(series_id: str, timeout: float = DEFAULT_TIMEOUT) -> str | None:
+    """Best-effort display title for a series id, via the CMS objects endpoint.
+    Returns None if the API is unreachable -- callers fall back to the raw id.
+    Used by the dashboard for the "Approve" button and show-add form."""
+    global _shared_resolver
+    if _shared_resolver is None:
+        _shared_resolver = SeriesResolver(timeout=timeout)
+    query = urllib.parse.urlencode({"locale": "en-US"})
+    try:
+        payload = _shared_resolver._get_json(
+            OBJECTS_URL.format(ids=series_id.upper()) + "?" + query
+        )
+    except Exception:  # display-only helper -- never propagate into a request
+        return None
+    for entry in payload.get("data", []):
+        if isinstance(entry, dict) and str(entry.get("id", "")).upper() == series_id.upper():
+            title = entry.get("title")
+            if isinstance(title, str) and title:
+                return title
+    return None

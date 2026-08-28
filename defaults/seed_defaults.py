@@ -34,7 +34,6 @@ GLOBAL_SPLICE_DOMAINS = [
     ("ipinfo\\.io", "Geolocation"),
     ("bitmovin\\.com", "Video player"),
     ("litix\\.io", "Video player telemetry"),
-    ("crunchyrollcdn\\.com", "Crunchyroll CDN"),
     ("cookielaw\\.org", "Cookie consent"),
     ("ketchcdn\\.com", "Cookie consent"),
     ("ketchjs\\.com", "Cookie consent"),
@@ -96,6 +95,17 @@ def seed(conn) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO domains (pattern, mode, kind, is_global, note, created_at) "
         "VALUES ('crunchyroll\\.com', 'bump', 'crunchyroll', 1, 'Crunchyroll -- shows approved per-user', ?)",
+        (db.now_iso(),),
+    )
+    # Playback / manifest / token service. Current Crunchyroll web playback
+    # issues these from cr-play-service.prd.crunchyrollsvc.com, which is NOT a
+    # subdomain of crunchyroll.com -- without its own bump-mode entry the
+    # show-level check at manifest time is skipped and approved shows may not
+    # play. cr_urls.PLAYBACK_URL_RE already understands this host.
+    conn.execute(
+        "INSERT OR IGNORE INTO domains (pattern, mode, kind, is_global, note, created_at) "
+        "VALUES ('crunchyrollsvc\\.com', 'bump', 'crunchyroll', 1, "
+        "'Crunchyroll playback/token service (cr-play-service.*)', ?)",
         (db.now_iso(),),
     )
     cr_row = conn.execute(

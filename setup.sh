@@ -20,11 +20,16 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 
 guess=""
+host_ip_guess=""
 if command -v ip >/dev/null 2>&1; then
   host_ip_guess="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
-  if [ -n "${host_ip_guess:-}" ]; then
-    guess="$(printf '%s' "$host_ip_guess" | awk -F. '{print $1"."$2"."$3".0/24"}')"
-  fi
+fi
+if [ -z "${host_ip_guess:-}" ] && command -v ipconfig >/dev/null 2>&1; then
+  # Git Bash on Windows: pull the first IPv4 address out of ipconfig.
+  host_ip_guess="$(ipconfig 2>/dev/null | sed -n 's/.*IPv4 Address[^:]*: *\([0-9.]*\).*/\1/p' | head -n1 | tr -d '\r')"
+fi
+if [ -n "${host_ip_guess:-}" ]; then
+  guess="$(printf '%s' "$host_ip_guess" | awk -F. '{print $1"."$2"."$3".0/24"}')"
 fi
 
 if [ -f .env ]; then
@@ -33,8 +38,15 @@ if [ -f .env ]; then
 else
   echo "A few questions, then this will build and start everything."
   echo
+  echo "LAN CIDR: the network your kids' devices connect from. This is a"
+  echo "belt-and-suspenders check on top of the per-person proxy logins."
+  echo "It only works with host networking (Linux); under Docker Desktop the"
+  echo "proxy can't see real client IPs, so enter 'none' to disable it there."
   read -rp "LAN CIDR devices will connect from [${guess:-192.168.1.0/24}]: " local_network
   local_network="${local_network:-${guess:-192.168.1.0/24}}"
+  case "$local_network" in
+    none|NONE|off|disabled) local_network="" ;;
+  esac
 
   read -rp "Dashboard admin username [admin]: " dash_user
   dash_user="${dash_user:-admin}"

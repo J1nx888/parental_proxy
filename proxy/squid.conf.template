@@ -35,6 +35,7 @@ acl authenticated proxy_auth REQUIRED
 acl step1 at_step SslBump1
 acl step2 at_step SslBump2
 acl CONNECT method CONNECT
+acl SSL_ports port 443
 
 
 # ==========================================================
@@ -85,6 +86,11 @@ http_access allow localhost
 # Require a valid per-person login for everything else. Squid issues the
 # 407 challenge automatically via the proxy_auth ACL type.
 http_access deny !authenticated
+
+# This is an HTTPS filtering proxy: CONNECT is only ever needed to port 443.
+# Refusing everything else stops the proxy being used as a generic TCP tunnel
+# (SSH-over-CONNECT, SMTP, etc.) by an authenticated user.
+http_access deny CONNECT !SSL_ports
 
 # Allow the CONNECT tunnel and TLS peek/bump negotiation for authenticated
 # clients -- the actual allow/deny decision happens in the ssl_bump rules
@@ -137,6 +143,11 @@ ssl_bump terminate step2 all
 # ==========================================================
 # PERFORMANCE
 # ==========================================================
+
+# No disk cache is configured. Also refuse to hold responses in the memory
+# cache: on a bumped connection that would mean one user's decrypted content
+# could be served to another.
+cache deny all
 
 quick_abort_min -1 KB
 quick_abort_max 0 KB

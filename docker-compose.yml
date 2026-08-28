@@ -8,12 +8,10 @@ services:
     ports:
       - "3128:3128"
     environment:
-      - LOCAL_NETWORK=${LOCAL_NETWORK:?Set LOCAL_NETWORK in .env}
+      - LOCAL_NETWORK=${LOCAL_NETWORK:-192.168.1.0/24}
       - DASHBOARD_URL=${DASHBOARD_URL:-}
     volumes:
       - pp_config:/config
-    depends_on:
-      - dashboard
 
   dashboard:
     build:
@@ -23,11 +21,18 @@ services:
     restart: unless-stopped
     ports:
       - "${DASHBOARD_BIND:-127.0.0.1}:8787:8787"
+    # Start after the proxy: its entrypoint fixes /config ownership on the
+    # shared volume (and generates the CA cert) before the dashboard, which
+    # runs as the same `proxy` user, opens the database.
+    depends_on:
+      - proxy
     environment:
-      - DASHBOARD_USER=${DASHBOARD_USER:?Set DASHBOARD_USER in .env}
-      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?Set DASHBOARD_PASSWORD in .env}
+      # Optional: only consumed on first run to seed the admin login. If unset,
+      # the dashboard generates a random password and prints it to its logs.
+      - DASHBOARD_USER=${DASHBOARD_USER:-}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-}
       - DASHBOARD_HOST=0.0.0.0
-      - LOCAL_NETWORK=${LOCAL_NETWORK:?Set LOCAL_NETWORK in .env}
+      - LOCAL_NETWORK=${LOCAL_NETWORK:-192.168.1.0/24}
       - PP_DB_PATH=/config/parental_proxy.db
       - PP_CA_CERT_PATH=/config/ssl_cert/ca_cert.pem
     volumes:

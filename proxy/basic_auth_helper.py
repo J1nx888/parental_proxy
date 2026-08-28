@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Squid `auth_param basic program` helper.
+"""Squid `auth_param basic program` helper -- one login per person.
 
-Protocol: one "username password" per line on stdin (password is the rest
-of the line after the first space -- Squid's classic Basic scheme doesn't
-percent-encode it). Responds "OK" or "ERR" per line, flushed immediately.
+Protocol: "username password" per line on stdin. The classic Basic scheme
+does not percent-encode these, and the password is everything after the
+first space (so it may contain spaces). Responds "OK"/"ERR" per line.
+The stdin loop itself lives in common/squid_helper.py.
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import sys
 sys.path.insert(0, "/opt/parental-proxy")
 
 import auth
-import db
+import squid_helper
 
 
 def check(conn, username: str, password: str) -> bool:
@@ -24,25 +25,10 @@ def check(conn, username: str, password: str) -> bool:
     return auth.verify_password(password, row["password_hash"])
 
 
-def main() -> int:
-    conn = db.get_conn()
-    db.init_db(conn)
-    for line in sys.stdin:
-        line = line.rstrip("\n").rstrip("\r")
-        if " " not in line:
-            sys.stdout.write("ERR\n")
-            sys.stdout.flush()
-            continue
-        username, password = line.split(" ", 1)
-        try:
-            ok = check(conn, username, password)
-        except Exception as exc:
-            print(f"basic_auth_helper error: {exc}", file=sys.stderr, flush=True)
-            ok = False
-        sys.stdout.write(("OK\n" if ok else "ERR\n"))
-        sys.stdout.flush()
-    return 0
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        squid_helper.run(
+            "basic_auth_helper", 2, check,
+            unquote=False, keep_trailing_spaces=True,
+        )
+    )

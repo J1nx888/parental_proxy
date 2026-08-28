@@ -1,0 +1,9 @@
+# Files that run inside the Linux containers must keep LF endings regardless
+# of the checkout platform -- a CRLF in entrypoint.sh gives "bad interpreter".
+*.sh            text eol=lf
+*.py            text eol=lf
+*.template      text eol=lf
+Dockerfile      text eol=lf
+*/Dockerfile    text eol=lf
+docker-compose.yml text eol=lf
+.env.example    text eol=lf

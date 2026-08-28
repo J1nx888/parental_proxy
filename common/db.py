@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS access_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_access_log_ts ON access_log(ts DESC);
-CREATE INDEX IF NOT EXISTS idx_access_log_dedupe ON access_log(username, domain, allowed, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_access_log_dedupe ON access_log(username, domain, allowed, series_id, ts DESC);
 """
 
 
@@ -143,3 +143,9 @@ def set_setting_if_absent(conn: sqlite3.Connection, key: str, value: str) -> Non
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+
+
+def iso_secs_ago(seconds: float) -> str:
+    """UTC ISO-8601 timestamp `seconds` in the past, same format as now_iso().
+    Comparable lexicographically against now_iso() values (fixed-width UTC)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - seconds)) + "Z"

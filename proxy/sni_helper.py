@@ -35,13 +35,13 @@ log richly at the HTTP layer instead (authz_helper.py, once decrypted), and
 from __future__ import annotations
 
 import sys
-import urllib.parse
 
 sys.path.insert(0, "/opt/parental-proxy")
 
 import db
 import logging_util
 import matching
+import squid_helper
 
 
 def handle_bump(conn, login: str, client_ip: str, sni: str) -> bool:
@@ -108,26 +108,8 @@ def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] not in HANDLERS:
         print("usage: sni_helper.py {bump|trusted|splice|block_page}", file=sys.stderr)
         return 2
-    handler = HANDLERS[sys.argv[1]]
-
-    conn = db.get_conn()
-    db.init_db(conn)
-
-    for line in sys.stdin:
-        parts = line.strip().split()
-        if len(parts) != 3:
-            sys.stdout.write("ERR\n")
-            sys.stdout.flush()
-            continue
-        login, client_ip, sni = (urllib.parse.unquote(p) for p in parts)
-        try:
-            ok = handler(conn, login, client_ip, sni)
-        except Exception as exc:
-            print(f"sni_helper[{sys.argv[1]}] error: {exc}", file=sys.stderr, flush=True)
-            ok = False
-        sys.stdout.write(("OK\n" if ok else "ERR\n"))
-        sys.stdout.flush()
-    return 0
+    mode = sys.argv[1]
+    return squid_helper.run(f"sni_helper[{mode}]", 3, HANDLERS[mode])
 
 
 if __name__ == "__main__":
