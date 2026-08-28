@@ -1,0 +1,452 @@
+# Dashboard: routes and UI reference
+
+Source of truth: `dashboard/dashboard.py` (~1100 lines). This is the **entire**
+web app -- one Flask file with routes and Jinja2 templates defined as Python
+string constants, rendered via `render_template_string`. There is no separate
+JSON API, no frontend build, no static template files. To change the UI you
+edit this one file.
+
+Supporting modules it imports (all copied from `common/` into the same
+container directory at build time -- see "Build/deploy layout" below):
+`auth.py` (password hashing), `cr_api.py` (Crunchyroll metadata lookups),
+`db.py` (SQLite schema/connection/settings), `matching.py` (domain/path
+matching helpers shared with the proxy's own request-time checks).
+
+## Build/deploy layout (why `import auth`/`import db` work)
+
+`dashboard/dashboard.py` does `import auth`, `import cr_api`, `import db`,
+`import matching` as top-level modules -- but those files physically live in
+`common/`, not `dashboard/`. This resolves at runtime, not edit time:
+
+- `dashboard/Dockerfile` does `COPY common/*.py /app/` then
+  `COPY dashboard/dashboard.py /app/`, flattening everything into one
+  directory (`/app`) inside the image.
+- `dashboard.py` also does `sys.path.insert(0, str(Path(__file__).parent))`
+  so the same trick works when run locally from the `dashboard/` folder,
+  provided the `common/*.py` files have been copied or symlinked alongside
+  it first.
+
+If you add a new shared helper module under `common/`, remember it needs the
+same `COPY common/*.py /app/` treatment -- already covered by the existing
+wildcard copy, so nothing to change in the Dockerfile for a new file, but you
+do need to `import <module>` (not `import common.<module>`) from
+`dashboard.py`.
+
+## Auth / session model (integration point only)
+
+The dashboard has no login page, no session cookie, and no CSRF token. It
+authenticates every request with **HTTP Basic Auth** against admin
+credentials stored in the `settings` table (`admin_username`,
+`admin_password_hash`):
+
+- `require_admin` (decorator, ~line 113) wraps every protected view. It reads
+  `request.authorization`, hands it to `_check_admin_auth()`, and returns a
+  bare `401` with a `WWW-Authenticate: Basic` header on failure -- this is
+  what makes the browser pop its native Basic Auth prompt.
+- `_check_admin_auth()` (~line 99) loads `admin_username` /
+  `admin_password_hash` from `db.get_setting()` and calls
+  `auth.verify_password(basic_auth.password, expected_hash)`. Hashing itself
+  (`auth.hash_password` / `auth.verify_password`) is implemented in
+  `common/auth.py` -- treat that as a black box here; it's documented
+  separately in the security doc.
+- `bootstrap_admin()` (~line 69) runs once at import time (see bottom of the
+  file, `bootstrap_admin()` is called unconditionally at module load,
+  before `main()`): seeds `admin_username`/`admin_password_hash` from the
+  `DASHBOARD_USER`/`DASHBOARD_PASSWORD` env vars on first run, or generates a
+  random password and prints it to stderr if `DASHBOARD_PASSWORD` isn't set.
+  Also seeds `local_network` and a random `secret_key` setting if absent.
+- `app.secret_key` is loaded from the `secret_key` setting right after
+  bootstrap (bottom of file) -- present because Flask requires *a* secret key
+  to exist, but nothing in this app currently uses `flask.session` or signed
+  cookies; all state is server-side in SQLite and all auth is Basic Auth
+  re-sent by the browser on every request.
+- Per-user (kid) accounts in the `users` table are a **completely separate**
+  credential set used by the Squid/proxy side (`proxy/basic_auth_helper.py`)
+  for the child's device proxy login -- not for dashboard access. Don't
+  confuse `users.password_hash` (checked by the proxy) with
+  `settings.admin_password_hash` (checked by the dashboard).
+
+## CSRF protection
+
+Implemented as a single `@app.before_request` hook, `_reject_cross_origin_writes()`
+at the top of `dashboard.py` (~line 39-56). Because auth is HTTP Basic, a
+browser that already has credentials cached will silently attach them to a
+cross-site POST -- the classic CSRF risk for Basic Auth apps. The mitigation:
+
+1. Only applies to state-changing methods: `POST`, `PUT`, `PATCH`, `DELETE`.
+   GET is exempt (also why `/report`'s filter form uses `method="get"`).
+2. Checks the `Origin` header first; if absent, falls back to `Referer`.
+3. If either is present and its host (`urlparse(value).netloc`) doesn't
+   match `request.host`, the request is rejected with a bare
+   `403 Response("Cross-origin request blocked.")`.
+4. If **neither** header is present, the request is allowed through -- the
+   reasoning documented in the docstring is that a non-browser client (curl,
+   a script, an API caller) has no ambient cookies/credentials to abuse, so
+   there's nothing for CSRF to exploit.
+
+There is no per-form CSRF token anywhere in the templates. This
+Origin/Referer check is the entire CSRF defense.
+
+## The `flash_redirect()` helper
+
+Defined once, near the top of the "SHARED PAGE CHROME" section (~line 191):
+
+```python
+def flash_redirect(endpoint: str, message: str, error: bool = False, **kwargs):
+    return redirect(url_for(endpoint, message=message, error="1" if error else None, **kwargs))
+```
+
+Pattern used by essentially every POST handler in the file: after mutating
+the DB, redirect (302) back to a GET-rendering view, passing the
+user-facing outcome as query-string parameters instead of using Flask's
+`flash()`/session-based flashing (consistent with "no session state"
+above). `**kwargs` lets a handler also carry along any other query params
+that view needs (most commonly `user_id=` to preserve the Domains page's
+per-user filter, or `domain_id=` to land back on the right domain's detail
+page).
+
+On the receiving end, `render()` (~line 184) always pulls `message` and
+`error` out of `request.args` and threads them into the `BASE` template,
+which renders:
+
+```jinja
+{% if message %}<div class="flash {{ 'error' if error else 'ok' }}">{{ message }}</div>{% endif %}
+```
+
+So: call `flash_redirect(target_endpoint, "Some message.", error=True, **extra_query_params)`
+from any POST handler; nothing else needs to be wired up for the message to
+show on the next page load. Because the message lives in the URL query
+string, it also means reloading the destination page re-shows the same flash
+(it's not consumed/popped) -- acceptable for this app's scale.
+
+Two report/domain flows redirect straight to `domain_detail` with a
+`prefill_path=` kwarg instead of using `flash_redirect` for the "message"
+part (see `add_domain_from_url` indirectly and `approve_from_report`'s
+`path_not_allowed` branch) -- that's a plain `redirect(url_for(...))`, not
+`flash_redirect`, because there's no flash message on that particular hop,
+just a query param the destination template reads directly (see "Prefill"
+below).
+
+## Shared page chrome: `BASE` + `render()`
+
+- `BASE` (~line 129): the entire HTML page shell as a Jinja2 template
+  string -- `<!doctype html>`, inline `<style>` block (no external CSS
+  file), a `<nav>` with four static links (Report / Users / Domains /
+  Settings, each built with `url_for(...)` and highlighted via an `active`
+  variable), the flash-message block, and `{{ body|safe }}` where the
+  page-specific content is injected.
+- `render(active: str, body: str)` (~line 184): the only place `BASE` is
+  rendered. Every route handler ends by calling
+  `render("<nav-key>", render_template_string(PAGE_BODY, ...))`, i.e. each
+  view first renders its own body template into a string, then hands that
+  string to `render()` to wrap in the shared chrome. `active` must be one of
+  `"report"`, `"users"`, `"domains"`, `"settings"` to match the `nav` links'
+  `active` check.
+- CSS is a handful of utility classes reused across all pages: `.add-form`
+  (flex row of inputs + submit button), `.btn`/`button.add`/`button.danger`/
+  `button.small` (action styling), `.badge.mode-*` and `.badge.allowed`/
+  `.badge.blocked` (colored pills for domain mode and report status), `.hint`
+  (small muted helper text under a form), `.flash.ok`/`.flash.error`.
+  Re-use these classes rather than inventing new styles when adding UI.
+
+## Template constants (per-page bodies)
+
+Each resource area defines one or more `..._BODY` string constants
+containing just the inner page content (no `<html>`/`<nav>` -- that's
+`BASE`'s job). They are rendered with `render_template_string(CONSTANT,
+**context)` inside their route handler, and the result is passed to
+`render()`. Full list, in file order:
+
+| Constant | Rendered by | Notes |
+|---|---|---|
+| `USERS_BODY` | `users()` | Table of all users + "Add user" form. Also has the cert-download banner. |
+| `USER_DETAIL_BODY` | `user_detail()` | One user's assigned domains (read-only list), approved shows table + add form, change-password form. |
+| `DOMAINS_BODY` | `domains()` | All domains table (or filtered by `?user_id=`), "Add domain" form, and conditionally the "Approve a specific page for {user}" form. |
+| `DOMAIN_DETAIL_BODY` | `domain_detail()` | One domain's mode/global/note edit form, assigned-users toggle table (only if not global), allowed-paths table + add form (only if mode is `bump`). |
+| `REPORT_BODY` | `report()` | Access-log table with user/status GET filter form and inline per-row "Approve" actions. |
+| `SETTINGS_BODY` | `settings_page()` | Local network CIDR form, blocked-site experience mode form, admin username/password form. |
+
+All of these live in the same file as their route handlers, directly above
+them (e.g. `USERS_BODY` is defined right before `users()`/`add_user()`).
+When adding a new field to an existing page, edit the relevant `..._BODY`
+constant's HTML/Jinja and the context dict passed to
+`render_template_string(...)` in the corresponding view function together.
+
+### Prefill / query-param-driven form pre-population
+
+Two examples of the same pattern -- a GET view reads an extra query param
+and threads it into the template as a value the form pre-fills, so the
+admin's next action is one edit + submit rather than starting from scratch:
+
+- **`prefill_path` on Domain Detail's "Add path" form.** `domain_detail()`
+  passes `prefill_path=request.args.get("prefill_path")` into
+  `DOMAIN_DETAIL_BODY`. The template shows an extra hint line
+  ("A blocked request suggested the pattern below...") when it's set, and
+  the path `<input>`'s `value="{{ prefill_path or '' }}"`. The value
+  originates from `path_to_pattern(path)` (~line 475), which regex-escapes
+  a real observed request path into a starting-point pattern anchored at
+  `^`. Two producers redirect here with that param: `approve_from_report()`'s
+  `path_not_allowed` branch, and (indirectly) anywhere else that wants to
+  send the admin to "review and save a path rule" rather than silently
+  guessing one.
+- **`user_id` as a persistent filter on `/domains`.** `domains()` reads
+  `?user_id=` from the query string, resolves it to a `filtered_user` row,
+  and both filters the domain list (global domains + domains explicitly
+  assigned to that user, via `matching.user_has_domain()`) and reveals the
+  extra "Approve a specific page for {user}" form. Every mutating form on
+  the filtered `DOMAINS_BODY` page (add domain, delete domain) carries a
+  hidden `user_id` input so the POST handler can round-trip
+  `redirect_kwargs = {"user_id": ...}` back into `flash_redirect(...,
+  **redirect_kwargs)`, keeping the admin on the same filtered view after the
+  action completes instead of bouncing them back to the unfiltered list.
+
+## Routes by resource
+
+### General / unauthenticated
+
+- `GET /` -> `index()` -- redirects to `report`.
+- `GET /ca-cert` -> `ca_cert()` -- **unauthenticated on purpose** (see file
+  docstring: it's a public certificate, every client device needs it).
+  Serves `CA_CERT_PATH` (env `PP_CA_CERT_PATH`, default
+  `/config/ssl_cert/ca_cert.pem`) as a download named
+  `parental-proxy-ca.crt`; 404s with an explanatory message if the proxy
+  container hasn't generated it yet.
+- `GET /blocked` -> `blocked()` -- static unauthenticated 403 HTML page shown
+  to end users (not the admin) when Squid redirects a blocked bump-mode
+  request here; inlined HTML, no shared `BASE`/template constant since it's
+  a deliberately separate, minimal page.
+
+### Users (`/users`)
+
+- `GET /users` -> `users()` -- lists all users with computed `domain_count`
+  (global domains + explicit `user_domains` assignments, matching what the
+  "N assigned" link's `?user_id=` filter actually shows on `/domains`) and
+  `show_count`. Renders `USERS_BODY`.
+- `POST /users/add` -> `add_user()` -- form fields `username`, `display_name`
+  (optional, defaults to username), `password`. Validates username against
+  `^[A-Za-z0-9_.-]+$`, requires both username and password, hashes the
+  password via `auth.hash_password()`, inserts into `users`. Redirects to
+  `users` via `flash_redirect`; duplicate username -> error flash.
+- `POST /users/delete` -> `delete_user()` -- form field `user_id`. Hard
+  deletes the row (cascades to `user_domains`/`user_shows` via FK
+  `ON DELETE CASCADE`). Redirects to `users`.
+- `POST /users/reset-password` -> `reset_password()` -- form fields
+  `user_id`, `password`. Redirects to `user_detail` (not `users`) with
+  `user_id=` preserved.
+- `GET /users/<int:user_id>` -> `user_detail()` -- one user's assigned
+  domains (read-only, via a JOIN on `user_domains`), approved
+  `user_shows`, and the add-show/change-password forms. Renders
+  `USER_DETAIL_BODY`. Redirects to `users` with an error flash if the user
+  id doesn't exist.
+- `POST /shows/add` -> `add_show()` -- form fields `user_id`, `url` (a
+  Crunchyroll series URL), `name` (optional override). Parses the URL with
+  `parse_series_url()` (module-level regex `SERIES_URL_RE`, ~line 450) to
+  extract a series id + slug-derived name; on parse failure, flashes the
+  parse error back to `user_detail`. On success, looks up the real title via
+  `cr_api.series_title(series_id)` (falls back to the slug-derived name, or
+  the admin's override if given), then upserts into `user_shows` (`ON
+  CONFLICT(user_id, series_id) DO UPDATE SET series_name = excluded.series_name`).
+- `POST /shows/remove` -> `remove_show()` -- form fields `user_id`,
+  `series_id`. Deletes from `user_shows`. Redirects to `user_detail`.
+
+### Domains (`/domains`)
+
+- `GET /domains` -> `domains()` -- optional `?user_id=` query param filters
+  the list to global domains plus domains assigned to that user (via
+  `matching.user_has_domain()`, the same function the proxy itself uses at
+  request time -- deliberately not reimplemented here). Renders
+  `DOMAINS_BODY`, including the "Approve a specific page for {user}" section
+  only when `filtered_user` is set (see UI/UX notes below).
+- `POST /domains/add` -> `add_domain()` -- form fields `pattern`, `mode`
+  (`splice`/`bump`/`trusted`, default `splice`), `is_global` (checkbox),
+  `note` (optional), plus optional `user_id` purely to preserve the filtered
+  view across the redirect (this call does **not** assign the new domain to
+  that user -- it's just for staying on the same filtered page). Validates:
+  pattern non-empty, mode in the allowed set, pattern <= 200 chars, and
+  pattern must compile as a regex (`re.compile`). Inserts into `domains`
+  with `kind='generic'`. Duplicate pattern (UNIQUE constraint) -> error
+  flash naming the pattern.
+- `POST /domains/add-url -> add_domain_from_url()` -- GH #6 shortcut. Form
+  fields `url`, `user_id` (**required** -- this route only makes sense from
+  a user-filtered Domains view; if `user_id` is missing it flashes an
+  explanatory error back to the unfiltered `domains` page). Steps: prepend
+  `https://` if the URL has no scheme; extract `hostname` via `urlparse()`
+  and re-validate it against a strict hostname regex (urlparse alone doesn't
+  validate hostname syntax); extract `path` (default `/`); look up the
+  domain via `matching.find_domain()` -- if it doesn't exist yet, create it
+  in `bump` mode (`kind='generic'`, `is_global=0`, note
+  `'Added via the paste-a-URL shortcut'`); if it exists but isn't already in
+  `bump` mode, refuse with an error flash telling the admin to switch modes
+  from Manage first (a page-level path rule requires bump mode -- splice
+  mode never inspects the path). Then `INSERT OR IGNORE` a `domain_paths`
+  row derived from the path via `path_to_pattern()`, and `INSERT OR IGNORE`
+  a `user_domains` row assigning that domain to `user_id`. Success flash
+  names the exact hostname+path approved.
+- `POST /domains/delete` -> `delete_domain()` -- form field `domain_id`,
+  optional `user_id` (redirect-preservation only, as above). Refuses to
+  delete a domain whose `kind == 'crunchyroll'` (the built-in Crunchyroll
+  domain backing the show-approval feature) with an explanatory error flash;
+  otherwise hard-deletes the row (cascades to `user_domains`/`domain_paths`).
+- `GET /domains/<int:domain_id>` -> `domain_detail()` -- loads the domain,
+  all users (for the assign/grant toggle table), the set of currently
+  assigned user ids, and its `domain_paths` rows. Also reads
+  `?prefill_path=` (see Prefill section above). Renders `DOMAIN_DETAIL_BODY`.
+  Redirects to `domains` with an error flash if the domain id doesn't exist.
+- `POST /domains/update` -> `update_domain()` -- form fields `domain_id`,
+  `mode`, `is_global` (checkbox), `note`. No validation on `mode` here
+  (unlike `add_domain`) -- it's a `<select>` so the browser constrains the
+  value in practice. Updates the row, redirects to `domain_detail`.
+- `POST /domains/toggle-user` -> `toggle_user_domain()` -- form fields
+  `domain_id`, `user_id`, `action` (`"add"` or `"remove"`, driven by a
+  hidden input whose value is computed in the template from whether the
+  user is currently assigned). Inserts or deletes the corresponding
+  `user_domains` row. Redirects to `domain_detail`.
+- `POST /domains/paths/add` -> `add_path()` -- form fields `domain_id`,
+  `pattern`. Validates non-empty, <= 200 chars, and compiles as a regex.
+  `INSERT OR IGNORE` into `domain_paths`. Redirects to `domain_detail`.
+- `POST /domains/paths/delete` -> `delete_path()` -- form field `path_id`.
+  Looks up the `domain_id` first (needed for the redirect target after the
+  row is gone), deletes the `domain_paths` row, redirects to
+  `domain_detail` with that `domain_id` (or `None` if the path was already
+  gone).
+
+### Report (`/report`)
+
+- `GET /report` -> `report()` -- optional `?user=` (username, exact match)
+  and `?status=` (`blocked`/`allowed`) GET filters, built as a raw SQL
+  string with conditionally appended `AND` clauses (parameterized, not
+  string-interpolated -- safe from injection) against `access_log`, capped
+  at `LIMIT 200`, newest first (`ORDER BY id DESC`). Also surfaces
+  `db.get_setting(conn, "cr_resolver_last_error")` so a failing Crunchyroll
+  metadata resolver shows a banner at the top of the page. Renders
+  `REPORT_BODY`.
+- `POST /report/approve` -> `approve_from_report()` -- form field `log_id`.
+  Looks up the `access_log` row and branches three ways:
+  1. **Show-scoped** (`row["series_id"]` set): resolves the title via
+     `cr_api.series_title()` and upserts `user_shows` for that user --
+     one-click "approve this show".
+  2. **Path-not-allowed** (`row["reason"] == "path_not_allowed"`): the
+     domain is already assigned to the user (that's why the path check ran
+     at all), so a plain `user_domains` insert would be a silent no-op and
+     the same request would be denied again. Instead this redirects to
+     `domain_detail` with `prefill_path=path_to_pattern(row["path"])` so the
+     admin reviews/saves an actual path rule (see Prefill section).
+  3. **New/blocked domain** (anything else): looks up the domain via
+     `matching.find_domain()`; if it's never been configured at all,
+     creates it as `splice` mode, `is_global=0`, note `'Auto-added from
+     report approval'` (the safest default for a reactive one-off
+     approval), then assigns it to the user via `user_domains`.
+  All three branches end with `flash_redirect("report", ...)` except branch
+  2, which does a plain `redirect(url_for("domain_detail", ...))` instead
+  (no flash message on that hop, just the `prefill_path` param).
+
+### Settings (`/settings`)
+
+- `GET /settings` -> `settings_page()` -- reads `local_network`,
+  `admin_username`, `block_page_mode` (default `"terminate"`) settings.
+  Renders `SETTINGS_BODY`. (Never reads or displays
+  `admin_password_hash` -- the password field is always blank/write-only.)
+- `POST /settings/local-network` -> `update_local_network()` -- form field
+  `local_network` (space-separated CIDRs). No format validation beyond
+  `.strip()` -- an invalid CIDR just fails silently at match time in
+  `matching.ip_in_configured_lan()`. Saving an empty value flashes a
+  specific message explaining the LAN check is now disabled.
+- `POST /settings/block-page-mode` -> `update_block_page_mode()` -- form
+  field `block_page_mode`, must be `"redirect"` or `"terminate"` or it's
+  rejected with an error flash.
+- `POST /settings/admin` -> `update_admin()` -- form fields
+  `admin_username` (required, non-empty), `admin_password` (optional --
+  leaving it blank keeps the current password hash). Updates
+  `admin_username` unconditionally; only rehashes and updates
+  `admin_password_hash` if a new password was actually submitted.
+
+## Notable UI/UX behaviors
+
+- **The `/domains` "Approve a specific page for {user}" form only renders
+  when a user filter is active** (`{% if filtered_user %}` in
+  `DOMAINS_BODY`, driven by `?user_id=` on the GET route). This is
+  deliberate: approving a single page only makes sense in the context of a
+  specific person (there's no "everyone gets this one page" concept the way
+  whole-domain assignment has an "Everyone gets this" checkbox), so the
+  route (`add_domain_from_url`) itself also hard-refuses without a
+  `user_id`.
+- **Domain mode badges are color-coded and consistent everywhere**:
+  `.badge.mode-splice` (green-tinted), `.badge.mode-bump` (red-tinted),
+  `.badge.mode-trusted` (gray) -- same CSS classes used on `/domains`,
+  `/domains/<id>`, and the assigned-domains table on `/users/<id>`.
+- **The Domain Detail page conditionally shows entire sections**: the
+  "Assigned users" grant/revoke table only appears `{% if not d.is_global
+  %}` (a global domain has no per-user assignment to manage), and the
+  "Allowed paths" section only appears `{% if d.mode == 'bump' %}` (splice
+  and trusted modes never consult path rules, so editing them there would be
+  misleading).
+- **Delete confirmation is client-side only**: destructive buttons
+  (`delete_user`, `delete_domain`, `remove_show`) use inline
+  `onclick="return confirm('...')"` -- there's no server-side "are you
+  sure" step, so a JS-disabled/scripted client can delete without
+  confirmation (acceptable here since admin-only + CSRF-guarded).
+- **The `/report` approve button only appears for blocked rows with a known
+  user**: `{% if not row.allowed and row.user_id %}` -- rows with no
+  `user_id` (requests that didn't even map to a known proxy login) have
+  nothing sensible to approve into, so no button is shown.
+- **The built-in Crunchyroll domain (`kind == 'crunchyroll'`) is
+  undeletable** but still fully editable (mode/global/note/paths) from
+  Domain Detail -- `DOMAIN_DETAIL_BODY` shows an extra explanatory hint for
+  it, and `delete_domain()` refuses the delete server-side regardless of
+  what the UI does.
+- **Waitress, not Flask's dev server, runs in production**: `main()`
+  (bottom of file) calls `waitress.serve(app, host=..., port=..., threads=8)`
+  -- `app.run()` is never invoked. `DASHBOARD_HOST` (default `127.0.0.1`)
+  and `DASHBOARD_PORT` (default `8787`) control the bind address.
+
+## How to add a new route/page
+
+Follow the existing pattern end to end; using an existing resource area
+(e.g. Domains) as your template is the fastest way to get the shape right.
+
+1. **Decide the URL and method(s)** following the existing conventions:
+   a plain resource path for `GET` list/detail views (e.g. `/widgets`,
+   `/widgets/<int:id>`), and a `/<resource>/<action>` path for `POST`
+   mutations (e.g. `/widgets/add`, `/widgets/delete`, `/widgets/update`).
+2. **Write the handler function** in `dashboard/dashboard.py`, grouped under
+   the relevant `# ====...====` section banner (or add a new banner section
+   if this is a genuinely new resource). Decorate it `@app.route(...)` then
+   `@require_admin` (unless it must be public like `/ca-cert`/`/blocked` --
+   justify that explicitly, as those two routes' comments do).
+   - Get a connection with `conn = get_db()` (wraps `db.get_conn()` +
+     `db.init_db(conn)`).
+   - For a `GET` view: query what the template needs, call
+     `render_template_string(YOUR_BODY, **context)`, pass that string into
+     `render("<nav-key>", body)`, and return it.
+   - For a `POST` view: read `request.form.get(...)` fields, validate
+     (mirror the style in `add_domain`/`add_path` -- required-field checks,
+     length caps, `re.compile()` for anything stored as a regex pattern),
+     mutate via `conn.execute(...)` + `conn.commit()`, and return
+     `flash_redirect("<endpoint>", "message", error=True/False, **kwargs)`.
+     Never return a bare `render(...)` from a POST handler -- always
+     redirect (GET-after-POST), consistent with every existing handler.
+3. **Define or extend a `..._BODY` template constant** near the top of that
+   handler group. Reuse the shared CSS classes (`.add-form`, `button.add`,
+   `button.danger`, `.badge.*`, `.hint`, `table`/`td`/`th`) rather than
+   adding new ones unless the existing vocabulary genuinely doesn't fit. If
+   the new page is a first-class nav destination, add a link to it in
+   `BASE`'s `<nav>` block and pick a matching `active` key.
+4. **Wire up redirects with `flash_redirect`** for every mutating action, so
+   the outcome message shows up automatically on the destination page via
+   `render()`'s existing `message`/`error` query-param handling -- no
+   additional plumbing needed.
+5. **If the new view needs a shared matching/db helper**, check
+   `common/matching.py` and `common/db.py` first rather than reimplementing
+   logic already used by the proxy side (e.g. `matching.find_domain()`,
+   `matching.user_has_domain()`, `db.get_setting()`/`db.set_setting()`) --
+   this keeps the dashboard's idea of "is this allowed" consistent with what
+   the proxy actually enforces at request time.
+6. **If you added a new file under `common/`**, no Dockerfile change is
+   needed (`COPY common/*.py /app/` is already a wildcard) -- just
+   `import <module_name>` (flat, not `common.<module_name>`) from
+   `dashboard.py`, matching the existing `import auth` / `import db` /
+   `import matching` style.
+7. **Manual smoke test**: run `dashboard/dashboard.py` directly (needs
+   `common/*.py` importable alongside it, and env vars `PP_DB_PATH`/
+   `PP_CA_CERT_PATH` pointed somewhere writable), or rebuild the
+   `dashboard` Docker image and hit the new route through the container.

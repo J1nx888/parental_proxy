@@ -1,0 +1,315 @@
+# Deployment
+
+Reference for deploying, redeploying, or modifying the deployment of Parental
+Proxy v2. Covers local setup, the two-container architecture, environment
+variables, the CA certificate, networking caveats, port mappings, CI, and
+common operational commands.
+
+## Prerequisites
+
+- Docker with the `docker compose` plugin (Docker Desktop on Windows/Mac, or
+  Docker Engine + compose plugin on Linux).
+- A LAN CIDR for the network client devices connect from (optional — see
+  [Networking notes](#networking-notes)).
+
+## Step-by-step local setup
+
+### Option A: `./setup.sh` (recommended)
+
+`setup.sh` lives at the project root and is the one-command path: it writes
+`.env` (if one doesn't already exist) by asking a handful of questions, then
+builds and starts both containers. Walking through exactly what it does:
+
+1. **Checks prerequisites.** Exits with an install link if `docker` isn't on
+   `PATH`, or if `docker compose version` fails (the compose plugin is
+   missing).
+2. **Guesses this machine's LAN IP** to prefill the CIDR prompt: tries
+   `ip route get 1.1.1.1` (Linux/native), then falls back to parsing
+   `ipconfig` output (Git Bash on Windows). The first IPv4 address found is
+   turned into a `/24` guess, e.g. `192.168.1.0/24`.
+3. **If `.env` already exists, it is left untouched** — the script prints a
+   note that you'd need to delete it first to redo the questions. This makes
+   `./setup.sh` safe to re-run (e.g. to rebuild) without clobbering config.
+4. **If `.env` does not exist, prompts for:**
+   - **LAN CIDR** — defaults to the guessed value or `192.168.1.0/24`.
+     Typing `none`/`NONE`/`off`/`disabled` writes an empty `LOCAL_NETWORK`
+     (disables the LAN check — see the networking caveat below).
+   - **Dashboard admin username** — defaults to `admin`.
+   - **Dashboard admin password** — if left blank, generates one with
+     `openssl rand -base64 12` (or reads `/dev/urandom` if `openssl` isn't
+     available) and prints it once to the terminal, noting it won't be shown
+     again by the script (though it's still recoverable — see
+     [Viewing the auto-generated dashboard password](#viewing-the-auto-generated-dashboard-password)).
+   - **Whether to expose the dashboard on the LAN** (y/N) — sets
+     `DASHBOARD_BIND` to `0.0.0.0` if yes, otherwise `127.0.0.1`.
+   - **Whether to show a friendly blocked-site page** (Y/n) — if yes, asks
+     for this machine's LAN IP (prefilled from the earlier guess) and writes
+     `DASHBOARD_URL=http://<ip>:8787`; if no, or no IP is available,
+     `DASHBOARD_URL` is left blank.
+   - Writes all of the above to `.env` in the project root.
+5. **Runs `docker compose up -d --build`.**
+6. **Prints next steps**: the dashboard URL to open, and a reminder to create
+   a user per person, install the CA cert on each device, and set that
+   device's proxy to `<host-ip>:3128` with the person's credentials.
+
+Run it from the project root:
+
+```
+./setup.sh
+```
+
+### Option B: manual `docker-compose` (no wizard)
+
+Equivalent to Option A without the interactive prompts — useful for scripted
+or non-interactive deploys:
+
+1. Copy the template and edit it:
+   ```
+   cp .env.example .env
+   ```
+   Edit `.env` to set `LOCAL_NETWORK`, `DASHBOARD_USER`, `DASHBOARD_PASSWORD`,
+   `DASHBOARD_BIND`, and `DASHBOARD_URL` as desired (every value is optional —
+   see [Environment variables](#environment-variables) for defaults).
+2. Build and start both containers:
+   ```
+   docker compose up -d --build
+   ```
+3. Open the dashboard (`http://127.0.0.1:8787/` by default, or
+   `http://<host-ip>:8787/` if `DASHBOARD_BIND=0.0.0.0`) and log in with the
+   admin credentials from `.env` (or the auto-generated password from the
+   dashboard container's logs if `DASHBOARD_PASSWORD` was left blank).
+4. Create a user per person under **Users**, download the CA certificate from
+   the Users page, install it as a trusted root on each device, and point
+   that device's proxy settings at this machine's IP on port `3128` with the
+   new user's credentials.
+5. Approve shows/sites per user ahead of time, or reactively from the
+   **Report** page as blocks show up.
+
+## Two-container architecture
+
+Two services, defined in `docker-compose.yml` at the project root, sharing
+one named Docker volume:
+
+- **`proxy`** (container name `parental-proxy`, built from
+  `proxy/Dockerfile`) — the SSL-bumping Squid proxy. Listens on port `3128`.
+  Runs `proxy/entrypoint.sh` as its `ENTRYPOINT`.
+- **`dashboard`** (container name `parental-proxy-dashboard`, built from
+  `dashboard/Dockerfile`) — the Flask web UI (`dashboard/dashboard.py`).
+  Listens on port `8787`, run as the `proxy` user (Debian uid 13).
+
+Both mount the same named volume, **`pp_config`**, at **`/config`** in each
+container. That's where the shared SQLite database
+(`/config/parental_proxy.db`) and the generated CA cert/key
+(`/config/ssl_cert/`) live — there's no other IPC between the two containers;
+they coordinate purely through files on this shared volume.
+
+### Startup order dependency
+
+`docker-compose.yml` declares:
+
+```yaml
+dashboard:
+  depends_on:
+    - proxy
+```
+
+This is load-bearing, not incidental. `proxy`'s `entrypoint.sh` is what:
+
+- `chown -R proxy:proxy /config` — fixes ownership on the shared volume
+  (needed because a fresh named volume can be first-initialized by whichever
+  container mounts it first, and would otherwise leave it root-owned for the
+  other container to trip over — "attempt to write a readonly database").
+- Generates the CA certificate/key pair under `/config/ssl_cert/` if absent.
+- Initializes the SQLite database and Squid's own on-disk cert cache
+  (`/var/lib/squid/ssl_db`).
+
+The dashboard container runs as the same `proxy` user and opens the same
+SQLite file, so it needs `/config` to already be correctly owned and
+initialized before it starts — hence `depends_on: [proxy]`. Both Dockerfiles
+also pre-chown `/config` at build time (`proxy/Dockerfile` line ~22,
+`dashboard/Dockerfile` line ~15) as a first line of defense for a
+freshly-created volume, and `entrypoint.sh` re-chowns on every start to
+repair a volume left root-owned by an older build.
+
+Note `depends_on` here only waits for the `proxy` container to *start*, not
+for its entrypoint work to fully finish — in practice this has been fine
+because the dashboard's own DB open/init is tolerant of the brief startup
+window, per the ownership-repair logic on both sides.
+
+## Environment variables
+
+All variables are optional; defaults apply if a line is missing. Source:
+`.env.example` (LOCAL_NETWORK, DASHBOARD_USER, DASHBOARD_PASSWORD,
+DASHBOARD_BIND, DASHBOARD_URL) and `docker-compose.yml`'s `environment:`
+blocks (which also inject DASHBOARD_HOST, PP_DB_PATH, PP_CA_CERT_PATH into
+the dashboard container).
+
+| Variable | Consumed by | Purpose | Default |
+|---|---|---|---|
+| `LOCAL_NETWORK` | proxy + dashboard | LAN CIDR(s) allowed to use the proxy, space-separated if more than one. Seeded into the DB once on first run (`db.set_setting_if_absent`); editable afterward from the dashboard's Settings page without restarting. | `192.168.1.0/24` |
+| `DASHBOARD_USER` | dashboard | Admin login username. Only read on first run to seed the account; editable from Settings afterward. | `admin` |
+| `DASHBOARD_PASSWORD` | dashboard | Admin login password. Only read on first run. If left blank, the dashboard generates a random password on first start and prints it to its own container logs. | (blank → auto-generated) |
+| `DASHBOARD_BIND` | host bind, via `docker-compose.yml`'s port mapping (`${DASHBOARD_BIND:-127.0.0.1}:8787:8787`) | Which host interface the dashboard's port 8787 is published on. `127.0.0.1` = this machine only (use SSH port-forwarding for remote access); `0.0.0.0` = reachable from any device on the LAN. | `127.0.0.1` |
+| `DASHBOARD_URL` | proxy (`entrypoint.sh` appends a `deny_info` line to `squid.conf` when set) | If set (e.g. `http://192.168.1.50:8787`), blocked bump-mode requests redirect to a friendly explanation page (`${DASHBOARD_URL}/blocked`) instead of a bare connection error. Only applies to bump-mode domains — splice-mode blocks never show a page. Leave blank to skip. | (blank) |
+| `DASHBOARD_HOST` | dashboard | Bind address *inside* the dashboard container. Hardcoded to `0.0.0.0` in `docker-compose.yml` (not read from `.env`) so the container itself always listens on all interfaces; it's the host-side `DASHBOARD_BIND` port mapping that actually controls external reachability. | `0.0.0.0` (fixed in compose file) |
+| `PP_DB_PATH` | dashboard (and set internally by `proxy/entrypoint.sh` for its own process) | Path to the shared SQLite database file inside the container. Hardcoded in `docker-compose.yml`'s dashboard environment block to the shared-volume path. | `/config/parental_proxy.db` |
+| `PP_CA_CERT_PATH` | dashboard | Path to the generated CA certificate, used by the dashboard's CA-download endpoint (Users page download link). Hardcoded in `docker-compose.yml`. | `/config/ssl_cert/ca_cert.pem` |
+| `CA_ORG` | proxy (`entrypoint.sh`) | Organization name (`/O=`) baked into the generated CA certificate's subject. Not present in `.env.example`; set it directly in `docker-compose.yml`'s proxy environment block or as a shell-exported var if you want to override it. | `Parental Proxy` |
+| `CA_COMMON_NAME` | proxy (`entrypoint.sh`) | Common name (`/CN=`) baked into the generated CA certificate's subject. Same override mechanism as `CA_ORG`. | `Parental Proxy CA` |
+
+Notes:
+- `DASHBOARD_HOST`, `PP_DB_PATH`, and `PP_CA_CERT_PATH` are not meant to be
+  set by the user in `.env` — they're fixed values wired directly into
+  `docker-compose.yml`'s `dashboard.environment` block, listed here because
+  they're part of the deployment's environment surface and a future change
+  to the compose file might need to know what they're for.
+- `CA_ORG` / `CA_COMMON_NAME` are read by `entrypoint.sh` via shell parameter
+  expansion (`${CA_ORG:-Parental Proxy}`) but are not passed through by
+  `docker-compose.yml`'s current `proxy.environment` block — to override
+  them you'd need to add entries there.
+
+## CA certificate
+
+Generated by `proxy/entrypoint.sh` on the proxy container's first start (only
+if `/config/ssl_cert/ca_cert.pem` or `/config/ssl_cert/ca_key.pem` is
+missing — otherwise it's left alone on every subsequent start, so it's stable
+across restarts and rebuilds as long as the `pp_config` volume persists):
+
+```
+openssl req -new -newkey rsa:2048 -sha256 -days 3650 -nodes -x509 \
+  -keyout "$SSL_DIR/ca_key.pem" \
+  -out "$SSL_DIR/ca_cert.pem" \
+  -subj "/O=${CA_ORG:-Parental Proxy}/CN=${CA_COMMON_NAME:-Parental Proxy CA}" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+```
+
+A 2048-bit RSA key, self-signed, valid 10 years (3650 days), with
+`basicConstraints=CA:TRUE` and `keyCertSign`/`cRLSign` usage explicitly set
+so Squid's `security_file_certgen` can mint per-site leaf certificates from
+it at request time (SSL-bump). Both files land in `/config/ssl_cert/` on the
+shared `pp_config` volume — same path as `PP_CA_CERT_PATH` used by the
+dashboard container.
+
+**What a client device needs to do:** install `ca_cert.pem` (not the key —
+the private key never leaves the proxy container) as a trusted root
+certificate, then point the device's Wi-Fi/network proxy settings at this
+host's IP on port `3128` with that person's dashboard-created username and
+password. The dashboard's **Users** page has a direct download link for the
+certificate — same file for every user, no per-user cert. Per-OS install
+steps (Windows/macOS/iOS/Android/Chromebook) aren't duplicated here; see the
+README's "Setting up a person" section and the "Setting up a device"
+reference it points to.
+
+Caveat directly from the README: a native app doing certificate pinning will
+simply fail to connect through this proxy rather than being filtered —
+SSL-bump can't defeat pinning without modifying the app.
+
+## Networking notes
+
+`LOCAL_NETWORK` (the LAN CIDR check) has a platform-dependent caveat,
+documented in `.env.example`:
+
+> This check only works when the proxy sees real client IPs, i.e. with host
+> networking on Linux. Under Docker Desktop (Windows/Mac) or plain bridge
+> networking the proxy sees an internal gateway address instead, and this
+> would reject every request. In that case leave it blank (here or in the
+> dashboard) to disable the check and rely on the per-person proxy logins
+> alone.
+
+In other words:
+- **Linux with host networking**: the proxy container can see clients' real
+  LAN IPs, so `LOCAL_NETWORK` correctly restricts proxy use to that CIDR as
+  a belt-and-suspenders layer on top of per-user Basic Auth.
+- **Docker Desktop (Windows/Mac) or plain bridge networking**: the proxy
+  only sees an internal Docker gateway address for every connection,
+  regardless of the real client. Leaving `LOCAL_NETWORK` set in this
+  environment would reject *every* request. Set it to blank (via `.env`,
+  or `none`/`off`/`disabled` at the `setup.sh` prompt, or later from the
+  dashboard's Settings page) to disable the CIDR check entirely and rely
+  solely on per-person proxy logins for access control.
+- This setting is editable at runtime from the dashboard (Settings page)
+  without restarting either container — the `.env` value only seeds it on
+  first run (`db.set_setting_if_absent` in `entrypoint.sh`).
+
+`docker-compose.yml` itself does not configure `network_mode: host` for the
+proxy service — it uses default bridge networking with an explicit port
+mapping (`3128:3128`). Host networking, where relevant, would be a
+Linux-specific override to the compose file, not the shipped default.
+
+## Port mappings
+
+| Port | Service | Compose mapping | Notes |
+|---|---|---|---|
+| `3128` | proxy | `"3128:3128"` (all interfaces) | Squid's HTTP/HTTPS proxy port. Client devices point their proxy settings here. |
+| `8787` | dashboard | `"${DASHBOARD_BIND:-127.0.0.1}:8787:8787"` | Flask dashboard. Bound only to `127.0.0.1` on the host by default — **not LAN-reachable** unless `DASHBOARD_BIND=0.0.0.0` is set (see the `DASHBOARD_BIND` row above). Remote access to a `127.0.0.1`-bound dashboard requires SSH port-forwarding. |
+
+## CI
+
+`.github/workflows/tests.yml` defines a single job, `pytest`, run on
+`ubuntu-latest`:
+
+- **Triggers:** `push` to `main`, and every `pull_request` (any branch).
+- **Steps:** checkout, set up Python 3.12, `pip install -r
+  requirements-dev.txt` and `pip install -r dashboard/requirements.txt`, then
+  `pytest -v`.
+- **Scope:** this is explicitly the "Tier-1 (no-Docker)" suite only — no
+  Squid, no real Docker networking, no real device involved. Per the
+  workflow's own comment and the README's "Testing notes" section, Phase
+  2/3 verification (real Squid SSL-bump, real Docker networking, a real
+  client device) is not covered by CI and has to be run manually against an
+  actual deployment (this project keeps a disposable VM for that — see the
+  `parental_proxy_smoketest_vm` memory note if using this repo's usual
+  workflow).
+
+Nothing in this workflow builds or runs the Docker images — it only
+exercises the pure-Python test suite under `tests/`.
+
+## Common commands
+
+```
+# Start (build if needed) both containers in the background
+docker compose up -d --build
+
+# Stop and remove both containers (the pp_config volume, and its
+# database/CA cert, is preserved)
+docker compose down
+
+# Follow logs for both services
+docker compose logs -f
+
+# Follow logs for just the dashboard (e.g. to read the auto-generated
+# admin password)
+docker compose logs dashboard
+```
+
+### Viewing the auto-generated dashboard password
+
+If `DASHBOARD_PASSWORD` was left blank in `.env`, the dashboard generates a
+random password on its first start and prints it to its own container's
+logs — per the comment in `.env.example`:
+
+```
+docker compose logs dashboard
+```
+
+Look for the generated-password line near the top of the dashboard
+container's startup output (i.e. from its first-ever start — if you've
+restarted the container many times since, you may need `docker compose
+logs dashboard --since <time>` or scroll further back to find the original
+first-run output).
+
+### Full backup / moving to another machine
+
+The `pp_config` volume holds everything stateful: the CA private key (so
+restored devices don't need to re-trust a new cert) and the full SQLite
+database (users, permissions, log entries). Per the README:
+
+```
+docker run --rm -v <project-dir-name>_pp_config:/config -v "$PWD":/backup \
+  alpine tar czf /backup/pp-config-backup.tar.gz -C /config .
+```
+
+Replace `<project-dir-name>` with the actual Compose project name (by
+default, the project directory's basename) since Compose prefixes volume
+names with it.

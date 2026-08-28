@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "last_run": "2026-08-28T00:00:00Z",
+  "sections": {
+    "architecture": {
+      "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "defaults/", "dashboard/dashboard.py"],
+      "fingerprint": "9a7af68fcd04922699f2c2321c66a6360e228f0b9df6aeaa0bb5afeb83864d0e",
+      "doc_path": "docs/architecture/overview.md",
+      "last_updated": "2026-08-28T00:00:00Z"
+    },
+    "dashboard": {
+      "source_paths": ["dashboard/", "common/db.py", "common/matching.py"],
+      "fingerprint": "c299731703561e4e6916ef701be1e93d17f9b490011d739026df08190b1390c4",
+      "doc_path": "docs/dashboard/routes.md",
+      "last_updated": "2026-08-28T00:00:00Z"
+    },
+    "database": {
+      "source_paths": ["common/db.py", "defaults/seed_defaults.py"],
+      "fingerprint": "46f56748fea1cc9fcbfddbe103ecd42f286e9c2a4864c42e426752baa78c77d5",
+      "doc_path": "docs/database/schema.md",
+      "last_updated": "2026-08-28T00:00:00Z"
+    },
+    "deployment": {
+      "source_paths": ["docker-compose.yml", "proxy/Dockerfile", "dashboard/Dockerfile", "proxy/entrypoint.sh", "setup.sh", ".env.example", ".github/workflows/tests.yml", "README.md"],
+      "fingerprint": "a49e89f7d4ff3f99ebf37705cedd3a69430c6c8e2c6ef1708c45b443662d4da0",
+      "doc_path": "docs/deployment/setup.md",
+      "last_updated": "2026-08-28T00:00:00Z"
+    },
+    "security": {
+      "source_paths": ["common/auth.py", "proxy/basic_auth_helper.py", "proxy/authz_helper.py", "proxy/sni_helper.py", "common/squid_helper.py", "proxy/entrypoint.sh", "proxy/squid.conf.template", "dashboard/dashboard.py"],
+      "fingerprint": "78a94ea6a3c4237414279a26180e4c6c439f472dcf424bf119c3b90a7a8b4e28",
+      "doc_path": "docs/security/overview.md",
+      "last_updated": "2026-08-28T00:00:00Z"
+    },
+    "testing": {
+      "source_paths": ["tests/", "pytest.ini", "requirements-dev.txt", ".github/workflows/tests.yml"],
+      "fingerprint": "cca68ed53b478281334578c002cbb0799a86e221765288f7f2a48c90473daaf6",
+      "doc_path": "docs/testing/overview.md",
+      "last_updated": "2026-08-28T00:00:00Z"
+    }
+  }
+}
