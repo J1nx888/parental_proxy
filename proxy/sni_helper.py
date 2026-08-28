@@ -144,15 +144,16 @@ def handle_block_page(conn, login: str, client_ip: str, sni: str, _data: str = "
     # lets that later, richer entry through even though a path-less one
     # from this layer was already logged for the same key -- see
     # log_access()'s docstring/comment.
-    # Cost note: this runs a domain lookup, sometimes a user lookup, and a
-    # log_access() read+write for every connection to any unconfigured
+    # Cost note (GH #7): this runs a domain lookup, sometimes a user lookup,
+    # and a log_access() read+write for every connection to any unconfigured
     # domain -- including ordinary ad/tracker/CDN noise, not just
     # meaningful "kid tried a new site" attempts. That's the accepted
     # tradeoff of making this visible at all (GH #1); the per-process
     # find_domain() call also can't be shared with the other three
     # sni_helper modes, since each mode is a separate long-lived helper
-    # process with no memory in common. Revisit if this shows up as real
-    # load or Report-page noise in practice.
+    # process with no memory in common. See GH #7 for the tradeoffs on
+    # fixing this properly; revisit if it shows up as real load or
+    # Report-page noise in practice.
     if mode != "redirect" and matching.find_domain(conn, sni) is None:
         _log_denial(conn, login, sni, "unknown_domain")
 
