@@ -288,6 +288,47 @@ def test_approve_missing_log_entry_errors(client):
     assert "error=1" in resp.headers["Location"]
 
 
+def test_approve_path_not_allowed_redirects_to_prefilled_add_path_form(client, db_conn):
+    """GH #6: approving a path-blocked row used to be a silent no-op
+    (re-asserting a domain assignment that already existed). It must now
+    send the admin to review a derived pattern instead of auto-saving one
+    or doing nothing."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    client.post("/domains/add", data={"pattern": r"asurascans\.example", "mode": "bump", "is_global": "on"}, headers=_auth_header())
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"asurascans\.example",)).fetchone()[0]
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason) "
+        "VALUES (datetime('now'), ?, 'kid1', 'asurascans.example', '/comics/some-comic?ref=1', 0, 'path_not_allowed')",
+        (user_id,),
+    )
+    db_conn.commit()
+    log_id = db_conn.execute("SELECT id FROM access_log").fetchone()[0]
+
+    resp = client.post("/report/approve", data={"log_id": log_id}, headers=_auth_header())
+    assert resp.status_code == 302
+    location = resp.headers["Location"]
+    assert f"/domains/{domain_id}" in location
+    assert "prefill_path=" in location
+    # No domain_paths row should be silently created -- the admin must
+    # actually submit the (possibly edited) Add Path form for that.
+    assert db_conn.execute("SELECT * FROM domain_paths WHERE domain_id = ?", (domain_id,)).fetchone() is None
+
+    # Following the redirect shows the derived pattern in the form, ready
+    # to review/edit before saving -- query string stripped, anchored,
+    # escaped.
+    detail_resp = client.get(location, headers=_auth_header())
+    assert rb'value="^/comics/some\-comic"' in detail_resp.data or b"^/comics/some-comic" in detail_resp.data
+
+
+def test_path_to_pattern_strips_query_anchors_and_escapes():
+    import dashboard
+    assert dashboard.path_to_pattern("/comics/some-comic?ref=1") == r"^/comics/some\-comic"
+    assert dashboard.path_to_pattern("/a.b/c") == r"^/a\.b/c"
+    assert dashboard.path_to_pattern(None) == "^/"
+    assert dashboard.path_to_pattern("") == "^/"
+
+
 def test_report_page_lists_logged_rows(client, db_conn):
     db_conn.execute(
         "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason) "
@@ -465,6 +506,103 @@ def test_users_page_sites_link_includes_user_id(client, db_conn):
     user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
     resp = client.get("/users", headers=_auth_header())
     assert f"/domains?user_id={user_id}".encode() in resp.data
+
+
+# ============================================================
+# GH #6: paste-a-URL one-step page approval
+# ============================================================
+
+def test_add_domain_from_url_creates_bump_domain_path_and_assignment(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+
+    resp = client.post(
+        "/domains/add-url",
+        data={"url": "https://asurascans.example/comics/some-comic?ref=1", "user_id": str(user_id)},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    assert f"user_id={user_id}".encode() in resp.headers["Location"].encode()
+
+    domain = db_conn.execute("SELECT * FROM domains WHERE pattern = ?", (r"asurascans\.example",)).fetchone()
+    assert domain is not None
+    assert domain["mode"] == "bump"
+    assert domain["is_global"] == 0
+
+    path_row = db_conn.execute("SELECT * FROM domain_paths WHERE domain_id = ?", (domain["id"],)).fetchone()
+    assert path_row is not None
+    assert path_row["pattern"] == r"^/comics/some\-comic"
+
+    assert db_conn.execute(
+        "SELECT 1 FROM user_domains WHERE user_id = ? AND domain_id = ?", (user_id, domain["id"])
+    ).fetchone() is not None
+
+
+def test_add_domain_from_url_reuses_existing_bump_domain(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    client.post("/domains/add", data={"pattern": r"asurascans\.example", "mode": "bump", "is_global": "on"}, headers=_auth_header())
+
+    client.post(
+        "/domains/add-url",
+        data={"url": "https://asurascans.example/comics/another-one", "user_id": str(user_id)},
+        headers=_auth_header(),
+    )
+    count = db_conn.execute("SELECT COUNT(*) c FROM domains WHERE pattern = ?", (r"asurascans\.example",)).fetchone()["c"]
+    assert count == 1  # no duplicate domain row created
+
+
+def test_add_domain_from_url_rejects_non_bump_existing_domain(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    client.post("/domains/add", data={"pattern": r"asurascans\.example", "mode": "splice", "is_global": "on"}, headers=_auth_header())
+
+    resp = client.post(
+        "/domains/add-url",
+        data={"url": "https://asurascans.example/comics/some-comic", "user_id": str(user_id)},
+        headers=_auth_header(),
+    )
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT * FROM domain_paths").fetchone() is None
+
+
+def test_add_domain_from_url_without_user_id_errors(client, db_conn):
+    resp = client.post(
+        "/domains/add-url", data={"url": "https://asurascans.example/comics/x"}, headers=_auth_header()
+    )
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT * FROM domains").fetchone() is None
+
+
+def test_add_domain_from_url_with_invalid_user_id_errors(client, db_conn):
+    resp = client.post(
+        "/domains/add-url",
+        data={"url": "https://asurascans.example/comics/x", "user_id": "999999"},
+        headers=_auth_header(),
+    )
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT * FROM domains").fetchone() is None
+
+
+def test_add_domain_from_url_with_invalid_url_errors(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    resp = client.post(
+        "/domains/add-url", data={"url": "not a url at all!!", "user_id": str(user_id)}, headers=_auth_header()
+    )
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_domains_filtered_view_shows_paste_url_form(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    resp = client.get(f"/domains?user_id={user_id}", headers=_auth_header())
+    assert b"add-url" in resp.data
+
+
+def test_domains_unfiltered_view_hides_paste_url_form(client, db_conn):
+    resp = client.get("/domains", headers=_auth_header())
+    assert b"add-url" not in resp.data
 
 
 def test_domains_filter_with_nonexistent_user_id_shows_error(client, db_conn):

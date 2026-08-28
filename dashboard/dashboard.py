@@ -472,6 +472,21 @@ def parse_series_url(url: str) -> tuple[str | None, str]:
 # DOMAINS
 # ==========================================================
 
+def path_to_pattern(path: str) -> str:
+    """Derive a starting-point regex pattern from a real, literal request
+    path -- query string stripped, then anchored to the start and
+    regex-escaped so path characters that happen to be regex metacharacters
+    (a literal `.` is the common one) are matched literally rather than as
+    "any character". No trailing anchor: matches the given path and
+    anything after it (e.g. GH #6's motivating case -- approving one
+    comic's URL should keep matching future chapters under the same path),
+    same convention as the seeded CRUNCHYROLL_PATHS prefixes. This is a
+    starting point for the admin to review/edit, not a final answer --
+    callers must still let it go through the normal add_path validation.
+    """
+    return "^" + re.escape((path or "/").split("?", 1)[0])
+
+
 DOMAINS_BODY = """
 <h2>Domains ({{ domains|length }})</h2>
 {% if filtered_user %}
@@ -521,6 +536,16 @@ DOMAINS_BODY = """
   <button class="add" type="submit">Add domain</button>
 </form>
 <p class="hint">"Everyone gets this" is for shared infrastructure (fonts, auth providers, CDNs) -- leave it unchecked for sites you want to assign to specific users individually.</p>
+
+{% if filtered_user %}
+<h2>Approve a specific page for {{ filtered_user.display_name }}</h2>
+<p class="hint">Paste a full URL to approve just that page (and anything after it), without opening the rest of the site. Creates the domain in bump mode if it doesn't already exist, adds a path rule derived from the URL, and assigns both to {{ filtered_user.display_name }}.</p>
+<form class="add-form" method="post" action="{{ url_for('add_domain_from_url') }}">
+  <input type="hidden" name="user_id" value="{{ filtered_user.id }}">
+  <input type="url" name="url" placeholder="https://example.com/some/specific/page" required style="flex:1; min-width:320px;">
+  <button class="add" type="submit">Approve this page</button>
+</form>
+{% endif %}
 """
 
 
@@ -588,6 +613,71 @@ def add_domain():
     return flash_redirect("domains", f"Added {pattern}.", **redirect_kwargs)
 
 
+@app.route("/domains/add-url", methods=["POST"])
+@require_admin
+def add_domain_from_url():
+    """GH #6: approve one specific page without the three separate steps
+    (add domain, flip to bump, add a path pattern from a different page).
+    Only usable from a user's filtered Domains view (?user_id=), since
+    approving a page always means approving it *for someone* -- there's no
+    "everyone gets this one page" equivalent the way whole-domain
+    assignment has "Everyone gets this"."""
+    url = request.form.get("url", "").strip()
+    user_id = request.form.get("user_id", "")
+    redirect_kwargs = {"user_id": user_id} if user_id else {}
+    if not user_id:
+        return flash_redirect(
+            "domains",
+            "This shortcut approves a page for a specific person -- use it from that "
+            "person's filtered Domains view (via the Users page's \"N assigned\" link).",
+            error=True,
+        )
+    conn = get_db()
+    user = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user is None:
+        return flash_redirect("domains", "That user no longer exists.", error=True)
+
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "https://" + url
+    hostname = urlparse(url).hostname
+    # urlparse is lenient about what it calls a "hostname" -- it happily
+    # returns garbage input as netloc/hostname without validating actual
+    # hostname syntax, so a real format check is needed here too.
+    if not hostname or not re.match(
+        r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$", hostname
+    ):
+        return flash_redirect("domains", "That doesn't look like a valid URL.", error=True, **redirect_kwargs)
+    path = urlparse(url).path or "/"
+
+    domain = matching.find_domain(conn, hostname)
+    if domain is None:
+        domain_pattern = re.escape(hostname)
+        conn.execute(
+            "INSERT INTO domains (pattern, mode, kind, is_global, note, created_at) "
+            "VALUES (?, 'bump', 'generic', 0, 'Added via the paste-a-URL shortcut', ?)",
+            (domain_pattern, db.now_iso()),
+        )
+        domain = conn.execute("SELECT * FROM domains WHERE pattern = ?", (domain_pattern,)).fetchone()
+    elif domain["mode"] != "bump":
+        return flash_redirect(
+            "domains",
+            f"{hostname} is already configured, but in {domain['mode']} mode -- a page-level "
+            f"rule needs bump mode. Switch it from Manage first, then try again.",
+            error=True, **redirect_kwargs,
+        )
+
+    conn.execute(
+        "INSERT OR IGNORE INTO domain_paths (domain_id, pattern) VALUES (?, ?)",
+        (domain["id"], path_to_pattern(path)),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO user_domains (user_id, domain_id) VALUES (?, ?)",
+        (user_id, domain["id"]),
+    )
+    conn.commit()
+    return flash_redirect("domains", f"Approved {hostname}{path} for this user.", **redirect_kwargs)
+
+
 @app.route("/domains/delete", methods=["POST"])
 @require_admin
 def delete_domain():
@@ -651,6 +741,9 @@ DOMAIN_DETAIL_BODY = """
 {% if d.mode == 'bump' %}
 <h2>Allowed paths ({{ paths|length }})</h2>
 <p class="hint">Regex patterns matched against the request path. Leave empty to allow any path on this domain once it's otherwise permitted.</p>
+{% if prefill_path %}
+<p class="hint">A blocked request suggested the pattern below (derived from the actual path that was denied) -- review it, broaden or narrow it as needed, then save.</p>
+{% endif %}
 <table>
   <tr><th>Pattern</th><th></th></tr>
   {% for p in paths %}
@@ -669,7 +762,7 @@ DOMAIN_DETAIL_BODY = """
 </table>
 <form class="add-form" method="post" action="{{ url_for('add_path') }}">
   <input type="hidden" name="domain_id" value="{{ d.id }}">
-  <input type="text" name="pattern" placeholder="e.g. ^/discover" required>
+  <input type="text" name="pattern" placeholder="e.g. ^/discover" value="{{ prefill_path or '' }}" required>
   <button class="add" type="submit">Add path</button>
 </form>
 {% endif %}
@@ -693,6 +786,7 @@ def domain_detail(domain_id: int):
     ).fetchall()
     body = render_template_string(
         DOMAIN_DETAIL_BODY, d=d, all_users=all_users, assigned_ids=assigned_ids, paths=paths,
+        prefill_path=request.args.get("prefill_path"),
     )
     return render("domains", body)
 
@@ -865,6 +959,20 @@ def approve_from_report():
         )
         conn.commit()
         return flash_redirect("report", f"Approved {name} for {row['username']}.")
+
+    if row["reason"] == "path_not_allowed":
+        # The domain is already assigned to this user -- that's *why* the
+        # request reached the path check at all -- so INSERT OR IGNORE into
+        # user_domains below would be a silent no-op and the identical
+        # request would be denied again immediately (GH #6). A path pattern
+        # governs future access, not a one-time yes/no, so send the admin
+        # to review a derived starting pattern rather than auto-saving one.
+        domain = matching.find_domain(conn, row["domain"])
+        if domain is None:
+            return flash_redirect("report", "Couldn't find that domain anymore.", error=True)
+        return redirect(url_for(
+            "domain_detail", domain_id=domain["id"], prefill_path=path_to_pattern(row["path"]),
+        ))
 
     domain = matching.find_domain(conn, row["domain"])
     if domain is None:
