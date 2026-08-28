@@ -1,0 +1,27 @@
+name: Tests
+
+# Tier-1 (no-Docker) suite only -- see tests/README.md. Phase 2/3 (real
+# Squid, real Docker networking, a real device) are not covered here and
+# still need to be run manually against a real deployment.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          pip install -r dashboard/requirements.txt
+
+      - name: Run pytest
+        run: pytest -v
