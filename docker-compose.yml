@@ -1,0 +1,37 @@
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: proxy/Dockerfile
+    container_name: parental-proxy
+    restart: unless-stopped
+    ports:
+      - "3128:3128"
+    environment:
+      - LOCAL_NETWORK=${LOCAL_NETWORK:?Set LOCAL_NETWORK in .env}
+      - DASHBOARD_URL=${DASHBOARD_URL:-}
+    volumes:
+      - pp_config:/config
+    depends_on:
+      - dashboard
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: parental-proxy-dashboard
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_BIND:-127.0.0.1}:8787:8787"
+    environment:
+      - DASHBOARD_USER=${DASHBOARD_USER:?Set DASHBOARD_USER in .env}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?Set DASHBOARD_PASSWORD in .env}
+      - DASHBOARD_HOST=0.0.0.0
+      - LOCAL_NETWORK=${LOCAL_NETWORK:?Set LOCAL_NETWORK in .env}
+      - PP_DB_PATH=/config/parental_proxy.db
+      - PP_CA_CERT_PATH=/config/ssl_cert/ca_cert.pem
+    volumes:
+      - pp_config:/config
+
+volumes:
+  pp_config:

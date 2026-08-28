@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# One-command setup: writes .env if needed, then builds and starts the containers.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+echo "=== Parental Proxy v2 -- setup ==="
+echo
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required but wasn't found."
+  echo "Install Docker Desktop (Mac/Windows) or Docker Engine (Linux):"
+  echo "  https://docs.docker.com/get-docker/"
+  exit 1
+fi
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "This needs the 'docker compose' plugin (bundled with recent"
+  echo "Docker Desktop / Docker Engine installs)."
+  exit 1
+fi
+
+guess=""
+if command -v ip >/dev/null 2>&1; then
+  host_ip_guess="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+  if [ -n "${host_ip_guess:-}" ]; then
+    guess="$(printf '%s' "$host_ip_guess" | awk -F. '{print $1"."$2"."$3".0/24"}')"
+  fi
+fi
+
+if [ -f .env ]; then
+  echo ".env already exists -- leaving it as-is."
+  echo "(Delete .env first if you want to redo the questions below.)"
+else
+  echo "A few questions, then this will build and start everything."
+  echo
+  read -rp "LAN CIDR devices will connect from [${guess:-192.168.1.0/24}]: " local_network
+  local_network="${local_network:-${guess:-192.168.1.0/24}}"
+
+  read -rp "Dashboard admin username [admin]: " dash_user
+  dash_user="${dash_user:-admin}"
+
+  read -rsp "Dashboard admin password (leave blank to generate one): " dash_pass
+  echo
+  if [ -z "$dash_pass" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+      dash_pass="$(openssl rand -base64 12)"
+    else
+      dash_pass="$(head -c 12 /dev/urandom | base64)"
+    fi
+    echo "Generated password: $dash_pass"
+    echo "(Save this now -- it's written to .env but not shown again by this script.)"
+  fi
+
+  read -rp "Allow the dashboard from other devices on your LAN (not just this machine)? [y/N]: " lan_dash
+  dash_bind="127.0.0.1"
+  case "${lan_dash:-N}" in
+    y|Y) dash_bind="0.0.0.0" ;;
+  esac
+
+  read -rp "Show a friendly 'blocked' page for blocked sites (recommended)? [Y/n]: " want_blocked
+  dashboard_url=""
+  case "${want_blocked:-Y}" in
+    n|N) dashboard_url="" ;;
+    *)
+      read -rp "  This machine's LAN IP, for the block-page link [${host_ip_guess:-<enter manually>}]: " dash_ip
+      dash_ip="${dash_ip:-${host_ip_guess:-}}"
+      if [ -n "$dash_ip" ]; then
+        dashboard_url="http://${dash_ip}:8787"
+      fi
+      ;;
+  esac
+
+  cat > .env << EOF
+LOCAL_NETWORK=${local_network}
+DASHBOARD_USER=${dash_user}
+DASHBOARD_PASSWORD=${dash_pass}
+DASHBOARD_BIND=${dash_bind}
+DASHBOARD_URL=${dashboard_url}
+EOF
+  echo
+  echo "Wrote .env"
+fi
+
+echo
+echo "Building and starting containers (this can take a minute the first time)..."
+docker compose up -d --build
+
+host_ip=""
+if command -v ip >/dev/null 2>&1; then
+  host_ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+fi
+if [ -z "$host_ip" ] && command -v hostname >/dev/null 2>&1; then
+  host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+fi
+host_ip="${host_ip:-<this-machine-ip>}"
+
+echo
+echo "=== Done ==="
+echo
+echo "1. Open http://${host_ip}:8787/ (or http://127.0.0.1:8787/ if you kept"
+echo "   the dashboard local-only) and log in with your admin credentials."
+echo "2. Create a user for each person, under Users."
+echo "3. On each device: install the CA certificate (Users page has a"
+echo "   download link), then set its proxy to ${host_ip}:3128 with that"
+echo "   person's username/password."
+echo "4. Approve shows/sites per user, or just let them try and approve from"
+echo "   the Report page as blocks show up."
+echo
+echo "Full instructions: see README.md"

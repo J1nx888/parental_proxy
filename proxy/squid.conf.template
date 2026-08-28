@@ -1,0 +1,150 @@
+# ==========================================================
+# PORT / TLS
+# ==========================================================
+
+http_port 3128 ssl-bump generate-host-certificates=on \
+dynamic_cert_mem_cache_size=4MB \
+cert=/config/ssl_cert/ca_cert.pem \
+key=/config/ssl_cert/ca_key.pem \
+tls-min-version=1.2 \
+tls-options=NO_TLSv1,NO_TLSv1_1
+
+sslcrtd_program /usr/lib/squid/security_file_certgen \
+-s /var/lib/squid/ssl_db \
+-M 4MB
+
+sslcrtd_children 5 startup=1 idle=1
+
+
+# ==========================================================
+# AUTHENTICATION -- one login per person (Option A)
+# ==========================================================
+
+auth_param basic program /usr/bin/python3 /opt/parental-proxy/basic_auth_helper.py
+auth_param basic children 10
+auth_param basic realm "Parental Proxy"
+auth_param basic credentialsttl 4 hours
+
+acl authenticated proxy_auth REQUIRED
+
+
+# ==========================================================
+# SSL BUMP STEPS
+# ==========================================================
+
+acl step1 at_step SslBump1
+acl step2 at_step SslBump2
+acl CONNECT method CONNECT
+
+
+# ==========================================================
+# PER-DOMAIN MODE DECISIONS (checked via SNI, before decryption)
+# ==========================================================
+# Same script, three modes -- see proxy/sni_helper.py.
+
+external_acl_type sni_bump_check children-max=10 ttl=0 negative_ttl=0 \
+%LOGIN %>a %ssl::>sni \
+/usr/bin/python3 /opt/parental-proxy/sni_helper.py bump
+
+external_acl_type sni_trusted_check children-max=10 ttl=0 negative_ttl=0 \
+%LOGIN %>a %ssl::>sni \
+/usr/bin/python3 /opt/parental-proxy/sni_helper.py trusted
+
+external_acl_type sni_splice_check children-max=10 ttl=0 negative_ttl=0 \
+%LOGIN %>a %ssl::>sni \
+/usr/bin/python3 /opt/parental-proxy/sni_helper.py splice
+
+external_acl_type sni_block_page_check children-max=10 ttl=0 negative_ttl=0 \
+%LOGIN %>a %ssl::>sni \
+/usr/bin/python3 /opt/parental-proxy/sni_helper.py block_page
+
+acl sni_bump external sni_bump_check
+acl sni_trusted external sni_trusted_check
+acl sni_splice_allowed external sni_splice_check
+acl sni_show_block_page external sni_block_page_check
+
+
+# ==========================================================
+# HTTP-LAYER DECISION (only reached for bump-mode domains,
+# once decrypted -- domain assignment, paths, Crunchyroll shows)
+# ==========================================================
+
+external_acl_type authz_check children-max=20 ttl=0 negative_ttl=0 \
+%LOGIN %>a %DST %PATH \
+/usr/bin/python3 /opt/parental-proxy/authz_helper.py
+
+acl authz_allowed external authz_check
+
+
+# ==========================================================
+# HTTP ACCESS RULES
+# ==========================================================
+
+http_access allow localhost
+
+# Require a valid per-person login for everything else. Squid issues the
+# 407 challenge automatically via the proxy_auth ACL type.
+http_access deny !authenticated
+
+# Allow the CONNECT tunnel and TLS peek/bump negotiation for authenticated
+# clients -- the actual allow/deny decision happens in the ssl_bump rules
+# below (splice/bump/terminate) and, for bump-mode domains, in authz_allowed.
+http_access allow CONNECT
+http_access allow step1
+http_access allow step2
+
+# Final decision for fully-decrypted (bump-mode) requests.
+http_access allow authz_allowed
+# A deny_info line for authz_allowed (pointing blocked bump-mode requests
+# at a friendly page) is appended here by entrypoint.sh if DASHBOARD_URL
+# is configured -- omitted entirely otherwise, since deny_info requires a
+# non-empty argument and envsubst can't conditionally drop a line.
+
+http_access deny all
+
+
+# ==========================================================
+# SSL BUMP DECISION CHAIN
+# ==========================================================
+# Order matters -- first match wins.
+
+ssl_bump peek step1
+
+# trusted: always splice, never checked (raw CDN traffic)
+ssl_bump splice step2 sni_trusted
+
+# bump: fully decrypt for path/show-level rules
+ssl_bump bump step2 sni_bump
+
+# splice (default mode): host-only check via SNI, no decryption
+ssl_bump splice step2 sni_splice_allowed
+
+# Everything else is already going to be denied -- an unconfigured domain,
+# or a splice-mode domain this user isn't permitted. If block_page_mode is
+# 'redirect' (the default, editable from Settings), bump it anyway so the
+# HTTP-layer deny (authz_helper.py) can serve a real page instead of a bare
+# connection failure -- this means the proxy briefly sees that one
+# connection's Host+Path before denying it, a deliberate tradeoff for a
+# better experience. If block_page_mode is 'terminate', this rule always
+# says no, and nothing here is ever decrypted.
+ssl_bump bump step2 sni_show_block_page
+
+# True catch-all: terminate rather than bump-and-deny, since there's
+# nothing to gain from decrypting traffic we're not going to explain either.
+ssl_bump terminate step2 all
+
+
+# ==========================================================
+# PERFORMANCE
+# ==========================================================
+
+quick_abort_min -1 KB
+quick_abort_max 0 KB
+quick_abort_pct 95
+
+read_ahead_gap 1 MB
+
+client_persistent_connections on
+server_persistent_connections on
+
+persistent_request_timeout 60 seconds
