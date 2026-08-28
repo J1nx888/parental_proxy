@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """Access-log writer, shared by the SNI and HTTP-layer authz helpers.
 
-Dedupes: the same (username, domain, allowed, series_id) combination is
-only logged once per DEDUPE_WINDOW_SECONDS, so one browsing session doesn't
-produce dozens of near-identical rows (repeated TLS connections, page
-assets, polling requests, etc). The reporting page stays readable, and
+Dedupes: the same (username, domain, allowed, series_id, path) combination
+is only logged once per DEDUPE_WINDOW_SECONDS, so one browsing session
+doesn't produce dozens of near-identical rows (repeated TLS connections,
+page assets, polling requests, etc). The reporting page stays readable, and
 "who accessed what and when" still reflects genuinely new activity.
+
+`path` is compared with its query string stripped (GH #5): two requests to
+the same page that only differ by a cache-busting or session query
+parameter count as the same dedupe entry, but two genuinely different
+pages on the same domain each get their own row -- previously `path` was
+not part of the key at all, so a bump-mode domain visited normally (many
+pages within the window, the common case) only ever showed its first page
+in the Report. This also means a path-less entry (e.g. the SNI layer,
+which never has a path since nothing is decrypted there) and a later
+path-bearing entry for what's otherwise the same event are different keys
+too, so a richer entry is never hidden behind an earlier, less
+informative one for the same window.
 """
 from __future__ import annotations
 
@@ -31,23 +43,21 @@ def log_access(
     cutoff_iso = iso_secs_ago(DEDUPE_WINDOW_SECONDS)
     # series_id is part of the dedupe key (SQLite's `IS` is null-safe, so two
     # NULLs still match) so two different blocked shows on the same domain
-    # each get their own row instead of collapsing into one.
+    # each get their own row instead of collapsing into one. `path` is
+    # compared query-string-stripped, computed in SQL for the stored value
+    # (instr/substr are built into SQLite) and in Python for the incoming
+    # one, so both sides normalize the same way.
+    normalized_path = path.split("?", 1)[0] if path is not None else None
     recent = conn.execute(
-        "SELECT path FROM access_log "
+        "SELECT 1 FROM access_log "
         "WHERE username = ? AND domain = ? AND allowed = ? AND ts >= ? "
         "AND series_id IS ? "
-        "ORDER BY id DESC LIMIT 1",
-        (username, domain, 1 if allowed else 0, cutoff_iso, series_id),
+        "AND (CASE WHEN instr(path, '?') > 0 THEN substr(path, 1, instr(path, '?') - 1) ELSE path END) IS ? "
+        "LIMIT 1",
+        (username, domain, 1 if allowed else 0, cutoff_iso, series_id, normalized_path),
     ).fetchone()
     if recent is not None:
-        # Let a path-bearing entry through even if a path-less one for the
-        # same key was already logged in this window -- e.g. the SNI layer
-        # logs an unconfigured domain with no path (nothing is decrypted
-        # yet), and the HTTP layer later logs the same domain with the real
-        # path once it is. The path-less entry is strictly less useful, so
-        # it must not block the richer one from ever appearing.
-        if not (path is not None and recent["path"] is None):
-            return
+        return
     conn.execute(
         "INSERT INTO access_log "
         "(ts, user_id, username, domain, path, series_id, series_name, allowed, reason) "
