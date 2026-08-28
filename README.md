@@ -224,18 +224,19 @@ Separately (not part of the `pytest` suite, just a manual syntax check):
 Squid config template, Dockerfiles, docker-compose.yml, and both shell
 scripts for syntax validity.
 
-**Not tested here, and worth doing before relying on this:** an actual
-`docker compose up --build` and a real device going through the full flow
-(login prompt, CA trust, Crunchyroll playback, a second user seeing
-different sites). The Squid config in particular -- `external_acl_type`
-with `%ssl::>sni` at ssl_bump step2, `ssl_bump terminate`, and Basic Auth
-combined with ssl-bump -- are all individually standard, documented Squid
-features, but this exact combination hasn't been run against real Squid.
-If step2's SNI-based routing doesn't behave exactly as expected on your
-Squid version, the most likely symptom is everything falling through to
-`ssl_bump terminate step2 all` (fails closed -- sites simply won't load
-rather than silently passing through unfiltered), which is a safe failure
-mode to debug from.
+**Update (2026-08-28): all of this has now actually been run**, against a
+disposable Debian 12 VM with Docker, and separately on a real Android
+tablet -- `docker compose up --build`, real proxy auth, real per-site and
+per-show enforcement, CA trust, and real Crunchyroll playback (one show
+approved and playing, a second, unapproved show correctly blocked). Five
+real bugs were found and fixed in the process (Debian's plain `squid`
+package lacking SSL-Bump support, a missing directory needed for cert
+generation, a Squid protocol quirk that silently broke every
+`external_acl_type` decision, an `http_access` ordering bug that bypassed
+per-show enforcement entirely, and a wrong assumption about Basic-auth
+percent-encoding) -- see `docs/review-2026-08-28.md` for the full writeup
+of each. The Squid `external_acl_type`/`ssl_bump`/Basic-Auth combination
+this project depends on is confirmed working as designed.
 
 ## Backing up / moving to another machine
 
