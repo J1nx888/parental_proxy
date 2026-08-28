@@ -86,6 +86,22 @@ def test_crunchyroll_paths_attached_to_crunchyroll_domain_only(conn):
     assert count == len(seed_defaults.CRUNCHYROLL_PATHS)
 
 
+def test_crunchyroll_personalization_path_is_allowed(conn):
+    """GH #4: the 'Top 10'-style recommendation API was blocked by the
+    path allowlist -- confirmed on a real device -- since it wasn't in
+    CRUNCHYROLL_PATHS."""
+    import matching
+
+    seed_defaults.seed(conn)
+    conn.commit()
+    cr_row = conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"crunchyroll\.com",)).fetchone()
+    path = (
+        "/personalization/v2/personalization?collectionId=Curation_Collections/"
+        "Dynamic/Top_10_US&vendor=thinkanalytics&locale=en-US"
+    )
+    assert matching.path_allowed(conn, cr_row["id"], path) is True
+
+
 def test_all_seeded_domain_patterns_are_unique(conn):
     seed_defaults.seed(conn)
     conn.commit()

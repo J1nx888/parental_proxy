@@ -190,6 +190,50 @@ def test_sni_handle_block_page_redirect_when_configured(conn):
     assert sni_helper.handle_block_page(conn, "-", "1.2.3.4", "anything.com") is True
 
 
+def test_sni_handle_block_page_terminate_logs_unconfigured_domain(conn):
+    """GH #1: a genuinely unconfigured domain must be visible on the Report
+    page even under the safe default (terminate) mode, since nothing else
+    in the SNI-layer chain -- or downstream -- ever logs it otherwise."""
+    _add_user(conn, "kid1", "pw")
+    assert sni_helper.handle_block_page(conn, "kid1", "192.168.1.5", "unknown-site.example") is False
+    row = conn.execute("SELECT * FROM access_log").fetchone()
+    assert row is not None
+    assert row["username"] == "kid1"
+    assert row["domain"] == "unknown-site.example"
+    assert row["path"] is None
+    assert row["allowed"] == 0
+    assert row["reason"] == "unknown_domain"
+
+
+def test_sni_handle_block_page_terminate_unauthenticated_uses_placeholder(conn):
+    sni_helper.handle_block_page(conn, "-", "192.168.1.5", "unknown-site.example")
+    row = conn.execute("SELECT * FROM access_log").fetchone()
+    assert row is not None
+    assert row["username"] == "(unauthenticated)"
+    assert row["user_id"] is None
+
+
+def test_sni_handle_block_page_terminate_does_not_double_log_configured_domain(conn):
+    """A configured splice-mode domain the user isn't permitted is already
+    logged by handle_splice before this rule is ever reached -- logging it
+    again here would just be a worse duplicate."""
+    _add_user(conn, "kid1", "pw")
+    _add_domain(conn, r"example\.com", mode="splice", is_global=0)
+    sni_helper.handle_block_page(conn, "kid1", "192.168.1.5", "example.com")
+    assert conn.execute("SELECT * FROM access_log").fetchone() is None
+
+
+def test_sni_handle_block_page_redirect_does_not_log(conn):
+    """In redirect mode, authz_helper.decide() logs this same case with the
+    real path once the connection is bumped -- logging it here too would
+    just lose to the dedupe window (GH #5) and hide the richer entry."""
+    db.set_setting(conn, "block_page_mode", "redirect")
+    conn.commit()
+    _add_user(conn, "kid1", "pw")
+    sni_helper.handle_block_page(conn, "kid1", "192.168.1.5", "unknown-site.example")
+    assert conn.execute("SELECT * FROM access_log").fetchone() is None
+
+
 # ============================================================
 # authz_helper.decide -- HTTP-layer decision on bump-mode domains
 # ============================================================

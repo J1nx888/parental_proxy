@@ -30,11 +30,14 @@ static argument) and is otherwise unused -- it must still be declared and
 consumed, because Squid always appends %DATA to an external_acl_type FORMAT
 that doesn't already include it (see squid.conf.template's comment).
 
-Only 'splice' mode logs to access_log at this stage -- spliced connections
-are never decrypted, so this is the only point that traffic is ever
-observed at all. 'bump' mode and the 'block_page' bump-for-denial path both
-log richly at the HTTP layer instead (authz_helper.py, once decrypted), and
-'trusted' mode is deliberately never logged (see project README).
+'splice' mode logs every decision at this stage -- spliced connections are
+never decrypted, so this is the only point that traffic is ever observed at
+all. 'bump' mode and the 'block_page' bump-for-denial path both log richly
+at the HTTP layer instead (authz_helper.py, once decrypted). 'block_page'
+also logs a domain-only entry itself, but *only* for a genuinely
+unconfigured domain in 'terminate' mode -- otherwise that case would never
+be recorded anywhere, since nothing downstream ever runs to log it either
+(GH #1). 'trusted' mode is deliberately never logged (see project README).
 """
 from __future__ import annotations
 
@@ -97,6 +100,40 @@ def handle_block_page(conn, login: str, client_ip: str, sni: str, _data: str = "
     # deny this once decrypted regardless, and http_access already requires
     # authentication before any ssl_bump step is reached at all.)
     mode = db.get_setting(conn, "block_page_mode", "terminate")
+
+    # In 'terminate' mode this connection is never decrypted, so this is the
+    # only point in the whole SNI-layer decision chain that can ever record
+    # a genuinely *unconfigured* domain: sni_bump/sni_trusted/
+    # sni_splice_allowed each require a matching `domains` row before doing
+    # anything, so none of them log one, and authz_helper.py never runs
+    # either since nothing gets decrypted. Without this, an unconfigured
+    # domain a kid tries is completely invisible on the Report page under
+    # the safe default -- no way to reactively approve it (GH #1).
+    #
+    # Skip logging when a domain row *does* exist: a configured splice-mode
+    # domain the user isn't permitted is already logged by handle_splice
+    # before this rule is ever reached, so logging again here would just be
+    # a duplicate (and a worse one -- no LAN/auth-specific reason).
+    #
+    # Skip logging entirely in 'redirect' mode: that path bumps the
+    # connection so authz_helper.decide() logs this same case
+    # (reason="unknown_domain") with the real path attached, which is
+    # strictly better information. Logging both would just mean the dedupe
+    # window (keyed without `path`, see GH #5) discards whichever one runs
+    # second.
+    if mode == "terminate" and matching.find_domain(conn, sni) is None:
+        if login in ("-", "", None):
+            logging_util.log_access(
+                conn, user_id=None, username="(unauthenticated)", domain=sni,
+                path=None, allowed=False, reason="unknown_domain",
+            )
+        else:
+            user = matching.get_user_by_username(conn, login)
+            logging_util.log_access(
+                conn, user_id=user["id"] if user else None, username=login,
+                domain=sni, path=None, allowed=False, reason="unknown_domain",
+            )
+
     return mode == "redirect"
 
 

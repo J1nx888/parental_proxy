@@ -182,12 +182,12 @@ def test_resolve_happy_path_maps_entries_by_id(monkeypatch):
     payload = {
         "data": [
             {"id": "OBJ1", "episode_metadata": {"series_id": "SER1"}},
-            {"id": "obj2", "season_metadata": {"series_id": "ser2"}},
+            {"id": "obj2", "type": "series"},
         ]
     }
     monkeypatch.setattr(cr_api._OPENER, "open", lambda request, timeout=None: _json_response(payload))
     result = resolver.resolve(["OBJ1", "OBJ2", "OBJ3"])
-    assert result == {"OBJ1": "SER1", "OBJ2": "SER2", "OBJ3": None}
+    assert result == {"OBJ1": "SER1", "OBJ2": "OBJ2", "OBJ3": None}
 
 
 def test_resolve_missing_data_list_raises(monkeypatch):
@@ -261,14 +261,6 @@ def test_series_id_of_episode_metadata_branch():
     assert cr_api.series_id_of({"episode_metadata": {"series_id": "abc"}}) == "ABC"
 
 
-def test_series_id_of_season_metadata_branch():
-    assert cr_api.series_id_of({"season_metadata": {"series_id": "abc"}}) == "ABC"
-
-
-def test_series_id_of_top_level_series_id_branch():
-    assert cr_api.series_id_of({"series_id": "abc"}) == "ABC"
-
-
 def test_series_id_of_type_series_branch():
     assert cr_api.series_id_of({"type": "series", "id": "abc"}) == "ABC"
 
@@ -278,12 +270,33 @@ def test_series_id_of_no_match_returns_none():
     assert cr_api.series_id_of({}) is None
 
 
-def test_series_id_of_prefers_earlier_branch_when_multiple_present():
-    entry = {
-        "episode_metadata": {"series_id": "from_episode"},
-        "series_id": "from_top_level",
+def test_series_id_of_real_season_shape_has_no_series_id_field():
+    """GH #3: verified against a real /content/v2/cms/objects/ response for
+    a season entry -- season_metadata has no series_id field at all in the
+    current API (the parent series only appears inside a pipe-delimited
+    `identifier` string). A season entry must resolve to None, not crash or
+    silently match something unrelated -- this is real captured shape, not
+    a hypothetical."""
+    real_season_entry = {
+        "id": "GR19CPDWM",
+        "type": "season",
+        "title": "Solo Leveling",
+        "season_metadata": {
+            "audio_locales": ["ja-JP"],
+            "season_display_number": "1",
+            "season_sequence_number": 1,
+            "identifier": "GDKHZEJ0K|S00320668",
+        },
     }
-    assert cr_api.series_id_of(entry) == "FROM_EPISODE"
+    assert cr_api.series_id_of(real_season_entry) is None
+
+
+def test_series_id_of_real_series_shape_has_only_id_and_type():
+    """GH #3: verified against a real response -- a 'series' object entry
+    has no fields at all beyond id/type, so the type=='series' branch using
+    its own id is the only way to resolve it, not a redundant fallback."""
+    real_series_entry = {"id": "GDKHZEJ0K", "type": "series"}
+    assert cr_api.series_id_of(real_series_entry) == "GDKHZEJ0K"
 
 
 def test_series_id_of_ignores_non_string_or_empty_values():

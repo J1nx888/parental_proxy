@@ -248,7 +248,7 @@ USERS_BODY = """
   <tr>
     <td><code>{{ u.username }}</code></td>
     <td>{{ u.display_name }}</td>
-    <td><a href="{{ url_for('domains') }}">{{ u.domain_count }} assigned</a></td>
+    <td><a href="{{ url_for('domains', user_id=u.id) }}">{{ u.domain_count }} assigned</a></td>
     <td>{{ u.show_count }} approved</td>
     <td>
       <a class="btn small" href="{{ url_for('user_detail', user_id=u.id) }}">Manage</a>
@@ -469,6 +469,13 @@ def parse_series_url(url: str) -> tuple[str | None, str]:
 
 DOMAINS_BODY = """
 <h2>Domains ({{ domains|length }})</h2>
+{% if filtered_user %}
+<p class="hint">
+  Showing domains assigned to <strong>{{ filtered_user.display_name }}</strong>
+  (plus everyone's global domains) --
+  <a href="{{ url_for('domains') }}">clear filter</a>
+</p>
+{% endif %}
 <p class="hint">
   <span class="badge mode-splice">splice</span> host-only, never decrypted &nbsp;
   <span class="badge mode-bump">bump</span> fully decrypted, path/show rules apply &nbsp;
@@ -514,8 +521,28 @@ DOMAINS_BODY = """
 @require_admin
 def domains():
     conn = get_db()
-    rows = conn.execute("SELECT * FROM domains ORDER BY is_global DESC, pattern").fetchall()
-    return render("domains", render_template_string(DOMAINS_BODY, domains=rows))
+    filter_user_id = request.args.get("user_id", "")
+    filtered_user = None
+    if filter_user_id:
+        filtered_user = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (filter_user_id,)
+        ).fetchone()
+    if filtered_user:
+        # Global domains apply to this user too, even without an explicit
+        # user_domains row -- same rule the proxy itself uses at request time.
+        rows = conn.execute(
+            "SELECT d.* FROM domains d "
+            "LEFT JOIN user_domains ud ON ud.domain_id = d.id AND ud.user_id = ? "
+            "WHERE d.is_global = 1 OR ud.user_id IS NOT NULL "
+            "ORDER BY d.is_global DESC, d.pattern",
+            (filter_user_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM domains ORDER BY is_global DESC, pattern").fetchall()
+    return render(
+        "domains",
+        render_template_string(DOMAINS_BODY, domains=rows, filtered_user=filtered_user),
+    )
 
 
 @app.route("/domains/add", methods=["POST"])

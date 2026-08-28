@@ -74,6 +74,8 @@ CRUNCHYROLL_PATHS = [
     r"^/v1/track", r"^/v1/p$",
     r"/content-reviews/",
     r"/v1/",
+    # "Top 10"-style recommendation rows on the discover/home page (GH #4).
+    r"^/personalization/v[0-9]+/",
 ]
 
 

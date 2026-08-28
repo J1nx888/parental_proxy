@@ -95,23 +95,30 @@ class TokenManager:
 
 
 def series_id_of(entry: dict[str, Any]) -> str | None:
-    """Return the parent series ID for a CMS object entry, or None if unknown."""
+    """Return the parent series ID for a CMS object entry, or None if unknown.
+
+    Verified 2026-08-28 against real /content/v2/cms/objects/ responses
+    (GH #3): an 'episode' entry has episode_metadata.series_id; a 'series'
+    entry has no series_id-shaped field at all, only its own id. Two
+    previously-speculative fallbacks were dropped after failing to fire
+    against any real entry sampled (episode, season, and series types):
+    season_metadata has no series_id field in the current API at all -- the
+    parent series is only present as the first half of a pipe-delimited
+    `identifier` string ("SERIESID|SEASONCODE"), which isn't reliable
+    enough to parse here, and isn't needed anyway since series_resolve.py
+    never looks up a season object in practice (only episode/playback
+    objects); and no sampled entry of any type had a top-level `series_id`
+    field either. Keeping untested branches that check for fields the real
+    API doesn't produce would just be misleading, not "extra safety" --
+    worst case if some other object type genuinely needs a dropped branch,
+    resolution fails closed (returns None) exactly like any other unknown
+    object id already does.
+    """
     episode_metadata = entry.get("episode_metadata")
     if isinstance(episode_metadata, dict):
         series_id = episode_metadata.get("series_id")
         if isinstance(series_id, str) and series_id:
             return series_id.upper()
-
-    season_metadata = entry.get("season_metadata")
-    if isinstance(season_metadata, dict):
-        series_id = season_metadata.get("series_id")
-        if isinstance(series_id, str) and series_id:
-            return series_id.upper()
-
-    # Some list endpoints return series_id at top level. Harmless for objects.
-    own_parent = entry.get("series_id")
-    if isinstance(own_parent, str) and own_parent:
-        return own_parent.upper()
 
     if entry.get("type") == "series":
         own_id = entry.get("id")

@@ -426,6 +426,48 @@ def test_remove_show_deletes_row(client, db_conn):
 
 
 # ============================================================
+# domains filtered by user (GH #2)
+# ============================================================
+
+def test_domains_filtered_by_user_shows_only_assigned_and_global(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    client.post("/users/add", data={"username": "kid2", "password": "pw"}, headers=_auth_header())
+    user1_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    user2_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid2'").fetchone()[0]
+
+    client.post("/domains/add", data={"pattern": r"global\.example", "mode": "splice", "is_global": "on"}, headers=_auth_header())
+    client.post("/domains/add", data={"pattern": r"kid1-only\.example", "mode": "splice"}, headers=_auth_header())
+    client.post("/domains/add", data={"pattern": r"kid2-only\.example", "mode": "splice"}, headers=_auth_header())
+
+    global_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"global\.example",)).fetchone()[0]
+    kid1_domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"kid1-only\.example",)).fetchone()[0]
+    client.post("/domains/toggle-user", data={"domain_id": kid1_domain_id, "user_id": user1_id, "action": "add"}, headers=_auth_header())
+
+    resp = client.get(f"/domains?user_id={user1_id}", headers=_auth_header())
+    assert resp.status_code == 200
+    assert rb"global\.example" in resp.data
+    assert rb"kid1-only\.example" in resp.data
+    assert rb"kid2-only\.example" not in resp.data
+    assert b"clear filter" in resp.data
+
+
+def test_domains_unfiltered_shows_everything(client, db_conn):
+    client.post("/domains/add", data={"pattern": r"a\.example", "mode": "splice"}, headers=_auth_header())
+    client.post("/domains/add", data={"pattern": r"b\.example", "mode": "splice"}, headers=_auth_header())
+    resp = client.get("/domains", headers=_auth_header())
+    assert rb"a\.example" in resp.data
+    assert rb"b\.example" in resp.data
+    assert b"clear filter" not in resp.data
+
+
+def test_users_page_sites_link_includes_user_id(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    resp = client.get("/users", headers=_auth_header())
+    assert f"/domains?user_id={user_id}".encode() in resp.data
+
+
+# ============================================================
 # domain_detail / update_domain
 # ============================================================
 
