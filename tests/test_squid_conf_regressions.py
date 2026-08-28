@@ -19,6 +19,14 @@ tests check the config's text/structure directly instead.
    approved or not) -- fails OPEN, the more serious direction. Fixed by
    qualifying both with CONNECT, which only matches during the tunnel/
    negotiation phase.
+
+A third, in proxy/basic_auth_helper.py: despite the module's own docstring
+claiming "classic Basic doesn't percent-encode", a real Squid 5.7 instance
+does percent-encode both auth_param basic fields, identically to the
+external_acl_type helpers. A raw capture showed a password of `a b%c d`
+arriving as `a%20b%25c%20d`. With unquote=False (the previous setting), any
+password containing a space, `%`, or other character needing escaping could
+never successfully authenticate.
 """
 from __future__ import annotations
 
@@ -26,6 +34,7 @@ import re
 from pathlib import Path
 
 import authz_helper
+import basic_auth_helper
 import sni_helper
 import squid_helper
 
@@ -66,6 +75,20 @@ def _captured_field_count(monkeypatch, call) -> int:
     return captured["field_count"]
 
 
+def _captured_run_kwargs(monkeypatch, call) -> dict:
+    captured: dict = {}
+
+    def fake_run(name, field_count, handler, **kwargs):
+        captured.update(kwargs)
+        captured["_called"] = True
+        return 0
+
+    monkeypatch.setattr(squid_helper, "run", fake_run)
+    call()
+    assert captured.pop("_called", False), "squid_helper.run was never called"
+    return captured
+
+
 def test_sni_helper_field_count_matches_squid_conf_template(monkeypatch):
     for mode, acl_name in [
         ("bump", "sni_bump_check"),
@@ -88,6 +111,20 @@ def test_authz_helper_field_count_matches_squid_conf_template(monkeypatch):
     assert actual == expected, (
         f"authz_helper.py: registered field_count={actual} but "
         f"squid.conf.template's authz_check FORMAT actually sends {expected} fields"
+    )
+
+
+def test_basic_auth_helper_unquotes_fields(monkeypatch):
+    """Regression: a real Squid 5.7 instance percent-encodes auth_param basic
+    fields (confirmed by raw capture: a password of `a b%c d` arrived as
+    `a%20b%25c%20d`) despite basic_auth_helper.py's old docstring claiming
+    otherwise. unquote=False meant any password needing escaping (a space,
+    a `%`, ...) could never authenticate."""
+    kwargs = _captured_run_kwargs(monkeypatch, basic_auth_helper.main)
+    assert kwargs.get("unquote", True) is True, (
+        "basic_auth_helper.main() must pass unquote=True (or omit it) -- a "
+        "real Squid instance percent-encodes these fields; see "
+        "docs/review-2026-08-28.md item 2.8."
     )
 
 
