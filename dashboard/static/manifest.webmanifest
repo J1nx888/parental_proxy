@@ -1,0 +1,14 @@
+{
+  "name": "Parental Proxy",
+  "short_name": "ParentalProxy",
+  "description": "Admin dashboard for the parental proxy: users, sites, shows, and the access report.",
+  "start_url": "/report",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#2f6fed",
+  "icons": [
+    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

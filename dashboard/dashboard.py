@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import sys
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from urllib.parse import urlparse
@@ -133,49 +134,36 @@ BASE = """
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Parental Proxy</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 920px; margin: 1.5rem auto; padding: 0 1rem; line-height: 1.4; }
-  nav { display: flex; gap: 1.2rem; margin-bottom: 1.5rem; border-bottom: 1px solid #8884; padding-bottom: .8rem; flex-wrap: wrap; }
-  nav a { text-decoration: none; color: inherit; opacity: .6; font-weight: 600; }
-  nav a.active { opacity: 1; border-bottom: 2px solid currentColor; }
-  h1 { font-size: 1.3rem; }
-  h2 { font-size: 1.05rem; margin-top: 2rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; }
-  table { width: 100%; border-collapse: collapse; margin-top: .6rem; }
-  td, th { text-align: left; padding: .35rem .3rem; border-bottom: 1px solid #8882; font-size: .92rem; }
-  th { font-size: .75rem; text-transform: uppercase; opacity: .6; }
-  form.inline { display: inline; }
-  .add-form { display: flex; gap: .5rem; margin-top: .8rem; flex-wrap: wrap; align-items: center; }
-  .add-form input[type=text], .add-form input[type=url], .add-form input[type=password], .add-form select { padding: .4rem; }
-  button, .btn { padding: .3rem .7rem; border-radius: 4px; border: none; cursor: pointer; font-size: .85rem; }
-  button.danger { background: #c0392b; color: white; }
-  button.add, .btn.add { background: #2e7d32; color: white; }
-  button.small { padding: .15rem .5rem; font-size: .78rem; }
-  .flash { padding: .5rem .8rem; border-radius: 6px; margin-bottom: 1rem; }
-  .flash.error { background: #c0392b22; border: 1px solid #c0392b88; }
-  .flash.ok { background: #2e7d3222; border: 1px solid #2e7d3288; }
-  .hint { font-size: .82rem; opacity: .7; margin: .3rem 0 .8rem; }
-  code { background: #8882; padding: .1rem .3rem; border-radius: 3px; }
-  .badge { display: inline-block; padding: .05rem .45rem; border-radius: 10px; font-size: .72rem; font-weight: 600; }
-  .badge.mode-splice { background: #2e7d3225; }
-  .badge.mode-bump { background: #c0392b20; }
-  .badge.mode-trusted { background: #8884; }
-  .badge.allowed { background: #2e7d3225; color: #2e7d32; }
-  .badge.blocked { background: #c0392b20; color: #c0392b; }
-  .cert-banner { background: #2e7d3215; border: 1px solid #2e7d3255; border-radius: 8px; padding: .7rem 1rem; margin-bottom: 1.2rem; }
-  .cert-banner a.btn { text-decoration: none; }
-</style>
+<meta name="theme-color" content="#2f6fed">
+<link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
+<link rel="icon" href="{{ url_for('static', filename='icons/favicon.ico') }}">
+<link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
 </head>
 <body>
-<h1>Parental Proxy</h1>
-<nav>
-  <a href="{{ url_for('report') }}" class="{{ 'active' if active=='report' else '' }}">Report</a>
-  <a href="{{ url_for('users') }}" class="{{ 'active' if active=='users' else '' }}">Users</a>
-  <a href="{{ url_for('domains') }}" class="{{ 'active' if active=='domains' else '' }}">Domains</a>
-  <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
-</nav>
+<header class="topbar">
+  <div class="page">
+    <a class="brand" href="{{ url_for('report') }}">
+      <img src="{{ url_for('static', filename='icons/icon-192.png') }}" alt="">
+      Parental Proxy
+    </a>
+    <nav class="tabs">
+      <a href="{{ url_for('report') }}" class="{{ 'active' if active=='report' else '' }}">Report</a>
+      <a href="{{ url_for('users') }}" class="{{ 'active' if active=='users' else '' }}">Users</a>
+      <a href="{{ url_for('domains') }}" class="{{ 'active' if active=='domains' else '' }}">Domains</a>
+      <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
+    </nav>
+  </div>
+</header>
+<div class="page">
 {% if message %}<div class="flash {{ 'error' if error else 'ok' }}">{{ message }}</div>{% endif %}
 {{ body|safe }}
+</div>
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+}
+</script>
 </body>
 </html>
 """
@@ -196,6 +184,17 @@ def flash_redirect(endpoint: str, message: str, error: bool = False, **kwargs):
 # CA CERT (public, unauthenticated)
 # ==========================================================
 
+@app.route("/sw.js")
+def service_worker():
+    # Served from root (not /static/sw.js) so its default scope is the whole
+    # app -- a service worker can only control paths at or below where it's
+    # served from, and it needs to control every dashboard page, not just
+    # /static/ assets.
+    resp = send_file(Path(app.static_folder) / "sw.js", mimetype="application/javascript")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
 @app.route("/ca-cert")
 def ca_cert():
     if not CA_CERT_PATH.exists():
@@ -215,8 +214,21 @@ def blocked():
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<title>Blocked</title>"
-        "<style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;text-align:center;}"
-        "h1{font-size:1.3rem;}</style></head><body>"
+        "<style>"
+        ":root{color-scheme:light dark;}"
+        "body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:28rem;margin:4rem auto;"
+        "padding:0 1.25rem;text-align:center;color:#1e293b;}"
+        "@media (prefers-color-scheme:dark){body{color:#e5eaf3;}}"
+        ".icon{width:56px;height:56px;border-radius:16px;background:#2f6fed;display:inline-flex;"
+        "align-items:center;justify-content:center;margin-bottom:1rem;}"
+        "h1{font-size:1.15rem;margin:0 0 .5rem;}"
+        "p{font-size:.92rem;opacity:.75;}"
+        "</style></head><body>"
+        "<div class='icon'>"
+        "<svg width='28' height='28' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2.2' "
+        "stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l8 3.5v5.2c0 4.7-3.2 8.6-8 9.8"
+        "-4.8-1.2-8-5.1-8-9.8V6.5L12 3z'/></svg>"
+        "</div>"
         "<h1>This site or show isn't approved.</h1>"
         "<p>Ask a parent to check the dashboard if you think this should be allowed.</p>"
         "</body></html>",
@@ -241,7 +253,9 @@ USERS_BODY = """
   <br><a class="btn add" href="{{ url_for('ca_cert') }}">Download CA certificate</a>
 </div>
 
+<div class="card">
 <h2>Users ({{ users|length }})</h2>
+<div class="table-scroll">
 <table>
   <tr><th>Username</th><th>Display name</th><th>Sites</th><th>Shows</th><th></th></tr>
   {% for u in users %}
@@ -262,6 +276,7 @@ USERS_BODY = """
   <tr><td colspan="5"><em>No users yet.</em></td></tr>
   {% endfor %}
 </table>
+</div>
 <form class="add-form" method="post" action="{{ url_for('add_user') }}">
   <input type="text" name="username" placeholder="username, e.g. kid1" required>
   <input type="text" name="display_name" placeholder="Display name, e.g. Alex">
@@ -269,6 +284,7 @@ USERS_BODY = """
   <button class="add" type="submit">Add user</button>
 </form>
 <p class="hint">This username/password is what gets configured in that person's device proxy settings (not the dashboard login).</p>
+</div>
 """
 
 
@@ -346,9 +362,11 @@ def reset_password():
 
 USER_DETAIL_BODY = """
 <p><a href="{{ url_for('users') }}">&larr; All users</a></p>
-<h2>{{ u.display_name }} <code>({{ u.username }})</code></h2>
+<h1>{{ u.display_name }} <code>({{ u.username }})</code></h1>
 
+<div class="card">
 <h2>Assigned sites</h2>
+<div class="table-scroll">
 <table>
   <tr><th>Domain</th><th>Mode</th></tr>
   {% for d in assigned_domains %}
@@ -357,9 +375,13 @@ USER_DETAIL_BODY = """
   <tr><td colspan="2"><em>No per-user sites assigned (still gets global sites).</em></td></tr>
   {% endfor %}
 </table>
+</div>
 <p class="hint">Manage assignment from the <a href="{{ url_for('domains') }}">Domains</a> page -- pick the site there and check this user.</p>
+</div>
 
+<div class="card">
 <h2>Approved Crunchyroll shows ({{ shows|length }})</h2>
+<div class="table-scroll">
 <table>
   <tr><th>Series ID</th><th>Name</th><th></th></tr>
   {% for s in shows %}
@@ -378,19 +400,23 @@ USER_DETAIL_BODY = """
   <tr><td colspan="3"><em>No shows approved yet.</em></td></tr>
   {% endfor %}
 </table>
+</div>
 <form class="add-form" method="post" action="{{ url_for('add_show') }}">
   <input type="hidden" name="user_id" value="{{ u.id }}">
   <input type="url" name="url" placeholder="https://www.crunchyroll.com/series/GYE5K0XVR/ace-attorney" required style="flex:1; min-width:280px;">
   <input type="text" name="name" placeholder="Name (auto-filled, editable)">
   <button class="add" type="submit">Approve show</button>
 </form>
+</div>
 
+<div class="card">
 <h2>Change password</h2>
 <form class="add-form" method="post" action="{{ url_for('reset_password') }}">
   <input type="hidden" name="user_id" value="{{ u.id }}">
   <input type="password" name="password" placeholder="New password" required>
   <button class="add" type="submit">Update password</button>
 </form>
+</div>
 """
 
 
@@ -488,6 +514,7 @@ def path_to_pattern(path: str) -> str:
 
 
 DOMAINS_BODY = """
+<div class="card">
 <h2>Domains ({{ domains|length }})</h2>
 {% if filtered_user %}
 <p class="hint">
@@ -501,6 +528,7 @@ DOMAINS_BODY = """
   <span class="badge mode-bump">bump</span> fully decrypted, path/show rules apply &nbsp;
   <span class="badge mode-trusted">trusted</span> always passed through, unchecked
 </p>
+<div class="table-scroll">
 <table>
   <tr><th>Pattern</th><th>Mode</th><th>Access</th><th>Note</th><th></th></tr>
   {% for d in domains %}
@@ -522,6 +550,7 @@ DOMAINS_BODY = """
   <tr><td colspan="5"><em>No domains configured.</em></td></tr>
   {% endfor %}
 </table>
+</div>
 
 <form class="add-form" method="post" action="{{ url_for('add_domain') }}">
   {% if filtered_user %}<input type="hidden" name="user_id" value="{{ filtered_user.id }}">{% endif %}
@@ -536,8 +565,10 @@ DOMAINS_BODY = """
   <button class="add" type="submit">Add domain</button>
 </form>
 <p class="hint">"Everyone gets this" is for shared infrastructure (fonts, auth providers, CDNs) -- leave it unchecked for sites you want to assign to specific users individually.</p>
+</div>
 
 {% if filtered_user %}
+<div class="card">
 <h2>Approve a specific page for {{ filtered_user.display_name }}</h2>
 <p class="hint">Paste a full URL to approve just that page (and anything after it), without opening the rest of the site. Creates the domain in bump mode if it doesn't already exist, adds a path rule derived from the URL, and assigns both to {{ filtered_user.display_name }}.</p>
 <form class="add-form" method="post" action="{{ url_for('add_domain_from_url') }}">
@@ -545,6 +576,7 @@ DOMAINS_BODY = """
   <input type="url" name="url" placeholder="https://example.com/some/specific/page" required style="flex:1; min-width:320px;">
   <button class="add" type="submit">Approve this page</button>
 </form>
+</div>
 {% endif %}
 """
 
@@ -699,11 +731,12 @@ def delete_domain():
 
 DOMAIN_DETAIL_BODY = """
 <p><a href="{{ url_for('domains') }}">&larr; All domains</a></p>
-<h2><code>{{ d.pattern }}</code> <span class="badge mode-{{ d.mode }}">{{ d.mode }}</span></h2>
+<h1><code>{{ d.pattern }}</code> <span class="badge mode-{{ d.mode }}">{{ d.mode }}</span></h1>
 {% if d.kind == 'crunchyroll' %}
 <p class="hint">This is the built-in Crunchyroll domain. Shows are approved per-user from each user's page; the paths below are a defense-in-depth safety net, not the main show filter.</p>
 {% endif %}
 
+<div class="card">
 <form class="add-form" method="post" action="{{ url_for('update_domain') }}">
   <input type="hidden" name="domain_id" value="{{ d.id }}">
   <select name="mode">
@@ -715,9 +748,12 @@ DOMAIN_DETAIL_BODY = """
   <input type="text" name="note" value="{{ d.note or '' }}" placeholder="Note">
   <button class="add" type="submit">Save</button>
 </form>
+</div>
 
 {% if not d.is_global %}
+<div class="card">
 <h2>Assigned users</h2>
+<div class="table-scroll">
 <table>
   <tr><th></th><th>User</th></tr>
   {% for u in all_users %}
@@ -736,14 +772,18 @@ DOMAIN_DETAIL_BODY = """
   </tr>
   {% endfor %}
 </table>
+</div>
+</div>
 {% endif %}
 
 {% if d.mode == 'bump' %}
+<div class="card">
 <h2>Allowed paths ({{ paths|length }})</h2>
 <p class="hint">Regex patterns matched against the request path. Leave empty to allow any path on this domain once it's otherwise permitted.</p>
 {% if prefill_path %}
 <p class="hint">A blocked request suggested the pattern below (derived from the actual path that was denied) -- review it, broaden or narrow it as needed, then save.</p>
 {% endif %}
+<div class="table-scroll">
 <table>
   <tr><th>Pattern</th><th></th></tr>
   {% for p in paths %}
@@ -760,11 +800,13 @@ DOMAIN_DETAIL_BODY = """
   <tr><td colspan="2"><em>No path restriction -- any path is allowed once the domain check passes.</em></td></tr>
   {% endfor %}
 </table>
+</div>
 <form class="add-form" method="post" action="{{ url_for('add_path') }}">
   <input type="hidden" name="domain_id" value="{{ d.id }}">
   <input type="text" name="pattern" placeholder="e.g. ^/discover" value="{{ prefill_path or '' }}" required>
   <button class="add" type="submit">Add path</button>
 </form>
+</div>
 {% endif %}
 """
 
@@ -874,6 +916,30 @@ REPORT_BODY = """
   <code>common/cr_api.py</code> may need re-deriving.
 </div>
 {% endif %}
+
+<div class="stat-strip">
+  <div class="stat"><div class="stat-value">{{ total }}</div><div class="stat-label">Requests shown</div></div>
+  <div class="stat"><div class="stat-value">{{ allowed_total }}</div><div class="stat-label">Allowed</div></div>
+  <div class="stat"><div class="stat-value">{{ blocked_total }}</div><div class="stat-label">Blocked</div></div>
+  <div class="stat"><div class="stat-value">{{ (blocked_pct ~ '%') if total else '--' }}</div><div class="stat-label">% blocked</div></div>
+</div>
+
+<div class="chart-grid">
+  <div class="card">
+    <h2>Activity, last 14 days</h2>
+    <div class="chart-card">
+      {% if total %}<canvas id="activity-chart"></canvas>{% else %}<div class="empty-note">No activity logged yet.</div>{% endif %}
+    </div>
+  </div>
+  <div class="card">
+    <h2>Top domains</h2>
+    <div class="chart-card">
+      {% if top_domains %}<canvas id="domains-chart"></canvas>{% else %}<div class="empty-note">No activity logged yet.</div>{% endif %}
+    </div>
+  </div>
+</div>
+
+<div class="card">
 <h2>Recent activity</h2>
 <form class="add-form" method="get" action="{{ url_for('report') }}">
   <select name="user">
@@ -890,6 +956,7 @@ REPORT_BODY = """
   <button class="add" type="submit">Filter</button>
 </form>
 
+<div class="table-scroll">
 <table>
   <tr><th>Time (UTC)</th><th>User</th><th>Domain</th><th>Show / Path</th><th>Result</th><th></th></tr>
   {% for row in rows %}
@@ -912,6 +979,66 @@ REPORT_BODY = """
   <tr><td colspan="6"><em>No activity logged yet.</em></td></tr>
   {% endfor %}
 </table>
+</div>
+</div>
+
+{% if total %}
+<script src="{{ url_for('static', filename='vendor/chart.umd.min.js') }}"></script>
+<script>
+(function () {
+  var style = getComputedStyle(document.documentElement);
+  var cGreen = style.getPropertyValue('--success').trim() || '#15803d';
+  var cRed = style.getPropertyValue('--danger').trim() || '#b91c1c';
+  var cBrand = style.getPropertyValue('--brand').trim() || '#2f6fed';
+  var cMuted = style.getPropertyValue('--text-muted').trim() || '#64748b';
+  var cGrid = style.getPropertyValue('--border').trim() || '#e2e8f0';
+
+  Chart.defaults.color = cMuted;
+  Chart.defaults.borderColor = cGrid;
+
+  var activityEl = document.getElementById('activity-chart');
+  if (activityEl) {
+    new Chart(activityEl, {
+      type: 'bar',
+      data: {
+        labels: {{ day_labels|tojson }},
+        datasets: [
+          { label: 'Allowed', data: {{ daily_allowed|tojson }}, backgroundColor: cGreen, stack: 's' },
+          { label: 'Blocked', data: {{ daily_blocked|tojson }}, backgroundColor: cRed, stack: 's' }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: { stacked: true },
+          y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } }
+        },
+        plugins: { legend: { position: 'bottom' } }
+      }
+    });
+  }
+
+  var domainsEl = document.getElementById('domains-chart');
+  if (domainsEl) {
+    new Chart(domainsEl, {
+      type: 'bar',
+      data: {
+        labels: {{ top_domain_labels|tojson }},
+        datasets: [{ label: 'Requests', data: {{ top_domain_counts|tojson }}, backgroundColor: cBrand }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: { x: { beginAtZero: true, ticks: { precision: 0 } } },
+        plugins: { legend: { display: false } }
+      }
+    });
+  }
+})();
+</script>
+{% endif %}
 """
 
 
@@ -921,22 +1048,58 @@ def report():
     conn = get_db()
     filter_user = request.args.get("user", "")
     filter_status = request.args.get("status", "")
-    query = "SELECT * FROM access_log WHERE 1=1"
+    where_sql = "WHERE 1=1"
     params: list = []
     if filter_user:
-        query += " AND username = ?"
+        where_sql += " AND username = ?"
         params.append(filter_user)
     if filter_status == "blocked":
-        query += " AND allowed = 0"
+        where_sql += " AND allowed = 0"
     elif filter_status == "allowed":
-        query += " AND allowed = 1"
-    query += " ORDER BY id DESC LIMIT 200"
-    rows = conn.execute(query, params).fetchall()
+        where_sql += " AND allowed = 1"
+
+    rows = conn.execute(
+        f"SELECT * FROM access_log {where_sql} ORDER BY id DESC LIMIT 200", params
+    ).fetchall()
+
+    # Chart/stat data reflects every matching row under the current filter,
+    # not just the 200 most recent shown in the table below -- these are
+    # separate aggregate queries, not derived from `rows`.
+    status_counts = conn.execute(
+        f"SELECT allowed, COUNT(*) c FROM access_log {where_sql} GROUP BY allowed", params
+    ).fetchall()
+    allowed_total = next((r["c"] for r in status_counts if r["allowed"]), 0)
+    blocked_total = next((r["c"] for r in status_counts if not r["allowed"]), 0)
+    total = allowed_total + blocked_total
+    blocked_pct = round(blocked_total / total * 100) if total else 0
+
+    top_domains = conn.execute(
+        f"SELECT domain, COUNT(*) c FROM access_log {where_sql} GROUP BY domain ORDER BY c DESC LIMIT 8",
+        params,
+    ).fetchall()
+
+    today = datetime.now(timezone.utc).date()
+    days = [today - timedelta(days=i) for i in range(13, -1, -1)]
+    daily_rows = conn.execute(
+        f"SELECT substr(ts,1,10) day, allowed, COUNT(*) c FROM access_log {where_sql} "
+        "AND ts >= ? GROUP BY day, allowed ORDER BY day",
+        params + [db.iso_secs_ago(14 * 86400)],
+    ).fetchall()
+    allowed_by_day = {r["day"]: r["c"] for r in daily_rows if r["allowed"]}
+    blocked_by_day = {r["day"]: r["c"] for r in daily_rows if not r["allowed"]}
+
     all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
     body = render_template_string(
         REPORT_BODY, rows=rows, all_users=all_users,
         filter_user=filter_user, filter_status=filter_status,
         resolver_error=db.get_setting(conn, "cr_resolver_last_error"),
+        total=total, allowed_total=allowed_total, blocked_total=blocked_total, blocked_pct=blocked_pct,
+        top_domains=top_domains,
+        top_domain_labels=[r["domain"] for r in top_domains],
+        top_domain_counts=[r["c"] for r in top_domains],
+        day_labels=[d.strftime("%m/%d") for d in days],
+        daily_allowed=[allowed_by_day.get(d.isoformat(), 0) for d in days],
+        daily_blocked=[blocked_by_day.get(d.isoformat(), 0) for d in days],
     )
     return render("report", body)
 
@@ -1001,13 +1164,16 @@ def approve_from_report():
 # ==========================================================
 
 SETTINGS_BODY = """
+<div class="card">
 <h2>Local network</h2>
 <form class="add-form" method="post" action="{{ url_for('update_local_network') }}">
   <input type="text" name="local_network" value="{{ local_network }}" style="flex:1; min-width:280px;">
   <button class="add" type="submit">Save</button>
 </form>
 <p class="hint">Space-separated CIDRs, e.g. <code>192.168.1.0/24 192.168.0.0/24</code>. Requests from outside these ranges are denied regardless of user/site rules. <strong>Leave blank to disable this check</strong> and rely only on per-person proxy logins &mdash; do that if the proxy runs under Docker Desktop or bridge networking, where it sees an internal gateway address instead of the real client IP and this check would otherwise block everyone.</p>
+</div>
 
+<div class="card">
 <h2>Blocked-site experience</h2>
 <form class="add-form" method="post" action="{{ url_for('update_block_page_mode') }}">
   <select name="block_page_mode">
@@ -1023,13 +1189,16 @@ SETTINGS_BODY = """
 <p class="hint">
   Bump-mode domains (Crunchyroll, or anything else you've set to bump mode) always show a page when blocked regardless of this setting, since they're already decrypted either way. This setting only affects splice-mode sites. To get an actual custom page here rather than Squid's generic one, also set <code>DASHBOARD_URL</code> in <code>.env</code> to this machine's address (e.g. <code>http://192.168.1.50:8787</code>) and restart the proxy container.
 </p>
+</div>
 
+<div class="card">
 <h2>Dashboard admin login</h2>
 <form class="add-form" method="post" action="{{ url_for('update_admin') }}">
   <input type="text" name="admin_username" value="{{ admin_username }}" placeholder="Admin username">
   <input type="password" name="admin_password" placeholder="New password (leave blank to keep current)">
   <button class="add" type="submit">Save</button>
 </form>
+</div>
 """
 
 

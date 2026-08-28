@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY common/*.py /app/
 COPY dashboard/dashboard.py /app/
+COPY dashboard/static /app/static
 
 # Run as the same user the squid helpers use (Debian's `proxy`, uid 13) so the
 # SQLite database and its -wal/-shm files on the shared /config volume stay
