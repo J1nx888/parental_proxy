@@ -128,6 +128,14 @@ CREATE TABLE IF NOT EXISTS group_domains (
 --       there's no login gate yet to fail -- added now, ahead of that
 --       feature, specifically so building it later is additive (one more
 --       rule keyed on this flag) rather than a schema change.
+--   last_seen_at: when this device was last observed on the network.
+--       NULL means "never observed" -- nothing populates this column yet
+--       (that needs the Phase 3 interception layer or an equivalent
+--       mechanism), so every device's is NULL today. Deliberately kept
+--       distinct from "definitely stale": the stale-device cleanup below
+--       only ever matches a real, old timestamp, never a NULL one, so
+--       turning that feature on can't mass-delete every device just
+--       because none of them have been seen yet.
 CREATE TABLE IF NOT EXISTS devices (
     id               INTEGER PRIMARY KEY,
     mac_address      TEXT UNIQUE NOT NULL,
@@ -136,6 +144,7 @@ CREATE TABLE IF NOT EXISTS devices (
     group_id         INTEGER REFERENCES groups(id) ON DELETE SET NULL,
     ignored          INTEGER NOT NULL DEFAULT 0,
     last_known_ip    TEXT,
+    last_seen_at     TEXT,
     bump_enabled     INTEGER NOT NULL DEFAULT 0,
     bypass_login     INTEGER NOT NULL DEFAULT 0,
     is_authenticated INTEGER NOT NULL DEFAULT 1,
@@ -211,6 +220,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(access_log)")}
     if "approval_requested_at" not in columns:
         conn.execute("ALTER TABLE access_log ADD COLUMN approval_requested_at TEXT")
+
+    device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
+    if "last_seen_at" not in device_columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN last_seen_at TEXT")
 
 
 # ==========================================================

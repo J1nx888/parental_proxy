@@ -1388,3 +1388,140 @@ def test_logout_with_bogus_credentials_returns_401(client):
 def test_logout_requires_some_credential(client):
     resp = client.get("/logout")
     assert resp.status_code == 401
+
+
+# ============================================================
+# Client-side search boxes (Users/Domains/Devices/Groups lists)
+# ============================================================
+
+def test_users_page_has_search_box_when_nonempty(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    resp = client.get("/users", headers=_auth_header())
+    assert b'data-filter-table="usersTable"' in resp.data
+
+
+def test_users_page_has_no_search_box_when_empty(client):
+    # The literal string "data-filter-table" is always present in BASE's
+    # shared JS (the attribute selector itself), so check for the actual
+    # rendered input, not the bare substring.
+    resp = client.get("/users", headers=_auth_header())
+    assert b'data-filter-table="usersTable"' not in resp.data
+
+
+def test_domains_and_devices_pages_have_search_boxes(client, db_conn):
+    client.post("/domains/add", data={"pattern": r"example\.com", "mode": "splice"}, headers=_auth_header())
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:30"}, headers=_auth_header())
+    client.post("/groups/add", data={"name": "TVs"}, headers=_auth_header())
+
+    resp = client.get("/domains", headers=_auth_header())
+    assert b'data-filter-table="domainsTable"' in resp.data
+
+    resp = client.get("/devices", headers=_auth_header())
+    assert b'data-filter-table="devicesTable"' in resp.data
+    assert b'data-filter-table="groupsTable"' in resp.data
+
+
+# ============================================================
+# Devices: last_seen_at + stale-device cleanup (Settings)
+# ============================================================
+
+def test_devices_table_has_last_seen_column_showing_never_by_default(client, db_conn):
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:31"}, headers=_auth_header())
+    resp = client.get("/devices", headers=_auth_header())
+    assert b"Last seen" in resp.data
+    assert b"Never" in resp.data
+
+
+def test_devices_migration_adds_last_seen_at_to_an_existing_database(tmp_path, monkeypatch):
+    """Simulates a database created before last_seen_at existed (by
+    creating the devices table without it), then confirms init_db()'s
+    migration adds the column without touching existing rows."""
+    import db as db_mod
+    db_path = tmp_path / "pre_migration.db"
+    monkeypatch.setattr(db_mod, "DB_PATH", db_path)
+    conn = db_mod.get_conn()
+    conn.executescript("""
+        CREATE TABLE devices (
+            id INTEGER PRIMARY KEY,
+            mac_address TEXT UNIQUE NOT NULL,
+            label TEXT,
+            user_id INTEGER,
+            group_id INTEGER,
+            ignored INTEGER NOT NULL DEFAULT 0,
+            last_known_ip TEXT,
+            bump_enabled INTEGER NOT NULL DEFAULT 0,
+            bypass_login INTEGER NOT NULL DEFAULT 0,
+            is_authenticated INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+    """)
+    conn.execute(
+        "INSERT INTO devices (mac_address, created_at) VALUES ('aa:bb:cc:dd:ee:ff', datetime('now'))"
+    )
+    conn.commit()
+    conn.close()
+
+    db_mod.init_db()
+
+    conn = db_mod.get_conn()
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
+    assert "last_seen_at" in columns
+    row = conn.execute("SELECT * FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:ff'").fetchone()
+    assert row is not None
+    assert row["last_seen_at"] is None
+    conn.close()
+
+
+def _insert_device_with_last_seen(db_conn, mac, days_ago):
+    import db as db_mod
+    ts = None if days_ago is None else db_mod.iso_secs_ago(days_ago * 86400)
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, last_seen_at, created_at) VALUES (?, ?, datetime('now'))",
+        (mac, ts),
+    )
+    db_conn.commit()
+
+
+def test_update_device_stale_days_validates_input(client):
+    resp = client.post("/settings/device-stale-days", data={"device_stale_days": "0"}, headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+    resp = client.post("/settings/device-stale-days", data={"device_stale_days": "abc"}, headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+    resp = client.post("/settings/device-stale-days", data={"device_stale_days": "30"}, headers=_auth_header())
+    assert resp.status_code == 302
+    assert "error" not in resp.headers["Location"]
+
+
+def test_settings_page_shows_correct_stale_device_count(client, db_conn):
+    _insert_device_with_last_seen(db_conn, "aa:bb:cc:dd:ee:40", days_ago=100)  # stale
+    _insert_device_with_last_seen(db_conn, "aa:bb:cc:dd:ee:41", days_ago=5)    # recent, not stale
+    _insert_device_with_last_seen(db_conn, "aa:bb:cc:dd:ee:42", days_ago=None)  # never seen -- must NOT count
+
+    client.post("/settings/device-stale-days", data={"device_stale_days": "30"}, headers=_auth_header())
+    resp = client.get("/settings", headers=_auth_header())
+    assert b"<strong>1</strong>" in resp.data
+
+
+def test_cleanup_stale_devices_only_removes_devices_with_an_old_real_timestamp(client, db_conn):
+    _insert_device_with_last_seen(db_conn, "aa:bb:cc:dd:ee:50", days_ago=100)  # stale -- removed
+    _insert_device_with_last_seen(db_conn, "aa:bb:cc:dd:ee:51", days_ago=5)    # recent -- kept
+    _insert_device_with_last_seen(db_conn, "aa:bb:cc:dd:ee:52", days_ago=None)  # never seen -- kept
+
+    client.post("/settings/device-stale-days", data={"device_stale_days": "30"}, headers=_auth_header())
+    resp = client.post("/devices/cleanup", headers=_auth_header())
+    assert resp.status_code == 302
+
+    remaining = {r["mac_address"] for r in db_conn.execute("SELECT mac_address FROM devices")}
+    assert remaining == {"aa:bb:cc:dd:ee:51", "aa:bb:cc:dd:ee:52"}
+
+
+def test_cleanup_stale_devices_requires_threshold_set_first(client, db_conn):
+    _insert_device_with_last_seen(db_conn, "aa:bb:cc:dd:ee:53", days_ago=100)
+    resp = client.post("/devices/cleanup", headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT 1 FROM devices").fetchone() is not None
+
+
+def test_cleanup_stale_devices_requires_admin_auth(client):
+    resp = client.post("/devices/cleanup")
+    assert resp.status_code == 401

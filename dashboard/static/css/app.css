@@ -236,7 +236,7 @@ form.inline { display: inline; }
   flex-wrap: wrap;
   align-items: center;
 }
-input[type=text], input[type=url], input[type=password], select {
+input[type=text], input[type=url], input[type=password], input[type=search], input[type=number], select {
   padding: .5rem .65rem;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);

@@ -187,6 +187,28 @@ BASE = """
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
 }
+
+// Instant client-side search for any table on the page: an input tagged
+// data-filter-table="<table id>" hides every <tr> that doesn't contain its
+// typed text (case-insensitive substring, anywhere in the row), without a
+// page reload -- separate from and layered on top of the server-side ?user_id=
+// / ?group_id= / ?device_id= filters elsewhere, which narrow what's sent
+// down in the first place. Header rows (identified by containing a <th>,
+// since these tables don't use <thead>) are never hidden.
+document.addEventListener("input", function (event) {
+  var input = event.target.closest("[data-filter-table]");
+  if (!input) return;
+  var table = document.getElementById(input.getAttribute("data-filter-table"));
+  if (!table) return;
+  var term = input.value.trim().toLowerCase();
+  var rows = table.rows;
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (row.querySelector("th")) continue;
+    var matches = !term || row.textContent.toLowerCase().indexOf(term) !== -1;
+    row.style.display = matches ? "" : "none";
+  }
+});
 </script>
 </body>
 </html>
@@ -338,8 +360,9 @@ USERS_BODY = """
 
 <div class="card">
 <h2>Users ({{ users|length }})</h2>
+{% if users %}<input type="search" data-filter-table="usersTable" placeholder="Search users&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">{% endif %}
 <div class="table-scroll">
-<table>
+<table id="usersTable">
   <tr><th>Username</th><th>Display name</th><th>Sites</th><th>Shows</th><th></th></tr>
   {% for u in users %}
   <tr>
@@ -661,8 +684,9 @@ DOMAINS_BODY = """
   <span class="badge mode-bump">bump</span> fully decrypted, path/show rules apply &nbsp;
   <span class="badge mode-trusted">trusted</span> always passed through, unchecked
 </p>
+{% if domains %}<input type="search" data-filter-table="domainsTable" placeholder="Search domains&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">{% endif %}
 <div class="table-scroll">
-<table>
+<table id="domainsTable">
   <tr><th>Pattern</th><th>Mode</th><th>Access</th><th>Note</th><th></th></tr>
   {% for d in domains %}
   <tr>
@@ -1202,8 +1226,9 @@ DEVICES_BODY = """
 <div class="card">
 <h2>Groups ({{ groups|length }})</h2>
 <p class="hint">A shared-device category (TVs, IoT, Gaming Computers) with its own domain allow-list -- assign devices to a group below, then manage what it can reach from its "Manage domains" link.</p>
+{% if groups %}<input type="search" data-filter-table="groupsTable" placeholder="Search groups&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">{% endif %}
 <div class="table-scroll">
-<table>
+<table id="groupsTable">
   <tr><th>Name</th><th></th></tr>
   {% for g in groups %}
   <tr>
@@ -1236,9 +1261,10 @@ DEVICES_BODY = """
   this list small and deliberate. Everything else will get that domain's
   whole-domain treatment instead. Nothing here is enforced yet.
 </p>
+{% if devices %}<input type="search" data-filter-table="devicesTable" placeholder="Search devices&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">{% endif %}
 <div class="table-scroll">
-<table>
-  <tr><th>MAC address</th><th>Label</th><th>Assigned to</th><th>SSL-Bump</th><th>Bypass login</th><th></th></tr>
+<table id="devicesTable">
+  <tr><th>MAC address</th><th>Label</th><th>Assigned to</th><th>SSL-Bump</th><th>Bypass login</th><th>Last seen</th><th></th></tr>
   {% for d in devices %}
   <tr>
     <td><code>{{ d.mac_address }}</code></td>
@@ -1251,6 +1277,7 @@ DEVICES_BODY = """
     </td>
     <td>{% if d.bump_enabled %}<span class="badge mode-bump">yes</span>{% else %}<span class="badge mode-splice">no</span>{% endif %}</td>
     <td>{% if d.bypass_login %}<span class="badge pending">yes</span>{% else %}&mdash;{% endif %}</td>
+    <td>{{ d.last_seen_at or 'Never' }}</td>
     <td>
       <a class="btn small" href="{{ url_for('device_detail', device_id=d.id) }}">Manage</a>
       <a class="btn small" href="{{ url_for('domains', device_id=d.id) }}">Domains</a>
@@ -1261,7 +1288,7 @@ DEVICES_BODY = """
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="6"><em>No devices tracked yet.</em></td></tr>
+  <tr><td colspan="7"><em>No devices tracked yet.</em></td></tr>
   {% endfor %}
 </table>
 </div>
@@ -1875,6 +1902,31 @@ SETTINGS_BODY = """
   <button class="add" type="submit">Save</button>
 </form>
 </div>
+
+<div class="card">
+<h2>Remove outdated devices</h2>
+<p class="hint">
+  Devices whose "last seen" time is older than this many days can be cleaned up in one click.
+  <strong>Requires the interception layer to actually populate "last seen" first</strong> -- until
+  that exists, no device has one at all, so this will never match anything yet. A device that's
+  never been seen is left alone regardless of this setting -- only a real, old timestamp counts,
+  never "we don't know."
+</p>
+<form class="add-form" method="post" action="{{ url_for('update_device_stale_days') }}">
+  <input type="number" name="device_stale_days" min="1" step="1" value="{{ device_stale_days or '' }}" placeholder="e.g. 90" style="width:6rem;">
+  <span class="hint" style="margin:0;">days</span>
+  <button class="add" type="submit">Save</button>
+</form>
+{% if device_stale_days %}
+<p class="hint">
+  <strong>{{ stale_device_count }}</strong> device{{ 's' if stale_device_count != 1 else '' }}
+  currently not seen in over {{ device_stale_days }} day{{ 's' if device_stale_days != 1 else '' }}.
+</p>
+<form method="post" action="{{ url_for('cleanup_stale_devices') }}" onsubmit="return confirm('Delete these outdated devices? This cannot be undone.');">
+  <button class="danger" type="submit" {{ 'disabled' if not stale_device_count }}>Clean up now</button>
+</form>
+{% endif %}
+</div>
 """
 
 
@@ -1885,11 +1937,53 @@ def settings_page():
     local_network = db.get_setting(conn, "local_network", "")
     admin_username = db.get_setting(conn, "admin_username", "")
     block_page_mode = db.get_setting(conn, "block_page_mode", "terminate")
+    device_stale_days = db.get_setting(conn, "device_stale_days", "")
+    stale_device_count = 0
+    if device_stale_days:
+        stale_device_count = conn.execute(
+            "SELECT COUNT(*) c FROM devices WHERE last_seen_at IS NOT NULL AND last_seen_at < ?",
+            (db.iso_secs_ago(int(device_stale_days) * 86400),),
+        ).fetchone()["c"]
     body = render_template_string(
         SETTINGS_BODY, local_network=local_network, admin_username=admin_username,
-        block_page_mode=block_page_mode,
+        block_page_mode=block_page_mode, device_stale_days=device_stale_days,
+        stale_device_count=stale_device_count,
     )
     return render("settings", body)
+
+
+@app.route("/settings/device-stale-days", methods=["POST"])
+@require_admin
+def update_device_stale_days():
+    value = request.form.get("device_stale_days", "").strip()
+    conn = get_db()
+    if not value:
+        db.set_setting(conn, "device_stale_days", "")
+        conn.commit()
+        return flash_redirect("settings_page", "Saved. Outdated-device cleanup is now off.")
+    try:
+        days = int(value)
+        if days < 1:
+            raise ValueError
+    except ValueError:
+        return flash_redirect("settings_page", "Enter a whole number of days (1 or more).", error=True)
+    db.set_setting(conn, "device_stale_days", str(days))
+    conn.commit()
+    return flash_redirect("settings_page", "Saved.")
+
+
+@app.route("/devices/cleanup", methods=["POST"])
+@require_admin
+def cleanup_stale_devices():
+    conn = get_db()
+    days = db.get_setting(conn, "device_stale_days", "")
+    if not days:
+        return flash_redirect("settings_page", "Set a threshold first.", error=True)
+    cutoff = db.iso_secs_ago(int(days) * 86400)
+    cur = conn.execute("DELETE FROM devices WHERE last_seen_at IS NOT NULL AND last_seen_at < ?", (cutoff,))
+    count = cur.rowcount
+    conn.commit()
+    return flash_redirect("settings_page", f"Removed {count} device{'s' if count != 1 else ''}.")
 
 
 @app.route("/settings/local-network", methods=["POST"])
