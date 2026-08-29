@@ -6,9 +6,15 @@ defaults/seed_defaults.py are all copied into /opt/parental-proxy/, and
 common/*.py + dashboard.py are copied into /app/ for the dashboard image.
 Every module therefore does bare imports like ``import db`` or
 ``import cr_api``, not ``from common import db``. To exercise the real code
-unmodified, this conftest puts all four source directories directly on
+unmodified, this conftest puts each source directory directly on
 sys.path (flat, no package layer) instead of using a src-layout/PYTHONPATH
 trick that would require touching the modules under test.
+
+``controller/`` (the Phase 3 interception-controller, see RoadMap.md
+Milestone 3) has no Dockerfile yet -- it isn't deployed anywhere yet --
+but follows the same flat-import convention (``from ipc_client import
+Target``, not ``from controller import ipc_client``) so it's included
+here on the same basis, ready for whenever it does get containerized.
 
 No Docker, no network, no external services -- see the autouse
 ``block_network`` fixture below.
@@ -21,7 +27,7 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-for sub in ("common", "proxy", "dashboard", "defaults"):
+for sub in ("common", "proxy", "dashboard", "defaults", "controller"):
     p = str(REPO_ROOT / sub)
     if p not in sys.path:
         sys.path.insert(0, p)
