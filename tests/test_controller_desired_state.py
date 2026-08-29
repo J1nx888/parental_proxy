@@ -1,0 +1,108 @@
+"""controller/desired_state.py: building a real DesiredState from the
+devices/device_bindings tables."""
+from __future__ import annotations
+
+import db
+import identity
+from desired_state import db_backed_desired_state
+from ipc_client import Target
+
+GATEWAY = Target(ip="192.168.1.1", mac="aa:bb:cc:dd:ee:00")
+
+
+def _add_device(conn, mac_address, ignored=0):
+    conn.execute(
+        "INSERT INTO devices (mac_address, ignored, created_at) VALUES (?, ?, ?)",
+        (mac_address, ignored, db.now_iso()),
+    )
+    conn.commit()
+    return conn.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_address,)).fetchone()
+
+
+def test_no_devices_yields_empty_target_list(conn):
+    desired = db_backed_desired_state(conn, GATEWAY)
+    assert desired.gateway == GATEWAY
+    assert desired.targets == ()
+
+
+def test_device_with_active_binding_becomes_a_target(conn):
+    _add_device(conn, "aa:bb:cc:dd:ee:01")
+    identity.record_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21", source="rtnetlink")
+
+    desired = db_backed_desired_state(conn, GATEWAY)
+    assert desired.targets == (Target(ip="192.168.1.21", mac="aa:bb:cc:dd:ee:01"),)
+
+
+def test_device_with_no_binding_is_excluded(conn):
+    """A known device that hasn't been observed on the network yet (no
+    device_bindings row) contributes no target -- there's no IP to
+    poison anyone with."""
+    _add_device(conn, "aa:bb:cc:dd:ee:01")
+    desired = db_backed_desired_state(conn, GATEWAY)
+    assert desired.targets == ()
+
+
+def test_ignored_device_is_excluded_even_with_an_active_binding(conn):
+    """ignored stands in for the design's bypass_v4 class -- see
+    db_backed_desired_state's own doc comment."""
+    _add_device(conn, "aa:bb:cc:dd:ee:01", ignored=1)
+    identity.record_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21", source="rtnetlink")
+
+    desired = db_backed_desired_state(conn, GATEWAY)
+    assert desired.targets == ()
+
+
+def test_deactivated_binding_is_excluded(conn):
+    """A device whose binding got superseded (see
+    identity.record_binding's conflict handling) must not still show up
+    as a target using its old, no-longer-valid IP."""
+    _add_device(conn, "aa:bb:cc:dd:ee:01")
+    identity.record_binding(
+        conn, "aa:bb:cc:dd:ee:01", "192.168.1.21", source="rtnetlink", seen_at="2026-08-29T00:00:00Z"
+    )
+    identity.record_binding(
+        conn, "aa:bb:cc:dd:ee:01", "192.168.1.22", source="rtnetlink", seen_at="2026-08-29T01:00:00Z"
+    )
+
+    desired = db_backed_desired_state(conn, GATEWAY)
+    assert desired.targets == (Target(ip="192.168.1.22", mac="aa:bb:cc:dd:ee:01"),)
+
+
+def test_multiple_devices_all_included(conn):
+    _add_device(conn, "aa:bb:cc:dd:ee:01")
+    _add_device(conn, "aa:bb:cc:dd:ee:02")
+    identity.record_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21", source="rtnetlink")
+    identity.record_binding(conn, "aa:bb:cc:dd:ee:02", "192.168.1.22", source="rtnetlink")
+
+    desired = db_backed_desired_state(conn, GATEWAY)
+    assert set(desired.targets) == {
+        Target(ip="192.168.1.21", mac="aa:bb:cc:dd:ee:01"),
+        Target(ip="192.168.1.22", mac="aa:bb:cc:dd:ee:02"),
+    }
+
+
+def test_device_with_two_simultaneously_active_bindings_contributes_only_the_freshest(conn):
+    """Mirrors test_identity_bindings.py's equivalent case -- a
+    theoretical overlap where more than one binding for a device is
+    marked active at once must not produce two targets for one MAC."""
+    device = _add_device(conn, "aa:bb:cc:dd:ee:01")
+    conn.execute(
+        "INSERT INTO device_bindings "
+        "(device_id, mac_address, ipv4_address, first_seen_at, last_seen_at, source, active) "
+        "VALUES (?, 'aa:bb:cc:dd:ee:01', '192.168.1.21', ?, ?, 'snapshot', 1)",
+        (device["id"], "2026-08-29T00:00:00Z", "2026-08-29T00:00:00Z"),
+    )
+    conn.execute(
+        "INSERT INTO device_bindings "
+        "(device_id, mac_address, ipv4_address, first_seen_at, last_seen_at, source, active) "
+        "VALUES (?, 'aa:bb:cc:dd:ee:01', '192.168.1.22', ?, ?, 'snapshot', 1)",
+        (device["id"], "2026-08-29T01:00:00Z", "2026-08-29T01:00:00Z"),
+    )
+
+    desired = db_backed_desired_state(conn, GATEWAY)
+    assert desired.targets == (Target(ip="192.168.1.22", mac="aa:bb:cc:dd:ee:01"),)
+
+
+def test_full_duplex_flag_passed_through(conn):
+    desired = db_backed_desired_state(conn, GATEWAY, full_duplex=True)
+    assert desired.full_duplex is True

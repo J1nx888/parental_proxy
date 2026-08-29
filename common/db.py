@@ -167,6 +167,83 @@ CREATE TABLE IF NOT EXISTS device_domains (
     UNIQUE(device_id, domain_id)
 );
 
+-- Phase 3 identity model (Milestone 4): every observed MAC<->IPv4
+-- pairing, feeding the interception controller's desired-state
+-- computation (controller/desired_state.py). A device's IP can change
+-- (DHCP lease renewal) and an IP can be reassigned to a different MAC
+-- over time (a departed device's lease reused by a new one) -- this
+-- table keeps every observed pairing rather than overwriting in place,
+-- so `active` distinguishes "this is the binding to trust right now"
+-- from stale history, and last_seen_at lets a consumer judge freshness
+-- rather than trusting a silently-clobbered single row.
+--   source: where this observation came from -- 'rtnetlink' (kernel
+--       neighbor-table events, lowest latency), 'snapshot' (periodic
+--       `ip neigh` poll, catches anything rtnetlink missed), 'adguard'
+--       (DNS query-log correlation, confirms active IP usage),
+--       'bettercap' (optional enrichment only, never load-bearing --
+--       see the v2 roadmap notes), 'active_scan' (rate-limited direct
+--       ARP probe, only for stale/onboarding devices).
+--   confidence: 1.0 for a direct observation (rtnetlink/snapshot);
+--       lower for inferred/enrichment-only sources. Not consumed by
+--       anything yet -- reserved for when multiple simultaneous
+--       "active" bindings for one device need to be ranked.
+--   device_id: nullable, deliberately -- a MAC never seen before gets
+--       a binding row immediately (so nothing is silently dropped),
+--       but is NOT auto-associated to a `devices` row from network
+--       data alone (hostname/vendor guessing is exactly the
+--       auto-merge the v2 roadmap rules out). A NULL device_id is a
+--       pending binding awaiting a human association; ON DELETE SET
+--       NULL means deleting a `devices` row later returns its
+--       bindings to pending rather than discarding the observation.
+CREATE TABLE IF NOT EXISTS device_bindings (
+    id            INTEGER PRIMARY KEY,
+    device_id     INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    mac_address   TEXT NOT NULL,
+    ipv4_address  TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at  TEXT NOT NULL,
+    source        TEXT NOT NULL CHECK (source IN ('rtnetlink', 'snapshot', 'adguard', 'bettercap', 'active_scan')),
+    confidence    REAL NOT NULL DEFAULT 1.0,
+    active        INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(mac_address, ipv4_address)
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_bindings_device ON device_bindings(device_id);
+CREATE INDEX IF NOT EXISTS idx_device_bindings_ip_active ON device_bindings(ipv4_address, active);
+
+-- Singleton row (see the CHECK) tracking the interception layer's own
+-- runtime state: what generation the controller wants applied vs what
+-- the worker has actually confirmed, and whether the system is
+-- currently degraded. Written by the controller; read by the
+-- dashboard for an eventual "interception health" view (nothing reads
+-- it yet -- see the v2 roadmap notes on that future dashboard scope).
+CREATE TABLE IF NOT EXISTS interception_runtime (
+    singleton_id       INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    desired_generation INTEGER NOT NULL DEFAULT 0,
+    applied_generation INTEGER NOT NULL DEFAULT 0,
+    mode               TEXT NOT NULL DEFAULT 'stopped' CHECK (mode IN ('stopped', 'running', 'repair_only', 'fail_open')),
+    last_healthy_at    TEXT,
+    fail_open_reason   TEXT
+);
+
+-- Normalized network/identity-layer event log (device seen/lost, a
+-- binding created or superseded by a MAC/IP conflict, etc.) -- distinct
+-- from access_log, which is proxy-layer allow/deny decisions. This is
+-- the "outbox events" RoadMap.md's Milestone 4 refers to.
+CREATE TABLE IF NOT EXISTS network_events (
+    id           INTEGER PRIMARY KEY,
+    event_type   TEXT NOT NULL,
+    device_id    INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    mac_address  TEXT,
+    ipv4_address TEXT,
+    source       TEXT NOT NULL,
+    observed_at  TEXT NOT NULL,
+    payload_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_network_events_observed ON network_events(observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_network_events_device ON network_events(device_id);
+
 CREATE TABLE IF NOT EXISTS access_log (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,
