@@ -767,3 +767,103 @@ def test_update_admin_blank_password_keeps_current_password(client, db_conn):
     )
     # Original password still works since it was left blank on the form.
     assert client.get("/users", headers=_auth_header()).status_code == 200
+
+
+# ============================================================
+# /blocked: "Request approval" + admin Dismiss/Approve
+# ============================================================
+
+def _insert_recent_denial(db_conn, user_id, domain="newsite.example", path=None):
+    # Must match db.now_iso()'s exact format (T/Z, not SQLite's datetime('now')
+    # 'YYYY-MM-DD HH:MM:SS') -- /blocked's lookback filters with `ts >= ?`
+    # against db.iso_secs_ago(), and the two formats don't compare correctly
+    # against each other lexicographically (space sorts before 'T').
+    import db as db_mod
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason) "
+        "VALUES (?, ?, 'kid1', ?, ?, 0, 'unknown_domain')",
+        (db_mod.now_iso(), user_id, domain, path),
+    )
+    db_conn.commit()
+    return db_conn.execute("SELECT id FROM access_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+
+
+def test_blocked_page_offers_request_button_for_a_recent_denial(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    _insert_recent_denial(db_conn, user_id)
+
+    resp = client.get("/blocked")
+    assert resp.status_code == 403
+    assert b"Request approval" in resp.data
+
+
+def test_blocked_page_has_no_button_with_no_recent_denial(client):
+    resp = client.get("/blocked")
+    assert b"Request approval" not in resp.data
+    assert b"Request sent" not in resp.data
+
+
+def test_request_approval_sets_flag_and_blocked_page_reflects_it(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    log_id = _insert_recent_denial(db_conn, user_id)
+
+    resp = client.post("/blocked/request-approval", data={"log_id": log_id})
+    assert resp.status_code == 302
+
+    row = db_conn.execute("SELECT approval_requested_at FROM access_log WHERE id = ?", (log_id,)).fetchone()
+    assert row["approval_requested_at"] is not None
+
+    # No admin auth needed for either the page or the click -- the kid on
+    # the blocked device isn't logged into the dashboard.
+    resp = client.get("/blocked")
+    assert b"Request sent" in resp.data
+    assert b"Request approval" not in resp.data
+
+
+def test_report_shows_pending_request_badge_and_card(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    log_id = _insert_recent_denial(db_conn, user_id)
+    client.post("/blocked/request-approval", data={"log_id": log_id})
+
+    resp = client.get("/report", headers=_auth_header())
+    assert b"Pending approval requests" in resp.data
+    assert b"newsite.example" in resp.data
+
+
+def test_dismiss_request_clears_flag_without_granting_access(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    log_id = _insert_recent_denial(db_conn, user_id)
+    client.post("/blocked/request-approval", data={"log_id": log_id})
+
+    resp = client.post("/report/dismiss-request", data={"log_id": log_id}, headers=_auth_header())
+    assert resp.status_code == 302
+
+    row = db_conn.execute("SELECT approval_requested_at FROM access_log WHERE id = ?", (log_id,)).fetchone()
+    assert row["approval_requested_at"] is None
+
+    import matching
+    assert matching.find_domain(db_conn, "newsite.example") is None  # still not approved
+
+    resp = client.get("/report", headers=_auth_header())
+    assert b"Pending approval requests" not in resp.data
+
+
+def test_dismiss_request_requires_admin_auth(client, db_conn):
+    resp = client.post("/report/dismiss-request", data={"log_id": "1"})
+    assert resp.status_code == 401
+
+
+def test_approving_a_pending_request_also_clears_the_flag(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    log_id = _insert_recent_denial(db_conn, user_id)
+    client.post("/blocked/request-approval", data={"log_id": log_id})
+
+    client.post("/report/approve", data={"log_id": log_id}, headers=_auth_header())
+
+    row = db_conn.execute("SELECT approval_requested_at FROM access_log WHERE id = ?", (log_id,)).fetchone()
+    assert row["approval_requested_at"] is None

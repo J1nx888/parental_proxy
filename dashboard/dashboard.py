@@ -996,6 +996,10 @@ REPORT_BODY = """
         <input type="hidden" name="log_id" value="{{ row.id }}">
         <button class="add small" type="submit">Approve for {{ row.username }}</button>
       </form>
+      <form class="inline" method="post" action="{{ url_for('dismiss_request') }}">
+        <input type="hidden" name="log_id" value="{{ row.id }}">
+        <button class="small" type="submit">Dismiss</button>
+      </form>
     </td>
   </tr>
   {% endfor %}
@@ -1257,6 +1261,20 @@ def approve_from_report():
     )
     conn.commit()
     return flash_redirect("report", f"Approved {row['domain']} for {row['username']}.")
+
+
+@app.route("/report/dismiss-request", methods=["POST"])
+@require_admin
+def dismiss_request():
+    """Clears a pending 'Request approval' flag without granting anything --
+    the site/show stays exactly as denied as it was before the request. This
+    is the admin's "no" -- distinct from Approve, and distinct from doing
+    nothing (which would leave it cluttering the pending list forever)."""
+    log_id = request.form.get("log_id", "")
+    conn = get_db()
+    conn.execute("UPDATE access_log SET approval_requested_at = NULL WHERE id = ?", (log_id,))
+    conn.commit()
+    return flash_redirect("report", "Dismissed.")
 
 
 # ==========================================================
