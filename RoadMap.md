@@ -325,10 +325,17 @@ replaces its Redis-based approach.
       `controller/desired_state.py` replaces `main.py`'s placeholder
       with a real query (every non-ignored device with an active
       binding). 27 new tests, full suite verified at 298/298 locally
-      and 305/305 on the smoke-test VM. Not yet done: nothing actually
-      populates `device_bindings` from live traffic — that's a
-      discovery daemon (rtnetlink/snapshot/AdGuard sources per the
-      design doc's precedence order), still unbuilt.
+      and 305/305 on the smoke-test VM. **Partial discovery source
+      added the same day**: `controller/discovery.py` implements just
+      the periodic `ip neigh show` snapshot (the design doc's
+      "missed-event reconciliation" source) — parses real iproute2
+      output, records trusted entries via `identity.record_binding`,
+      idempotent across repeated runs. Not wired into any running
+      loop yet. Still unbuilt: the higher-precedence live rtnetlink-
+      event listener (needs real netlink socket programming, e.g.
+      `pyroute2` — deliberately not rushed alongside the snapshot
+      piece), AdGuard query-log correlation, and active ARP scanning —
+      the other three sources in the design doc's precedence order.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
       sets, atomic apply/rollback. **Scaffold written AND verified
       against real nftables 2026-08-29**, in `phase3/nftables-manager/`
@@ -428,14 +435,16 @@ replaces its Redis-based approach.
 
 Milestones 1–9 above (all but the soak test) have real, tested — several
 functionally verified against real nftables/real sockets/real subprocess
-behavior — work behind them as of 2026-08-29. What's NOT built: a
-discovery daemon to populate `device_bindings` from live traffic, an
-actual controller<->nftables-manager coordinated deployment (each half
-is verified independently and against each other via the shared DB, but
-neither has ever run outside a disposable VM/container), a dashboard
-"interception health" view reading the tables above, and running any of
-this against a real network interface (`CAP_NET_RAW`/`CAP_NET_ADMIN`
-deliberately withheld from every sandboxed test account used so far).
+behavior, including the controller and nftables-manager coordinating
+live through the shared DB (Milestone 7's end-to-end proof) — work
+behind them as of 2026-08-29. What's NOT built: a full discovery daemon
+(only the periodic snapshot source exists so far, not wired into a
+running loop, and not the higher-precedence live rtnetlink listener), a
+dashboard "interception health" view reading the tables above, and
+running any of this against a real network interface (`CAP_NET_RAW`/
+`CAP_NET_ADMIN` deliberately withheld from every sandboxed test account
+used so far — nothing here has ever run outside a disposable VM or
+container).
 
 ---
 
