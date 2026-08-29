@@ -136,6 +136,13 @@ CREATE TABLE IF NOT EXISTS group_domains (
 --       only ever matches a real, old timestamp, never a NULL one, so
 --       turning that feature on can't mass-delete every device just
 --       because none of them have been seen yet.
+--   quarantined_at: Milestone 8's operator-triggered isolation state
+--       (the QUARANTINE policy class -- see common/policy_class.py).
+--       NULL means not quarantined (the default for every device).
+--       Nothing sets this yet -- no dashboard control exists to
+--       trigger it -- this column exists so the policy-classification
+--       logic and the nftables quarantine_v4 set have something real
+--       to read once that control is built.
 CREATE TABLE IF NOT EXISTS devices (
     id               INTEGER PRIMARY KEY,
     mac_address      TEXT UNIQUE NOT NULL,
@@ -148,6 +155,7 @@ CREATE TABLE IF NOT EXISTS devices (
     bump_enabled     INTEGER NOT NULL DEFAULT 0,
     bypass_login     INTEGER NOT NULL DEFAULT 0,
     is_authenticated INTEGER NOT NULL DEFAULT 1,
+    quarantined_at   TEXT,
     created_at       TEXT NOT NULL,
     CHECK (user_id IS NULL OR group_id IS NULL)
 );
@@ -214,16 +222,33 @@ CREATE INDEX IF NOT EXISTS idx_device_bindings_ip_active ON device_bindings(ipv4
 -- Singleton row (see the CHECK) tracking the interception layer's own
 -- runtime state: what generation the controller wants applied vs what
 -- the worker has actually confirmed, and whether the system is
--- currently degraded. Written by the controller; read by the
--- dashboard for an eventual "interception health" view (nothing reads
--- it yet -- see the v2 roadmap notes on that future dashboard scope).
+-- currently degraded. Written by the controller (see
+-- controller/health.py, Milestone 6); read by the dashboard for an
+-- eventual "interception health" view (nothing reads it yet -- see the
+-- v2 roadmap notes on that future dashboard scope).
+--   desired_policy_json: Milestone 7's DesiredPolicy blob, computed by
+--       controller/policy_state.py from devices/device_bindings and
+--       read directly by phase3/nftables-manager (Go) -- following
+--       this project's own "one shared database, live reads" pattern
+--       (see docs/project.md) instead of a new IPC protocol between
+--       the two processes. NULL means "nothing computed yet",
+--       distinct from an explicit empty policy.
+--   nft_mode / nft_last_healthy_at / nft_fail_reason: nftables-manager's
+--       OWN health, deliberately separate columns from mode/
+--       last_healthy_at/fail_open_reason above (which track the
+--       controller<->ARP-worker pipeline) so the two subsystems never
+--       clobber each other's status in this shared singleton row.
 CREATE TABLE IF NOT EXISTS interception_runtime (
-    singleton_id       INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-    desired_generation INTEGER NOT NULL DEFAULT 0,
-    applied_generation INTEGER NOT NULL DEFAULT 0,
-    mode               TEXT NOT NULL DEFAULT 'stopped' CHECK (mode IN ('stopped', 'running', 'repair_only', 'fail_open')),
-    last_healthy_at    TEXT,
-    fail_open_reason   TEXT
+    singleton_id        INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    desired_generation   INTEGER NOT NULL DEFAULT 0,
+    applied_generation   INTEGER NOT NULL DEFAULT 0,
+    mode                 TEXT NOT NULL DEFAULT 'stopped' CHECK (mode IN ('stopped', 'running', 'repair_only', 'fail_open')),
+    last_healthy_at      TEXT,
+    fail_open_reason     TEXT,
+    desired_policy_json  TEXT,
+    nft_mode             TEXT NOT NULL DEFAULT 'stopped' CHECK (nft_mode IN ('stopped', 'running', 'fail_open')),
+    nft_last_healthy_at  TEXT,
+    nft_fail_reason      TEXT
 );
 
 -- Normalized network/identity-layer event log (device seen/lost, a
@@ -301,6 +326,28 @@ def _migrate(conn: sqlite3.Connection) -> None:
     device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
     if "last_seen_at" not in device_columns:
         conn.execute("ALTER TABLE devices ADD COLUMN last_seen_at TEXT")
+    if "quarantined_at" not in device_columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN quarantined_at TEXT")
+
+    # interception_runtime is itself a new (Milestone 4) table, so an
+    # existing pre-Milestone-4 database won't have it at all yet --
+    # CREATE TABLE IF NOT EXISTS above handles that case. This only
+    # covers the Milestone 6/7 columns added to interception_runtime
+    # after ITS initial release, same idempotent pattern as devices
+    # above. No CHECK constraint on the migrated nft_mode column (SQLite's
+    # ADD COLUMN support for inline CHECK is version-fragile) -- unlike
+    # a fresh database, an existing one won't enforce it at the schema
+    # level; application code is still expected to only write the three
+    # valid values.
+    runtime_columns = {row["name"] for row in conn.execute("PRAGMA table_info(interception_runtime)")}
+    if runtime_columns and "desired_policy_json" not in runtime_columns:
+        conn.execute("ALTER TABLE interception_runtime ADD COLUMN desired_policy_json TEXT")
+    if runtime_columns and "nft_mode" not in runtime_columns:
+        conn.execute("ALTER TABLE interception_runtime ADD COLUMN nft_mode TEXT NOT NULL DEFAULT 'stopped'")
+    if runtime_columns and "nft_last_healthy_at" not in runtime_columns:
+        conn.execute("ALTER TABLE interception_runtime ADD COLUMN nft_last_healthy_at TEXT")
+    if runtime_columns and "nft_fail_reason" not in runtime_columns:
+        conn.execute("ALTER TABLE interception_runtime ADD COLUMN nft_fail_reason TEXT")
 
 
 # ==========================================================
