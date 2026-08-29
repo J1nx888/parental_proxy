@@ -217,47 +217,179 @@ if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
 }
 
-// Instant client-side search, no page reload, two flavors sharing one
-// delegated listener:
-//   data-filter-table="<table id>"  hides non-matching <tr>s (header rows,
-//       identified by containing a <th> since these tables don't use
-//       <thead>, are never hidden) -- used by the Users/Domains/Devices/
-//       Groups list pages.
-//   data-filter-list="<container id>"  hides non-matching direct children
-//       (a "no results" placeholder, tagged .picker-empty, is never
-//       hidden) -- used by the Users/Groups/Devices picker widgets
-//       (ACCESS_SELECTS, the device-assignment picker, the Domains-page
-//       filter picker).
-// Both are separate from and layered on top of the server-side ?user_id=
-// / ?group_id= / ?device_id= filters elsewhere, which narrow what's sent
-// down in the first place.
+// Instant client-side search, no page reload -- hides non-matching <tr>s
+// (header rows, identified by containing a <th> since these tables don't
+// use <thead>, are never hidden). Used by the Users/Domains/Devices/Groups
+// list pages. Separate from and layered on top of the server-side
+// ?user_id= / ?group_id= / ?device_id= filters elsewhere, which narrow
+// what's sent down in the first place. The combobox picker widgets below
+// have their own, unrelated search box.
 document.addEventListener("input", function (event) {
   var tableInput = event.target.closest("[data-filter-table]");
-  if (tableInput) {
-    var table = document.getElementById(tableInput.getAttribute("data-filter-table"));
-    if (!table) return;
-    var tableTerm = tableInput.value.trim().toLowerCase();
-    var rows = table.rows;
-    for (var i = 0; i < rows.length; i++) {
-      var row = rows[i];
-      if (row.querySelector("th")) continue;
-      row.style.display = (!tableTerm || row.textContent.toLowerCase().indexOf(tableTerm) !== -1) ? "" : "none";
-    }
-    return;
-  }
-  var listInput = event.target.closest("[data-filter-list]");
-  if (listInput) {
-    var list = document.getElementById(listInput.getAttribute("data-filter-list"));
-    if (!list) return;
-    var listTerm = listInput.value.trim().toLowerCase();
-    var items = list.children;
-    for (var j = 0; j < items.length; j++) {
-      var item = items[j];
-      if (item.classList.contains("picker-empty")) continue;
-      item.style.display = (!listTerm || item.textContent.toLowerCase().indexOf(listTerm) !== -1) ? "" : "none";
-    }
+  if (!tableInput) return;
+  var table = document.getElementById(tableInput.getAttribute("data-filter-table"));
+  if (!table) return;
+  var tableTerm = tableInput.value.trim().toLowerCase();
+  var rows = table.rows;
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    if (row.querySelector("th")) continue;
+    row.style.display = (!tableTerm || row.textContent.toLowerCase().indexOf(tableTerm) !== -1) ? "" : "none";
   }
 });
+
+// Combobox picker -- type-to-reveal search that replaces a full checkbox/
+// radio list with a dropdown of only the entities that match what's
+// typed. Below a small item count it shows everything as soon as you
+// focus the box (no need to type for a handful of kids); above that
+// threshold nothing renders until you type, so this scales to any number
+// of users/groups/devices without ever putting more than a handful of
+// rows in the DOM at once (see GH #8). Three modes, one engine:
+//   multi   ACCESS_SELECTS -- click a result to add it as a removable
+//       tag; each tag carries its own hidden input named data-field.
+//   single  DEVICE_ASSIGNMENT_SELECT -- click a result to replace the
+//       current selection, shown above the input; one hidden input.
+//   nav     Domains page filter -- click a result to navigate to its
+//       href; no form field involved at all.
+(function () {
+  var SHOW_ALL_THRESHOLD = 8;
+  var MAX_RESULTS = 8;
+
+  document.querySelectorAll("[data-combobox]").forEach(function (root) {
+    var mode = root.dataset.mode;
+    var field = root.dataset.field;
+    var itemsEl = root.querySelector("[data-combobox-items]");
+    var items = itemsEl ? JSON.parse(itemsEl.textContent || "[]") : [];
+    var input = root.querySelector("[data-combobox-input]");
+    var results = root.querySelector("[data-combobox-results]");
+    var tagsBox = root.querySelector("[data-combobox-tags]");
+    var currentBox = root.querySelector("[data-combobox-current]");
+    var selectedIds = {};
+
+    function itemLabel(id) {
+      for (var i = 0; i < items.length; i++) if (items[i].id === id) return items[i].label;
+      return id;
+    }
+
+    function renderCurrent() {
+      if (!currentBox) return;
+      var id = root.dataset.value || "";
+      currentBox.textContent = id === "" ? "" : "Currently: " + itemLabel(id);
+    }
+
+    function renderTags() {
+      if (!tagsBox) return;
+      tagsBox.innerHTML = "";
+      Object.keys(selectedIds).forEach(function (id) {
+        var pill = document.createElement("span");
+        pill.className = "combobox-tag";
+        var label = document.createElement("span");
+        label.textContent = itemLabel(id);
+        pill.appendChild(label);
+        var remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "combobox-tag-remove";
+        remove.setAttribute("aria-label", "Remove " + itemLabel(id));
+        remove.textContent = "×";
+        remove.addEventListener("click", function () {
+          delete selectedIds[id];
+          renderTags();
+          renderResults();
+        });
+        pill.appendChild(remove);
+        var hidden = document.createElement("input");
+        hidden.type = "hidden";
+        hidden.name = field;
+        hidden.value = id;
+        pill.appendChild(hidden);
+        tagsBox.appendChild(pill);
+      });
+    }
+
+    function selectItem(item) {
+      if (mode === "multi") {
+        selectedIds[item.id] = true;
+        renderTags();
+        input.value = "";
+        renderResults();
+        input.focus();
+        return;
+      }
+      if (mode === "single") {
+        root.dataset.value = item.id;
+        var hidden = root.querySelector("[data-combobox-hidden]");
+        if (hidden) hidden.value = item.id;
+        renderCurrent();
+        input.value = "";
+        results.style.display = "none";
+        return;
+      }
+      if (mode === "nav" && item.href) {
+        window.location.href = item.href;
+      }
+    }
+
+    function renderResults() {
+      var query = input.value.trim().toLowerCase();
+      var pool = items.filter(function (item) { return !(mode === "multi" && selectedIds[item.id]); });
+      var showAll = pool.length <= SHOW_ALL_THRESHOLD;
+      results.innerHTML = "";
+      if (!query && !showAll) {
+        results.style.display = "block";
+        var hint = document.createElement("div");
+        hint.className = "combobox-empty";
+        hint.textContent = "Type to search " + pool.length + " entries.";
+        results.appendChild(hint);
+        return;
+      }
+      var found = query
+        ? pool.filter(function (item) { return item.label.toLowerCase().indexOf(query) !== -1; }).slice(0, MAX_RESULTS)
+        : pool;
+      if (!found.length) {
+        results.style.display = "block";
+        var empty = document.createElement("div");
+        empty.className = "combobox-empty";
+        empty.textContent = query ? "No matches." : (root.dataset.empty || "Nothing to pick from yet.");
+        results.appendChild(empty);
+        return;
+      }
+      results.style.display = "block";
+      found.forEach(function (item) {
+        var row = document.createElement("div");
+        row.className = "combobox-result";
+        row.textContent = item.label;
+        // mousedown (not click) with preventDefault so the input never
+        // blurs before the selection registers -- a plain click handler
+        // here would lose the race: blur fires and hides this dropdown
+        // before the click event reaches it.
+        row.addEventListener("mousedown", function (event) {
+          event.preventDefault();
+          selectItem(item);
+        });
+        results.appendChild(row);
+      });
+    }
+
+    input.addEventListener("input", renderResults);
+    input.addEventListener("focus", renderResults);
+    input.addEventListener("keydown", function (event) {
+      if (event.key === "Escape") { results.style.display = "none"; input.blur(); }
+    });
+    document.addEventListener("click", function (event) {
+      if (!root.contains(event.target)) results.style.display = "none";
+    });
+
+    if (mode === "multi") {
+      var selectedEl = root.querySelector("[data-combobox-selected]");
+      var preselected = selectedEl ? JSON.parse(selectedEl.textContent || "[]") : [];
+      preselected.forEach(function (id) { selectedIds[String(id)] = true; });
+      renderTags();
+    } else if (mode === "single") {
+      root.dataset.value = root.dataset.initial || "";
+      renderCurrent();
+    }
+  });
+})();
 
 // Sidebar collapse toggle -- state persists per-browser via localStorage (a
 // display preference, not app data) and is applied before first paint by
@@ -699,77 +831,67 @@ def path_to_pattern(path: str) -> str:
     return "^" + re.escape((path or "/").split("?", 1)[0])
 
 
+def _entity_combo(rows, label_fn) -> list[dict]:
+    """Turns a list of DB rows into the flat [{"id", "label"}, ...] shape
+    the combobox widget's data-combobox-items script expects. Built once
+    in Python (rather than in the Jinja template) since the label differs
+    per entity type (display_name / name / label-or-mac_address) and
+    Jinja has no clean way to build a list of dicts inline before tojson."""
+    return [{"id": str(r["id"]), "label": label_fn(r)} for r in rows]
+
+
 # Shared by the add-domain form and the domain Manage page's Access card --
-# one Everyone checkbox plus three independent multi-selects (Users,
-# Groups, Devices), so "single user, multiple users, a device, a group, or
-# any combination" is just whatever's selected across these three lists at
-# once. Needs all_users/all_groups/all_devices and preselected_user_ids/
-# preselected_group_ids/preselected_device_ids/is_global_checked in scope
-# wherever it's used.
+# one Everyone checkbox plus three independent multi-select comboboxes
+# (Users, Groups, Devices), so "single user, multiple users, a device, a
+# group, or any combination" is just whatever's picked across these three
+# widgets at once. Needs all_users_combo/all_groups_combo/all_devices_combo
+# (see _entity_combo) and preselected_user_ids/preselected_group_ids/
+# preselected_device_ids/is_global_checked in scope wherever it's used.
 ACCESS_SELECTS = """
   <label><input type="checkbox" name="is_global" {{ 'checked' if is_global_checked }}> Everyone</label>
   <div class="access-grid">
     <div>
       <div class="access-label">Users</div>
-      <div class="picker">
-        <input type="search" class="picker-search" data-filter-list="usersPicker" placeholder="Search users&hellip;">
-        <div class="picker-list" id="usersPicker">
-          {% for u in all_users %}
-          <label class="picker-item"><input type="checkbox" name="user_ids" value="{{ u.id }}" {{ 'checked' if u.id in preselected_user_ids }}> {{ u.display_name }}</label>
-          {% else %}
-          <div class="picker-empty">No users yet.</div>
-          {% endfor %}
-        </div>
+      <div class="combobox" data-combobox data-mode="multi" data-field="user_ids" data-empty="No users yet.">
+        <div class="combobox-tags" data-combobox-tags></div>
+        <input type="search" class="combobox-input" data-combobox-input placeholder="Search users&hellip;">
+        <div class="combobox-results" data-combobox-results></div>
+        <script type="application/json" data-combobox-items>{{ all_users_combo|tojson }}</script>
+        <script type="application/json" data-combobox-selected>{{ preselected_user_ids|list|tojson }}</script>
       </div>
     </div>
     <div>
       <div class="access-label">Groups</div>
-      <div class="picker">
-        <input type="search" class="picker-search" data-filter-list="groupsPicker" placeholder="Search groups&hellip;">
-        <div class="picker-list" id="groupsPicker">
-          {% for g in all_groups %}
-          <label class="picker-item"><input type="checkbox" name="group_ids" value="{{ g.id }}" {{ 'checked' if g.id in preselected_group_ids }}> {{ g.name }}</label>
-          {% else %}
-          <div class="picker-empty">No groups yet.</div>
-          {% endfor %}
-        </div>
+      <div class="combobox" data-combobox data-mode="multi" data-field="group_ids" data-empty="No groups yet.">
+        <div class="combobox-tags" data-combobox-tags></div>
+        <input type="search" class="combobox-input" data-combobox-input placeholder="Search groups&hellip;">
+        <div class="combobox-results" data-combobox-results></div>
+        <script type="application/json" data-combobox-items>{{ all_groups_combo|tojson }}</script>
+        <script type="application/json" data-combobox-selected>{{ preselected_group_ids|list|tojson }}</script>
       </div>
     </div>
     <div>
       <div class="access-label">Devices</div>
-      <div class="picker">
-        <input type="search" class="picker-search" data-filter-list="devicesPicker" placeholder="Search devices&hellip;">
-        <div class="picker-list" id="devicesPicker">
-          {% for dev in all_devices %}
-          <label class="picker-item"><input type="checkbox" name="device_ids" value="{{ dev.id }}" {{ 'checked' if dev.id in preselected_device_ids }}> {{ dev.label or dev.mac_address }}</label>
-          {% else %}
-          <div class="picker-empty">No devices yet.</div>
-          {% endfor %}
-        </div>
+      <div class="combobox" data-combobox data-mode="multi" data-field="device_ids" data-empty="No devices yet.">
+        <div class="combobox-tags" data-combobox-tags></div>
+        <input type="search" class="combobox-input" data-combobox-input placeholder="Search devices&hellip;">
+        <div class="combobox-results" data-combobox-results></div>
+        <script type="application/json" data-combobox-items>{{ all_devices_combo|tojson }}</script>
+        <script type="application/json" data-combobox-selected>{{ preselected_device_ids|list|tojson }}</script>
       </div>
     </div>
   </div>
-  <p class="hint" style="margin-top:.5rem;">Click any number of users, groups, and/or devices -- no Ctrl/Cmd needed. Type in a box to search it.</p>
+  <p class="hint" style="margin-top:.5rem;">Type to search, then click a result to add it as a tag -- click a tag's &times; to remove it.</p>
 """
 
 
 DOMAINS_BODY = """
 <div class="card">
 <h2>Filter</h2>
-{% if (all_users|length + all_groups|length + all_devices|length) > 8 %}
-<input type="search" data-filter-list="domainFilterChips" placeholder="Search kids, groups, devices&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">
-{% endif %}
-<div class="chip-row" id="domainFilterChips">
-  <a class="chip {{ 'active' if not current_filter_target }}" href="{{ url_for('domains') }}">All domains</a>
-  {% for u in all_users %}
-  <a class="chip {{ 'active' if current_filter_target==('user:' ~ u.id) }}" href="{{ url_for('domains', target='user:' ~ u.id) }}">{{ u.display_name }}</a>
-  {% endfor %}
-  {% for g in all_groups %}
-  <a class="chip {{ 'active' if current_filter_target==('group:' ~ g.id) }}" href="{{ url_for('domains', target='group:' ~ g.id) }}">{{ g.name }}</a>
-  {% endfor %}
-  {% for dev in all_devices %}
-  <a class="chip {{ 'active' if current_filter_target==('device:' ~ dev.id) }}" href="{{ url_for('domains', target='device:' ~ dev.id) }}">{{ dev.label or dev.mac_address }}</a>
-  {% endfor %}
+<div class="combobox" data-combobox data-mode="nav" data-empty="No kids, groups, or devices yet.">
+  <input type="search" class="combobox-input" data-combobox-input placeholder="Search kids, groups, devices&hellip;">
+  <div class="combobox-results" data-combobox-results></div>
+  <script type="application/json" data-combobox-items>{{ filter_combo|tojson }}</script>
 </div>
 {% if filtered_user or filtered_group or filtered_device %}
 <p class="hint">
@@ -850,6 +972,30 @@ DOMAINS_BODY = """
 """
 
 
+def _domains_filter_combo(all_users, all_groups, all_devices) -> list[dict]:
+    """Items for the Domains page's filter combobox (data-mode="nav") --
+    like _entity_combo, but each item also carries the ?target= href to
+    navigate to when picked, and there's a leading pseudo-entry for
+    clearing back to the unfiltered view."""
+    items = [{"id": "", "label": "All domains", "href": url_for("domains")}]
+    items += [
+        {"id": f"user:{u['id']}", "label": u["display_name"], "href": url_for("domains", target=f"user:{u['id']}")}
+        for u in all_users
+    ]
+    items += [
+        {"id": f"group:{g['id']}", "label": g["name"], "href": url_for("domains", target=f"group:{g['id']}")}
+        for g in all_groups
+    ]
+    items += [
+        {
+            "id": f"device:{d['id']}", "label": d["label"] or d["mac_address"],
+            "href": url_for("domains", target=f"device:{d['id']}"),
+        }
+        for d in all_devices
+    ]
+    return items
+
+
 def _parse_filter_target(raw: str) -> dict:
     """Decodes the Domains page's single combined filter picker (radio
     value like 'user:5', matching the same encoding as the device
@@ -918,20 +1064,15 @@ def domains():
     all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
     all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
     all_devices = conn.execute("SELECT * FROM devices ORDER BY COALESCE(label, mac_address)").fetchall()
-    if filtered_user:
-        current_filter_target = f"user:{filtered_user['id']}"
-    elif filtered_group:
-        current_filter_target = f"group:{filtered_group['id']}"
-    elif filtered_device:
-        current_filter_target = f"device:{filtered_device['id']}"
-    else:
-        current_filter_target = ""
     return render(
         "domains",
         render_template_string(
             DOMAINS_BODY, domains=rows, filtered_user=filtered_user, filtered_group=filtered_group,
-            filtered_device=filtered_device, all_users=all_users, all_groups=all_groups, all_devices=all_devices,
-            current_filter_target=current_filter_target, is_global_checked=False,
+            filtered_device=filtered_device, is_global_checked=False,
+            filter_combo=_domains_filter_combo(all_users, all_groups, all_devices),
+            all_users_combo=_entity_combo(all_users, lambda u: u["display_name"]),
+            all_groups_combo=_entity_combo(all_groups, lambda g: g["name"]),
+            all_devices_combo=_entity_combo(all_devices, lambda dev: dev["label"] or dev["mac_address"]),
             preselected_user_ids={filtered_user["id"]} if filtered_user else set(),
             preselected_group_ids={filtered_group["id"]} if filtered_group else set(),
             preselected_device_ids={filtered_device["id"]} if filtered_device else set(),
@@ -1197,7 +1338,10 @@ def domain_detail(domain_id: int):
         "SELECT * FROM domain_paths WHERE domain_id = ? ORDER BY pattern", (domain_id,)
     ).fetchall()
     body = render_template_string(
-        DOMAIN_DETAIL_BODY, d=d, all_users=all_users, all_groups=all_groups, all_devices=all_devices,
+        DOMAIN_DETAIL_BODY, d=d,
+        all_users_combo=_entity_combo(all_users, lambda u: u["display_name"]),
+        all_groups_combo=_entity_combo(all_groups, lambda g: g["name"]),
+        all_devices_combo=_entity_combo(all_devices, lambda dev: dev["label"] or dev["mac_address"]),
         preselected_user_ids=assigned_user_ids, preselected_group_ids=assigned_group_ids,
         preselected_device_ids=assigned_device_ids, is_global_checked=bool(d["is_global"]),
         paths=paths, prefill_path=request.args.get("prefill_path"),
@@ -1328,31 +1472,34 @@ def _parse_device_assignment(raw: str) -> tuple[int | None, int | None, int]:
     return None, None, 0
 
 
+def _assignment_combo(all_users, all_groups) -> list[dict]:
+    """Items for the device-assignment combobox -- Unassigned/Ignore are
+    always-present pseudo-entries alongside every kid and group, encoded
+    the same way _parse_device_assignment() expects to decode them."""
+    items = [
+        {"id": "", "label": "Unassigned"},
+        {"id": "ignored", "label": "Ignore (never filtered)"},
+    ]
+    items += [{"id": f"user:{u['id']}", "label": u["display_name"]} for u in all_users]
+    items += [{"id": f"group:{g['id']}", "label": g["name"]} for g in all_groups]
+    return items
+
+
 # Shared by the add-device form and the per-device Manage form -- one
 # control picks "unassigned" / "ignore this device entirely" / a specific
 # kid / a specific group, so there's no separate always-visible kid+group
 # dropdown pair to keep in sync (this app doesn't use JS to show/hide
-# fields based on another field's value).
+# fields based on another field's value). Needs assignment_combo (see
+# _assignment_combo) and current (the composite value, e.g. "user:5") in
+# scope wherever it's used.
 DEVICE_ASSIGNMENT_SELECT = """
   <div class="access-label">Assign to</div>
-  <div class="picker" style="max-width:320px;">
-    <input type="search" class="picker-search" data-filter-list="assignmentPicker" placeholder="Search&hellip;">
-    <div class="picker-list" id="assignmentPicker">
-      <label class="picker-item"><input type="radio" name="assignment" value="" {{ 'checked' if current=='' }}> Unassigned</label>
-      <label class="picker-item"><input type="radio" name="assignment" value="ignored" {{ 'checked' if current=='ignored' }}> Ignore (never filtered)</label>
-      {% if all_users %}
-      <div class="picker-section">Kid</div>
-      {% for u in all_users %}
-      <label class="picker-item"><input type="radio" name="assignment" value="user:{{ u.id }}" {{ 'checked' if current==('user:' ~ u.id) }}> {{ u.display_name }}</label>
-      {% endfor %}
-      {% endif %}
-      {% if all_groups %}
-      <div class="picker-section">Group</div>
-      {% for g in all_groups %}
-      <label class="picker-item"><input type="radio" name="assignment" value="group:{{ g.id }}" {{ 'checked' if current==('group:' ~ g.id) }}> {{ g.name }}</label>
-      {% endfor %}
-      {% endif %}
-    </div>
+  <div class="combobox" data-combobox data-mode="single" data-initial="{{ current }}" style="max-width:320px;">
+    <div class="combobox-current" data-combobox-current></div>
+    <input type="search" class="combobox-input" data-combobox-input placeholder="Search&hellip;">
+    <div class="combobox-results" data-combobox-results></div>
+    <input type="hidden" name="assignment" data-combobox-hidden value="{{ current }}">
+    <script type="application/json" data-combobox-items>{{ assignment_combo|tojson }}</script>
   </div>
 """
 
@@ -1452,8 +1599,8 @@ def devices():
     return render(
         "devices",
         render_template_string(
-            DEVICES_BODY, devices=rows, groups=all_groups, all_users=all_users, all_groups=all_groups,
-            current="",
+            DEVICES_BODY, devices=rows, groups=all_groups,
+            assignment_combo=_assignment_combo(all_users, all_groups), current="",
         ),
     )
 
@@ -1524,7 +1671,7 @@ def device_detail(device_id: int):
     return render(
         "devices",
         render_template_string(
-            DEVICE_DETAIL_BODY, d=d, all_users=all_users, all_groups=all_groups,
+            DEVICE_DETAIL_BODY, d=d, assignment_combo=_assignment_combo(all_users, all_groups),
             current=_device_assignment_value(d),
         ),
     )

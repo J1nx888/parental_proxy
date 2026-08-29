@@ -1583,12 +1583,15 @@ def test_domains_target_filter_reflects_selection_in_picker(client, db_conn):
     group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()[0]
     resp = client.get(f"/domains?target=group:{group_id}", headers=_auth_header())
     assert resp.status_code == 200
-    import re
-    # The filter is a row of chip links now (one <a> per kid/group/device);
-    # the one matching the current selection carries the "active" class.
-    match = re.search(rb'class="chip( active)?" href="[^"]*target=group:%d"' % group_id, resp.data)
-    assert match is not None
-    assert match.group(1) == b" active"
+    # The filter is a type-to-search combobox now, fed by a JSON item list
+    # rather than one <a> per kid/group/device -- this group's entry points
+    # back at the same ?target= value used to reach this page.
+    assert f'"href": "/domains?target=group:{group_id}"'.encode() in resp.data
+    # The combobox itself has no persistent "selected" state (nothing
+    # renders until you type), so the current selection is reflected by
+    # the existing hint text instead of a highlighted chip.
+    assert b"Showing domains assigned to" in resp.data
+    assert b"the <strong>TVs</strong> group" in resp.data
 
 
 def test_domains_target_filter_invalid_falls_back_to_all(client, db_conn):
@@ -1608,20 +1611,23 @@ def test_domains_target_takes_priority_over_individual_params(client, db_conn):
 
 
 # ============================================================
-# Picker widgets render checkboxes/radios, not native multi-selects
+# Picker widgets are searchable comboboxes, not native multi-selects
 # ============================================================
 
 def test_add_domain_form_uses_checkbox_pickers_not_multiselect(client):
     resp = client.get("/domains", headers=_auth_header())
     # The mode dropdown (splice/bump/trusted) is still a plain <select>;
-    # what's gone is the old <select multiple> for users/groups/devices.
+    # what's gone is the old <select multiple> for users/groups/devices --
+    # replaced by one type-to-search combobox per entity type, each fed by
+    # its own JSON item list (see _entity_combo) rather than a fully
+    # rendered checkbox per user/group/device.
     assert b"multiple" not in resp.data.lower()
-    assert b'data-filter-list="usersPicker"' in resp.data
-    assert b'data-filter-list="groupsPicker"' in resp.data
-    assert b'data-filter-list="devicesPicker"' in resp.data
+    assert b'data-mode="multi" data-field="user_ids"' in resp.data
+    assert b'data-mode="multi" data-field="group_ids"' in resp.data
+    assert b'data-mode="multi" data-field="device_ids"' in resp.data
 
 
 def test_device_assignment_uses_radio_picker(client):
     resp = client.get("/devices", headers=_auth_header())
-    assert b'data-filter-list="assignmentPicker"' in resp.data
-    assert b'name="assignment" value="ignored"' in resp.data
+    assert b'data-mode="single"' in resp.data
+    assert b'"id": "ignored", "label": "Ignore (never filtered)"' in resp.data
