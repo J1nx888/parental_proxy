@@ -4,22 +4,21 @@
 // interface (see internal/worker/types.go). This is the one piece of
 // the whole project that actually needs CAP_NET_RAW.
 //
-// NOT VERIFIED AGAINST A REAL BUILD -- this dev environment has no Go
-// toolchain (see docs/design/phase3-technical-design.md's header
-// note). Before the first real build on the smoke-test VM:
-//
-//	go get github.com/mdlayher/arp@latest github.com/mdlayher/ethernet@latest
-//	go build ./...
-//
-// and fix any API mismatches in this file. mdlayher/arp's exact method
-// set/signatures below are written from memory of the package's
-// documented shape, not checked against a fetched copy -- this file is
-// intentionally small and isolated so that fixing it doesn't touch any
-// of the unit-tested logic in internal/worker or internal/ipc.
+// Verified 2026-08-29 against a real build on the smoke-test VM
+// (github.com/mdlayher/arp v0.0.0-20260528070854-93566ba168e9, `go doc`
+// used to confirm the exact signatures): that version's Client.Resolve
+// and arp.NewPacket take netip.Addr, not net.IP, which the first draft
+// of this file (written offline, no toolchain available) got wrong.
+// Fixed below with a net.IP -> netip.Addr conversion at the boundary
+// so the rest of the codebase (worker.ARPSender) keeps using net.IP,
+// which is what the stdlib and this project's other code already use
+// throughout.
 package arpio
 
 import (
+	"fmt"
 	"net"
+	"net/netip"
 
 	"github.com/mdlayher/arp"
 )
@@ -50,7 +49,11 @@ func (cl *Client) Close() error {
 // served from a cache -- to learn ip's real hardware address. Used
 // only by worker.ResolveGateway during startup safety checks.
 func (cl *Client) Resolve(ip net.IP) (net.HardwareAddr, error) {
-	return cl.c.Resolve(ip)
+	addr, err := toAddr(ip)
+	if err != nil {
+		return nil, err
+	}
+	return cl.c.Resolve(addr)
 }
 
 // Reply sends an ARP reply claiming senderIP is at senderMAC,
@@ -59,9 +62,33 @@ func (cl *Client) Resolve(ip net.IP) (net.HardwareAddr, error) {
 // update, not whether the rest of the segment also observes the
 // frame).
 func (cl *Client) Reply(senderIP net.IP, senderMAC net.HardwareAddr, dstIP net.IP, dstMAC net.HardwareAddr) error {
-	pkt, err := arp.NewPacket(arp.OperationReply, senderMAC, senderIP, dstMAC, dstIP)
+	srcAddr, err := toAddr(senderIP)
+	if err != nil {
+		return err
+	}
+	dstAddr, err := toAddr(dstIP)
+	if err != nil {
+		return err
+	}
+	pkt, err := arp.NewPacket(arp.OperationReply, senderMAC, srcAddr, dstMAC, dstAddr)
 	if err != nil {
 		return err
 	}
 	return cl.c.WriteTo(pkt, dstMAC)
+}
+
+// toAddr converts a net.IP (as used throughout worker.ARPSender and
+// the rest of this project) to the netip.Addr that mdlayher/arp's
+// current API requires. IPv4-only, matching the rest of this project
+// (Generation/Target are IPv4-only per the design doc).
+func toAddr(ip net.IP) (netip.Addr, error) {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return netip.Addr{}, fmt.Errorf("not an IPv4 address: %v", ip)
+	}
+	addr, ok := netip.AddrFromSlice(ip4)
+	if !ok {
+		return netip.Addr{}, fmt.Errorf("invalid IPv4 address: %v", ip)
+	}
+	return addr, nil
 }

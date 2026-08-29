@@ -293,12 +293,14 @@ replaces its Redis-based approach.
       generation scheduler, race-free corrective-restoration logic on
       generation switch, the lease/heartbeat state machine, startup
       target-safety checks, and the controller IPC protocol are
-      implemented with unit tests for all of the above. Not yet
-      compiled or run anywhere — this dev sandbox has no Go toolchain
-      — and the raw-ARP-socket adapter (`internal/arpio`) is flagged as
-      unverified against a real `mdlayher/arp` build. See
-      `phase3/arp-worker/README.md` for exact status and first-build
-      steps once the smoke-test VM is available.
+      implemented with unit tests for all of the above. **Builds,
+      vets, and passes its full test suite on the smoke-test VM**
+      (Go 1.26.7 auto-toolchain) as of the same day — one real API
+      mismatch in the `mdlayher/arp` adapter found and fixed in the
+      process (`netip.Addr` vs `net.IP`). Not yet wired into an actual
+      controller process (Milestone 3, not started) or run against a
+      real interface (needs `CAP_NET_RAW`, deliberately withheld until
+      proven safe). See `phase3/arp-worker/README.md` for exact status.
 - [ ] **3. Controller** — versioned Unix-socket IPC, generations,
       leases, idempotent reconciliation.
 - [ ] **4. Identity model** — `device_bindings`, outbox events, MAC/IP

@@ -1,13 +1,21 @@
 # pp-arp-worker (Milestone 2 scaffold)
 
-Status: **written, not yet built or run.** This dev environment has no
-Go toolchain, so nothing here has been compiled, `go vet`'d, or tested
-— see the header notes in `internal/arpio/mdlayher_adapter.go` and
-`internal/ipc/peercred_unix.go` for the two files most likely to need a
-fix once a real build is attempted. Everything else (`internal/worker`,
-`internal/ipc`'s protocol/dispatch) has no external dependencies and no
-OS-specific syscalls, so it's the part most likely to already be
-correct.
+Status: **builds, vets, and passes its full test suite** on the
+smoke-test VM as of 2026-08-29 (Ubuntu 24.04, Go 1.26.7 auto-toolchain,
+`go build ./...`, `go vet ./...`, `go test ./... -count=10` all clean —
+`-race` isn't available there, no C compiler on that sandboxed account).
+One real API mismatch was found and fixed during that first build:
+`github.com/mdlayher/arp`'s current version uses `netip.Addr`, not
+`net.IP`, in `Client.Resolve` and `arp.NewPacket` — `internal/arpio/mdlayher_adapter.go`
+now converts at that one boundary; the rest of the codebase still uses
+`net.IP` throughout, matching the stdlib conventions the rest of this
+project already follows. `peercred_unix.go`'s `SO_PEERCRED` handling
+built and vetted clean on the first try.
+
+Not yet done: running this against a real interface (needs
+`CAP_NET_RAW`, deliberately never granted to this scaffold — see below),
+and wiring it into an actual controller process, which doesn't exist
+yet (Milestone 3).
 
 See [`../../docs/design/phase3-technical-design.md`](../../docs/design/phase3-technical-design.md)
 for the design this implements, and
@@ -39,23 +47,19 @@ cmd/pp-arp-worker/ main.go: flag parsing, wiring everything together,
                     shutdown.
 ```
 
-## First build, on the smoke-test VM (once it's reachable)
+## Building it yourself
 
 ```bash
 cd phase3/arp-worker
-go mod tidy      # fetches mdlayher/arp, golang.org/x/sys, coreos/go-systemd; writes go.sum
 go build ./...
 go vet ./...
 go test ./...    # internal/worker and internal/ipc tests need no root/NIC/CAP_NET_RAW
 ```
 
-`go build` will very likely surface a handful of API mismatches in
-`internal/arpio/mdlayher_adapter.go` and `internal/ipc/peercred_unix.go`
-— those two files were written from memory of the packages' documented
-shape, not against a fetched copy, precisely because no toolchain was
-available while writing them. Everything under `internal/worker` and
-`internal/ipc/{protocol,dispatch}.go` has no third-party dependency and
-should build clean.
+`go.mod`/`go.sum` are already resolved and committed, so `go mod tidy`
+isn't needed unless you're changing dependencies. If your local Go
+toolchain is older than the `go` directive in `go.mod` requires,
+`GOTOOLCHAIN=auto` (the default) will fetch a newer one automatically.
 
 ## What's deliberately NOT here yet
 
