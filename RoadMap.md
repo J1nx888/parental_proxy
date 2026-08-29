@@ -315,7 +315,20 @@ replaces its Redis-based approach.
       placeholder that raises rather than guessing, pending Milestone
       4's identity model.
 - [ ] **4. Identity model** — `device_bindings`, outbox events, MAC/IP
-      conflict handling.
+      conflict handling. **Scaffold written and verified 2026-08-29**:
+      `device_bindings`/`interception_runtime`/`network_events` tables
+      added to `common/db.py`; `common/identity.py` records
+      observations and handles both MAC/IP conflict shapes (IP
+      reassigned to a new MAC, a device's own IP changing), each
+      logged as a `network_events` row — never auto-associating a
+      brand-new MAC to a `devices` row from network data alone.
+      `controller/desired_state.py` replaces `main.py`'s placeholder
+      with a real query (every non-ignored device with an active
+      binding). 27 new tests, full suite verified at 298/298 locally
+      and 305/305 on the smoke-test VM. Not yet done: nothing actually
+      populates `device_bindings` from live traffic — that's a
+      discovery daemon (rtnetlink/snapshot/AdGuard sources per the
+      design doc's precedence order), still unbuilt.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
       sets, atomic apply/rollback.
 - [ ] **6. Service health** — Squid/AdGuard/controller readiness gates,
