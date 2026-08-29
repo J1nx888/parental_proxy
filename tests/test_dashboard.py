@@ -1584,9 +1584,11 @@ def test_domains_target_filter_reflects_selection_in_picker(client, db_conn):
     resp = client.get(f"/domains?target=group:{group_id}", headers=_auth_header())
     assert resp.status_code == 200
     import re
-    match = re.search(rb'value="group:%d"[^>]*' % group_id, resp.data)
+    # The filter is a row of chip links now (one <a> per kid/group/device);
+    # the one matching the current selection carries the "active" class.
+    match = re.search(rb'class="chip( active)?" href="[^"]*target=group:%d"' % group_id, resp.data)
     assert match is not None
-    assert b"checked" in match.group(0)
+    assert match.group(1) == b" active"
 
 
 def test_domains_target_filter_invalid_falls_back_to_all(client, db_conn):

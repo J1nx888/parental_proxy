@@ -157,31 +157,60 @@ BASE = """
 <link rel="icon" href="{{ url_for('static', filename='icons/favicon.ico') }}">
 <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<script>
+try { if (localStorage.getItem("pp_sidebar_collapsed") === "1") document.documentElement.classList.add("sidebar-collapsed"); } catch (e) {}
+</script>
 </head>
 <body>
-<header class="topbar">
-  <div class="page">
-    <a class="brand" href="{{ url_for('report') }}">
+{% set page_titles = {'report': 'Report', 'users': 'Users', 'domains': 'Domains', 'devices': 'Devices', 'settings': 'Settings'} %}
+<div class="app-shell">
+  <nav class="sidebar">
+    <a class="sidebar-brand" href="{{ url_for('report') }}">
       <img src="{{ url_for('static', filename='icons/icon-192.png') }}" alt="">
-      Parental Proxy
+      <span class="sidebar-label">Parental Proxy</span>
     </a>
-    <nav class="tabs">
-      <a href="{{ url_for('report') }}" class="{{ 'active' if active=='report' else '' }}">
-        Report{% if pending_count %} <span class="badge pending">{{ pending_count }}</span>{% endif %}
+    <div class="sidebar-nav">
+      <a class="sidebar-item {{ 'active' if active=='report' else '' }}" href="{{ url_for('report') }}" title="Report">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="20" x2="6" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="18" y1="20" x2="18" y2="14"/></svg>
+        <span class="sidebar-label">Report{% if pending_count %} <span class="badge pending">{{ pending_count }}</span>{% endif %}</span>
       </a>
-      <a href="{{ url_for('users') }}" class="{{ 'active' if active=='users' else '' }}">Users</a>
-      <a href="{{ url_for('domains') }}" class="{{ 'active' if active=='domains' else '' }}">Domains</a>
-      <a href="{{ url_for('devices') }}" class="{{ 'active' if active=='devices' else '' }}">Devices</a>
-    </nav>
-    <div class="topbar-actions">
-      <a class="icon-btn {{ 'active' if active=='settings' else '' }}" href="{{ url_for('settings_page') }}" title="Settings" aria-label="Settings">&#9881;</a>
-      <a class="logout-link" href="http://logout:logout@{{ request.host }}{{ url_for('logout') }}" title="Log out">Logout</a>
+      <a class="sidebar-item {{ 'active' if active=='users' else '' }}" href="{{ url_for('users') }}" title="Users">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span class="sidebar-label">Users</span>
+      </a>
+      <a class="sidebar-item {{ 'active' if active=='domains' else '' }}" href="{{ url_for('domains') }}" title="Domains">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="3" y1="12" x2="21" y2="12"/><path d="M12 3a14.5 14.5 0 0 1 0 18a14.5 14.5 0 0 1 0-18z"/></svg>
+        <span class="sidebar-label">Domains</span>
+      </a>
+      <a class="sidebar-item {{ 'active' if active=='devices' else '' }}" href="{{ url_for('devices') }}" title="Devices">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        <span class="sidebar-label">Devices</span>
+      </a>
+      <a class="sidebar-item {{ 'active' if active=='settings' else '' }}" href="{{ url_for('settings_page') }}" title="Settings">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span class="sidebar-label">Settings</span>
+      </a>
+    </div>
+    <div class="sidebar-bottom">
+      <button type="button" class="sidebar-item sidebar-collapse-btn" id="sidebarToggle" title="Collapse sidebar" aria-label="Toggle sidebar width">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="11 17 6 12 11 7"/><polyline points="18 17 13 12 18 7"/></svg>
+        <span class="sidebar-label">Collapse</span>
+      </button>
+      <a class="sidebar-item" href="http://logout:logout@{{ request.host }}{{ url_for('logout') }}" title="Log out">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <span class="sidebar-label">Log out</span>
+      </a>
+    </div>
+  </nav>
+  <div class="main">
+    <header class="topbar-slim">
+      <span class="page-title">{{ page_titles.get(active, active) }}</span>
+    </header>
+    <div class="page">
+    {% if message %}<div class="flash {{ 'error' if error else 'ok' }}">{{ message }}</div>{% endif %}
+    {{ body|safe }}
     </div>
   </div>
-</header>
-<div class="page">
-{% if message %}<div class="flash {{ 'error' if error else 'ok' }}">{{ message }}</div>{% endif %}
-{{ body|safe }}
 </div>
 <script>
 if ("serviceWorker" in navigator) {
@@ -229,6 +258,19 @@ document.addEventListener("input", function (event) {
     }
   }
 });
+
+// Sidebar collapse toggle -- state persists per-browser via localStorage (a
+// display preference, not app data) and is applied before first paint by
+// the inline <script> in <head> reading it onto <html> early, so there's no
+// flash of the wrong width on reload.
+(function () {
+  var toggle = document.getElementById("sidebarToggle");
+  if (!toggle) return;
+  toggle.addEventListener("click", function () {
+    var collapsed = document.documentElement.classList.toggle("sidebar-collapsed");
+    try { localStorage.setItem("pp_sidebar_collapsed", collapsed ? "1" : "0"); } catch (e) {}
+  });
+})();
 </script>
 </body>
 </html>
@@ -714,41 +756,21 @@ ACCESS_SELECTS = """
 DOMAINS_BODY = """
 <div class="card">
 <h2>Filter</h2>
-<form method="get" action="{{ url_for('domains') }}">
-  <div class="picker" style="max-width:340px;">
-    <input type="search" class="picker-search" data-filter-list="domainFilterPicker" placeholder="Search&hellip;">
-    <div class="picker-list" id="domainFilterPicker">
-      <label class="picker-item">
-        <input type="radio" name="target" value="" {{ 'checked' if not current_filter_target }} onchange="this.form.submit()"> All domains
-      </label>
-      {% if all_users %}
-      <div class="picker-section">Kid</div>
-      {% for u in all_users %}
-      <label class="picker-item">
-        <input type="radio" name="target" value="user:{{ u.id }}" {{ 'checked' if current_filter_target==('user:' ~ u.id) }} onchange="this.form.submit()"> {{ u.display_name }}
-      </label>
-      {% endfor %}
-      {% endif %}
-      {% if all_groups %}
-      <div class="picker-section">Group</div>
-      {% for g in all_groups %}
-      <label class="picker-item">
-        <input type="radio" name="target" value="group:{{ g.id }}" {{ 'checked' if current_filter_target==('group:' ~ g.id) }} onchange="this.form.submit()"> {{ g.name }}
-      </label>
-      {% endfor %}
-      {% endif %}
-      {% if all_devices %}
-      <div class="picker-section">Device</div>
-      {% for dev in all_devices %}
-      <label class="picker-item">
-        <input type="radio" name="target" value="device:{{ dev.id }}" {{ 'checked' if current_filter_target==('device:' ~ dev.id) }} onchange="this.form.submit()"> {{ dev.label or dev.mac_address }}
-      </label>
-      {% endfor %}
-      {% endif %}
-    </div>
-  </div>
-  <noscript><button class="add" type="submit" style="margin-top:.5rem;">Apply</button></noscript>
-</form>
+{% if (all_users|length + all_groups|length + all_devices|length) > 8 %}
+<input type="search" data-filter-list="domainFilterChips" placeholder="Search kids, groups, devices&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">
+{% endif %}
+<div class="chip-row" id="domainFilterChips">
+  <a class="chip {{ 'active' if not current_filter_target }}" href="{{ url_for('domains') }}">All domains</a>
+  {% for u in all_users %}
+  <a class="chip {{ 'active' if current_filter_target==('user:' ~ u.id) }}" href="{{ url_for('domains', target='user:' ~ u.id) }}">{{ u.display_name }}</a>
+  {% endfor %}
+  {% for g in all_groups %}
+  <a class="chip {{ 'active' if current_filter_target==('group:' ~ g.id) }}" href="{{ url_for('domains', target='group:' ~ g.id) }}">{{ g.name }}</a>
+  {% endfor %}
+  {% for dev in all_devices %}
+  <a class="chip {{ 'active' if current_filter_target==('device:' ~ dev.id) }}" href="{{ url_for('domains', target='device:' ~ dev.id) }}">{{ dev.label or dev.mac_address }}</a>
+  {% endfor %}
+</div>
 {% if filtered_user or filtered_group or filtered_device %}
 <p class="hint">
   Showing domains assigned to
