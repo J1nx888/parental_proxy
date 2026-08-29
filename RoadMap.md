@@ -395,9 +395,20 @@ replaces its Redis-based approach.
       half-updated, and `internal/nft`'s fault tests plus the
       reconciliation loop's read-fresh-every-cycle design mean a
       process crash mid-cycle self-corrects on the next tick, no
-      special resume logic needed). **Not attempted, needs real
-      hardware or a network-namespace harness this session didn't
-      build**: NIC down/up, gateway reboot, OOM kill under real load.
+      special resume logic needed); **the worker connection itself
+      dying** — previously just a documented gap — the controller
+      (`controller/main.py`) now detects a dead `WorkerClient`
+      (`WorkerConnectionError`, distinct from an application-level
+      fault reply) and reconnects on its own, verified with a real
+      integration test (real signals, real threads, a simulated worker
+      crash-and-restart, a clean `SIGTERM` shutdown afterward). Building
+      that test surfaced and fixed a real, previously-unnoticed bug:
+      `WorkerClient` had no lock, so the heartbeat-pacer thread and the
+      main reconciliation loop could genuinely race on the same socket
+      — fixed with a `threading.Lock`, verified with 40 concurrent
+      calls from 40 threads. **Not attempted, needs real hardware or a
+      network-namespace harness this session didn't build**: NIC
+      down/up, gateway reboot, OOM kill under real load.
 - [ ] **10. Soak test** — 7–14 days of mixed real household load,
       roaming, sleep/wake, with memory/FD/CPU trend monitoring. **Not
       startable autonomously** — needs the real household network
