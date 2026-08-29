@@ -79,11 +79,39 @@ CREATE TABLE IF NOT EXISTS series_cache (
     expires_at REAL NOT NULL
 );
 
--- v2 roadmap groundwork (no enforcement reads this yet -- Phase 3+): a
--- physical device on the network, identified by MAC address.
---   user_id: who this device belongs to. Nullable -- a shared household
---       device or a bypass_login smart-home gadget may not belong to any
---       one person.
+-- A named category of shared devices (e.g. "TVs", "IoT", "Gaming
+-- Computers") that gets its own domain allow-list, for devices that don't
+-- belong to any one person. Parallel concept to `users`, not a kind of
+-- user -- a device is assigned to at most one user OR one group (see
+-- `devices` below), never both.
+CREATE TABLE IF NOT EXISTS groups (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT UNIQUE NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- A group's domain allow-list -- the group-level equivalent of
+-- `user_domains`. Same shape, same meaning: a row here grants every
+-- device in this group access to this domain, independent of the
+-- domain's own `is_global` flag.
+CREATE TABLE IF NOT EXISTS group_domains (
+    id        INTEGER PRIMARY KEY,
+    group_id  INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+    UNIQUE(group_id, domain_id)
+);
+
+-- v2 roadmap groundwork (no enforcement reads any of this yet -- Phase
+-- 3+): a physical device on the network, identified by MAC address.
+--   user_id / group_id: at most one of these is set (enforced below) --
+--       a device belongs to a specific person, OR to a shared-device
+--       group ("TVs", "IoT"), OR neither. `ignored` is a third,
+--       independent state (see below), not a third value of this pair.
+--   ignored: "never do anything with this device, ever" -- a stronger,
+--       distinct statement from just being unassigned. An unassigned
+--       device is still a known device with no policy decided yet;
+--       an ignored one (the admin's own laptop, a guest's phone) is
+--       deliberately outside the whole system, for good.
 --   bump_enabled: whether this device is one of the small, deliberately
 --       curated set allowed to use SSL-Bump (path/show-level rules) at
 --       all. A domain's 'bump' mode only actually bumps traffic from a
@@ -92,8 +120,9 @@ CREATE TABLE IF NOT EXISTS series_cache (
 --       device-driven, not domain-driven (see the v2 roadmap).
 --   bypass_login: exempts a device that can't complete a login flow at
 --       all (smart TV, Echo, thermostat) from the eventual captive-portal
---       gate, falling back to admin-assigned device-level rules instead
---       of user-level ones.
+--       gate, falling back to its user/group/ignored assignment above
+--       instead of a personal login. Orthogonal to that assignment --
+--       a bypass_login device can still belong to a user or a group.
 --   is_authenticated: the eventual captive-portal gate's per-device flag.
 --       Defaults to 1 (authenticated) for every device today, since
 --       there's no login gate yet to fail -- added now, ahead of that
@@ -104,14 +133,18 @@ CREATE TABLE IF NOT EXISTS devices (
     mac_address      TEXT UNIQUE NOT NULL,
     label            TEXT,
     user_id          INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    group_id         INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+    ignored          INTEGER NOT NULL DEFAULT 0,
     last_known_ip    TEXT,
     bump_enabled     INTEGER NOT NULL DEFAULT 0,
     bypass_login     INTEGER NOT NULL DEFAULT 0,
     is_authenticated INTEGER NOT NULL DEFAULT 1,
-    created_at       TEXT NOT NULL
+    created_at       TEXT NOT NULL,
+    CHECK (user_id IS NULL OR group_id IS NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_devices_group ON devices(group_id);
 
 CREATE TABLE IF NOT EXISTS access_log (
     id          INTEGER PRIMARY KEY,

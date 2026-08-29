@@ -1104,7 +1104,7 @@ def test_add_device_duplicate_mac_rejected(client, db_conn):
     assert count == 1
 
 
-def test_update_device_sets_flags_and_user(client, db_conn):
+def test_update_device_sets_flags_and_assigns_to_a_kid(client, db_conn):
     client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
     user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
     client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:03"}, headers=_auth_header())
@@ -1113,7 +1113,7 @@ def test_update_device_sets_flags_and_user(client, db_conn):
     resp = client.post(
         "/devices/update",
         data={
-            "device_id": device_id, "label": "Alex's Phone", "user_id": user_id,
+            "device_id": device_id, "label": "Alex's Phone", "assignment": f"user:{user_id}",
             "bump_enabled": "on", "bypass_login": "",
         },
         headers=_auth_header(),
@@ -1123,6 +1123,8 @@ def test_update_device_sets_flags_and_user(client, db_conn):
     row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
     assert row["label"] == "Alex's Phone"
     assert row["user_id"] == user_id
+    assert row["group_id"] is None
+    assert row["ignored"] == 0
     assert row["bump_enabled"] == 1
     assert row["bypass_login"] == 0
 
@@ -1143,7 +1145,7 @@ def test_deleting_a_user_unassigns_their_devices_instead_of_deleting_them(client
     client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
     user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
     client.post(
-        "/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:05", "user_id": user_id},
+        "/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:05", "assignment": f"user:{user_id}"},
         headers=_auth_header(),
     )
     device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
@@ -1159,3 +1161,116 @@ def test_deleting_a_user_unassigns_their_devices_instead_of_deleting_them(client
 def test_devices_requires_admin_auth(client):
     assert client.get("/devices").status_code == 401
     assert client.post("/devices/add", data={"mac_address": "aa:bb:cc:dd:ee:06"}).status_code == 401
+
+
+# ============================================================
+# Devices: Ignore + Groups (assign to a shared-device category)
+# ============================================================
+
+def test_parse_device_assignment_variants():
+    import dashboard
+    assert dashboard._parse_device_assignment("") == (None, None, 0)
+    assert dashboard._parse_device_assignment("ignored") == (None, None, 1)
+    assert dashboard._parse_device_assignment("user:7") == (7, None, 0)
+    assert dashboard._parse_device_assignment("group:3") == (None, 3, 0)
+    # Malformed input falls back to unassigned rather than raising.
+    assert dashboard._parse_device_assignment("user:not-a-number") == (None, None, 0)
+    assert dashboard._parse_device_assignment("garbage") == (None, None, 0)
+
+
+def test_add_device_with_ignored_assignment(client, db_conn):
+    client.post(
+        "/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:10", "assignment": "ignored"},
+        headers=_auth_header(),
+    )
+    row = db_conn.execute("SELECT * FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:10'").fetchone()
+    assert row["ignored"] == 1
+    assert row["user_id"] is None
+    assert row["group_id"] is None
+
+
+def test_add_group_then_appears_and_device_can_join_it(client, db_conn):
+    resp = client.post("/groups/add", data={"name": "TVs"}, headers=_auth_header())
+    assert resp.status_code == 302
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()[0]
+
+    client.post(
+        "/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:11", "assignment": f"group:{group_id}"},
+        headers=_auth_header(),
+    )
+    row = db_conn.execute("SELECT * FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:11'").fetchone()
+    assert row["group_id"] == group_id
+    assert row["user_id"] is None
+    assert row["ignored"] == 0
+
+    resp = client.get("/devices", headers=_auth_header())
+    assert b"TVs" in resp.data
+
+
+def test_add_group_duplicate_name_rejected(client, db_conn):
+    client.post("/groups/add", data={"name": "IoT"}, headers=_auth_header())
+    resp = client.post("/groups/add", data={"name": "IoT"}, headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+    count = db_conn.execute("SELECT COUNT(*) c FROM groups WHERE name = 'IoT'").fetchone()["c"]
+    assert count == 1
+
+
+def test_deleting_a_group_unassigns_its_devices(client, db_conn):
+    client.post("/groups/add", data={"name": "Gaming Computers"}, headers=_auth_header())
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'Gaming Computers'").fetchone()[0]
+    client.post(
+        "/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:12", "assignment": f"group:{group_id}"},
+        headers=_auth_header(),
+    )
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+
+    client.post("/groups/delete", data={"group_id": group_id}, headers=_auth_header())
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row is not None
+    assert row["group_id"] is None
+
+
+def test_domains_filter_by_group_shows_group_assigned_and_global_domains(client, db_conn):
+    client.post("/groups/add", data={"name": "TVs"}, headers=_auth_header())
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()[0]
+    client.post(
+        "/domains/add", data={"pattern": "netflix\\.example", "mode": "splice"}, headers=_auth_header()
+    )
+    client.post(
+        "/domains/add", data={"pattern": "notassigned\\.example", "mode": "splice"}, headers=_auth_header()
+    )
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = 'netflix\\.example'").fetchone()[0]
+
+    resp = client.post(
+        "/domains/toggle-group",
+        data={"domain_id": domain_id, "group_id": group_id, "action": "add"},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    assert db_conn.execute(
+        "SELECT 1 FROM group_domains WHERE group_id = ? AND domain_id = ?", (group_id, domain_id)
+    ).fetchone() is not None
+
+    resp = client.get(f"/domains?group_id={group_id}", headers=_auth_header())
+    assert b"netflix" in resp.data
+    assert b"notassigned" not in resp.data
+
+
+def test_toggle_group_domain_remove(client, db_conn):
+    client.post("/groups/add", data={"name": "IoT"}, headers=_auth_header())
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'IoT'").fetchone()[0]
+    client.post("/domains/add", data={"pattern": "iot\\.example", "mode": "splice"}, headers=_auth_header())
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = 'iot\\.example'").fetchone()[0]
+    client.post(
+        "/domains/toggle-group", data={"domain_id": domain_id, "group_id": group_id, "action": "add"},
+        headers=_auth_header(),
+    )
+
+    client.post(
+        "/domains/toggle-group", data={"domain_id": domain_id, "group_id": group_id, "action": "remove"},
+        headers=_auth_header(),
+    )
+    assert db_conn.execute(
+        "SELECT 1 FROM group_domains WHERE group_id = ? AND domain_id = ?", (group_id, domain_id)
+    ).fetchone() is None

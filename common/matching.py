@@ -72,6 +72,18 @@ def user_has_domain(conn: sqlite3.Connection, user_id: int, domain_id: int) -> b
     return row is not None
 
 
+def group_has_domain(conn: sqlite3.Connection, group_id: int, domain_id: int) -> bool:
+    """v2 roadmap groundwork -- group_domains mirrors user_domains exactly,
+    but nothing in the proxy enforcement path consults it yet (groups
+    aren't identifiable at request time until the interception layer
+    exists). Used today only by the dashboard's Domains/group-filter view."""
+    row = conn.execute(
+        "SELECT 1 FROM group_domains WHERE group_id = ? AND domain_id = ?",
+        (group_id, domain_id),
+    ).fetchone()
+    return row is not None
+
+
 def user_has_show(conn: sqlite3.Connection, user_id: int, series_id: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM user_shows WHERE user_id = ? AND series_id = ?",
