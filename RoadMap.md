@@ -289,6 +289,16 @@ replaces its Redis-based approach.
       matrix, PCAP corpus.
 - [ ] **2. ARP worker MVP** — static targets, half-duplex, corrective
       restoration on shutdown, unit-tested packet serialization.
+      **Scaffold written 2026-08-29** in `phase3/arp-worker/` (Go): the
+      generation scheduler, race-free corrective-restoration logic on
+      generation switch, the lease/heartbeat state machine, startup
+      target-safety checks, and the controller IPC protocol are
+      implemented with unit tests for all of the above. Not yet
+      compiled or run anywhere — this dev sandbox has no Go toolchain
+      — and the raw-ARP-socket adapter (`internal/arpio`) is flagged as
+      unverified against a real `mdlayher/arp` build. See
+      `phase3/arp-worker/README.md` for exact status and first-build
+      steps once the smoke-test VM is available.
 - [ ] **3. Controller** — versioned Unix-socket IPC, generations,
       leases, idempotent reconciliation.
 - [ ] **4. Identity model** — `device_bindings`, outbox events, MAC/IP

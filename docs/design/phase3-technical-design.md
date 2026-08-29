@@ -44,6 +44,19 @@ three concrete reasons found while researching this:
    compile-time ownership guarantees buy much, and Go gets there with a
    shallower learning curve and less code.
 
+**Update 2026-08-29**: an initial Go scaffold implementing the design
+below now exists in [`phase3/arp-worker/`](../../phase3/arp-worker/) —
+the generation scheduler, corrective-restoration-on-switch logic, lease/
+heartbeat state machine, safety checks, and IPC protocol from sections
+3–4 below, each with unit tests. Not yet compiled (no Go toolchain in
+this dev environment); see that directory's `README.md` for exact
+status. The sketches below remain the reference design; the scaffold
+follows them but sharpens one detail not spelled out here — a direct
+generation switch only sends corrective ARPs to targets *leaving*
+scope, never to targets present in both the old and new generation, to
+avoid a race between a stale corrective pass and the new generation's
+own poisoning ticks.
+
 Rust remains a legitimate alternative (`pnet` for packet crafting,
 `netlink-packet-route`/`rtnetlink` crates for neighbor monitoring, both
 actively maintained) if there's a reason to prefer it later, but nothing
