@@ -12,9 +12,13 @@ around three new features:
    own login (configured in their device's proxy settings), and site/show
    permissions are assigned per person -- kid1 can reach `xyz.com` but not
    `abc.com`; kid2 can reach both.
-3. **Reporting, with one-click approve.** Every allow/block decision is
-   logged with who, what, and when. A blocked entry in the report has an
-   "Approve for this user" button that grants it immediately.
+3. **Reporting, with one-click approve -- and the kid can ask.** Every
+   allow/block decision is logged with who, what, and when, filterable by
+   kid and by date range (1/7/14/30 days) with at-a-glance graphs. A
+   blocked entry gets Approve / Approve for everyone / Dismiss buttons, and
+   the block page itself has a "Request approval" button -- a kid doesn't
+   need to know the dashboard exists for their request to show up as a
+   pending alert an admin can act on immediately.
 
 ## How it decides what to do with a site
 
@@ -63,9 +67,9 @@ experience):**
 
 Either way, allowed `splice`-mode traffic is never touched -- this setting
 only affects what happens to connections that were already going to be
-denied. And either way, clicking "Approve" on a report entry works even
-for a domain that was never configured before -- it gets created
-automatically, scoped to that one user.
+denied. And either way, clicking "Approve" (or "Approve for everyone") on
+a report entry works even for a domain that was never configured before
+-- it gets created automatically, scoped to that one user or made global.
 
 ## Crunchyroll specifically
 
@@ -75,6 +79,38 @@ parent show via Crunchyroll's CMS API (cached in the database) and checked
 against each user's individually-approved show list. This logic is
 Crunchyroll-specific and stays that way -- nothing else has an API to
 resolve "this URL belongs to this show," so it's not a generic feature.
+
+## The dashboard
+
+Server-rendered (Flask + Jinja2, no separate frontend build) but styled as
+a proper small app: cards, light/dark mode following the OS setting,
+responsive down to phone width, and installable as a PWA (Add to Home
+Screen) -- that last part needs a secure context (`localhost`, or HTTPS
+once that's set up), so it won't offer to install over plain HTTP to a LAN
+IP, but everything else works everywhere.
+
+**Report page:**
+
+- A stat strip (total / allowed / blocked / % blocked) where **Allowed**
+  and **Blocked** are clickable -- click one to filter the whole page,
+  graphs included, down to just that outcome. A **Clear filters** button
+  appears whenever a filter is active, to jump back to the default view.
+- A **Filter** control for kid, allowed/blocked, and a date range (1, 7,
+  14, or 30 days) that applies to everything below it at once -- the
+  totals, both graphs, and the activity table never disagree about what
+  window they're showing.
+- Two graphs (Chart.js, vendored locally -- no CDN dependency): activity
+  over the selected date range, and top domains by request count.
+- A **Pending approval requests** card at the top, independent of whatever
+  filter is set, listing anything a kid has asked to have approved (see
+  below) with **Approve**, **Approve for everyone**, and **Dismiss** for
+  each.
+
+**Kid-initiated requests:** the page a kid sees when something's blocked
+now has a "Request approval" button. They don't need to know the
+dashboard exists or where the Report page is -- clicking it creates a
+pending request an admin sees immediately, instead of the only path being
+someone noticing it later in the log.
 
 ## Quickstart
 
@@ -101,10 +137,14 @@ containers.
    a download link -- same certificate for everyone, no per-user cert) and
    set the device's Wi-Fi/network proxy to this machine's IP, port `3128`,
    with that person's username/password.
-3. **Approve shows/sites** either ahead of time (from their user page /
-   the Domains page) or reactively from the Report page as blocks show up
-   -- approving from the report works even for a site that was never
-   configured, it gets created automatically, scoped to that one user.
+3. **Approve shows/sites** ahead of time (from their user page / the
+   Domains page), reactively from the Report page as blocks show up, or
+   let the kid ask -- the block page has its own "Request approval"
+   button that surfaces a pending request on the Report page without
+   anyone needing to go looking for it. Approving works even for a site
+   that was never configured before -- it gets created automatically,
+   either scoped to that one user or, via "Approve for everyone," to the
+   whole household.
 
 Setting `DASHBOARD_URL` in `.env` gets you a real, project-branded block
 page. Without it, a blocked `bump`-mode or redirect-mode `splice` attempt
@@ -176,6 +216,10 @@ proxy/
 dashboard/
   dashboard.py    Flask app: users, domains, per-domain paths, per-user
                   shows, report + approve, settings, CA cert download
+  static/         CSS design system, vendored Chart.js, PWA manifest +
+                  service worker, generated icon set
+  dev_server.py   local-only launcher for previewing the dashboard
+                  outside Docker (not used by the built image)
   Dockerfile
 
 defaults/
@@ -204,8 +248,15 @@ network needed -- see that file for what's covered):
 - The full dashboard workflow via Flask's test client: admin auth, user
   CRUD, domain CRUD, per-user domain assignment, the CSRF/cross-origin
   guard, and -- specifically -- the click-to-approve flow for both a
-  blocked site and a blocked show, confirmed to actually grant access
-  afterward (not just show a success message).
+  blocked site and a blocked show (including "Approve for everyone"),
+  confirmed to actually grant access afterward (not just show a success
+  message).
+- The full kid-initiated request lifecycle: `/blocked`'s "Request
+  approval" button through to an admin's Approve / Approve for everyone /
+  Dismiss, including that Dismiss clears the request without granting
+  anything. The Report page's kid/status/date-range filtering (applied
+  consistently to the stat strip, both graphs, and the activity table),
+  the clickable Allowed/Blocked stat links, and Clear filters.
 - `seed_defaults.py` idempotency (run twice, no duplicates/errors), plus a
   regression case for the `crunchyrollcdn.com` mode bug and confirmation
   that `crunchyrollsvc.com` -- confirmed dev-only in Crunchyroll's own
