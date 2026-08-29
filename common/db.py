@@ -89,7 +89,11 @@ CREATE TABLE IF NOT EXISTS access_log (
     series_id   TEXT,
     series_name TEXT,
     allowed     INTEGER NOT NULL,
-    reason      TEXT
+    reason      TEXT,
+    -- Set when the kid-facing /blocked page's "Request approval" button is
+    -- used against this row; cleared again once an admin acts on it via
+    -- approve_from_report(). NULL = no outstanding request.
+    approval_requested_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_access_log_ts ON access_log(ts DESC);
@@ -112,9 +116,22 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
     conn = conn or get_conn()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         if owns_conn:
             conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Schema changes made after the initial release, applied to databases
+    that already exist -- the `CREATE TABLE IF NOT EXISTS` statements above
+    only cover a brand-new database, SQLite has no `ALTER TABLE ... ADD
+    COLUMN IF NOT EXISTS`, and this project has no versioned migration
+    system. Each check here is independently idempotent (safe to run on
+    every startup, on any existing database, in any order)."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(access_log)")}
+    if "approval_requested_at" not in columns:
+        conn.execute("ALTER TABLE access_log ADD COLUMN approval_requested_at TEXT")
 
 
 # ==========================================================

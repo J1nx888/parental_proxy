@@ -24,6 +24,9 @@
   --danger-bg: #fee2e2;
   --danger-border: #fca5a5;
   --neutral-bg: #e2e8f0;
+  --warning: #b45309;
+  --warning-bg: #fef3c7;
+  --warning-border: #fcd34d;
 
   --radius: 12px;
   --radius-sm: 7px;
@@ -53,6 +56,9 @@
     --danger-bg: #3a1414;
     --danger-border: #6b2323;
     --neutral-bg: #263349;
+    --warning: #fbbf24;
+    --warning-bg: #3d2c07;
+    --warning-border: #78530f;
 
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, .4);
     --shadow: 0 2px 10px rgba(0, 0, 0, .45);
@@ -251,6 +257,11 @@ button.small, .btn.small { padding: .28rem .6rem; font-size: .78rem; }
 .badge.mode-trusted { background: var(--neutral-bg); color: var(--text-muted); }
 .badge.allowed { background: var(--success-bg); color: var(--success); }
 .badge.blocked { background: var(--danger-bg); color: var(--danger); }
+.badge.pending { background: var(--warning-bg); color: var(--warning); }
+
+.pending-card { border-color: var(--warning-border); background: var(--warning-bg); }
+.pending-card table { background: var(--surface); }
+.pending-card .table-scroll { background: var(--surface); border-radius: var(--radius-sm); }
 
 /* ---- Report: stat strip + charts ---- */
 .stat-strip {

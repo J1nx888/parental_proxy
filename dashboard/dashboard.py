@@ -148,7 +148,9 @@ BASE = """
       Parental Proxy
     </a>
     <nav class="tabs">
-      <a href="{{ url_for('report') }}" class="{{ 'active' if active=='report' else '' }}">Report</a>
+      <a href="{{ url_for('report') }}" class="{{ 'active' if active=='report' else '' }}">
+        Report{% if pending_count %} <span class="badge pending">{{ pending_count }}</span>{% endif %}
+      </a>
       <a href="{{ url_for('users') }}" class="{{ 'active' if active=='users' else '' }}">Users</a>
       <a href="{{ url_for('domains') }}" class="{{ 'active' if active=='domains' else '' }}">Domains</a>
       <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
@@ -170,8 +172,12 @@ if ("serviceWorker" in navigator) {
 
 
 def render(active: str, body: str) -> str:
+    conn = get_db()
+    pending_count = conn.execute(
+        "SELECT COUNT(*) c FROM access_log WHERE approval_requested_at IS NOT NULL"
+    ).fetchone()["c"]
     return render_template_string(
-        BASE, active=active, body=body,
+        BASE, active=active, body=body, pending_count=pending_count,
         message=request.args.get("message"), error=request.args.get("error"),
     )
 
@@ -208,32 +214,87 @@ def ca_cert():
     )
 
 
+BLOCKED_BODY = """
+<!doctype html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Blocked</title>
+<style>
+:root{color-scheme:light dark;}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:28rem;margin:4rem auto;
+padding:0 1.25rem;text-align:center;color:#1e293b;}
+@media (prefers-color-scheme:dark){body{color:#e5eaf3;}}
+.icon{width:56px;height:56px;border-radius:16px;background:#2f6fed;display:inline-flex;
+align-items:center;justify-content:center;margin-bottom:1rem;}
+h1{font-size:1.15rem;margin:0 0 .5rem;}
+p{font-size:.92rem;opacity:.75;}
+button{margin-top:1.25rem;padding:.6rem 1.4rem;border-radius:8px;border:none;background:#2f6fed;
+color:#fff;font-size:.92rem;font-weight:600;cursor:pointer;font-family:inherit;}
+.sent{margin-top:1.25rem;font-size:.88rem;color:#15803d;font-weight:600;}
+</style></head><body>
+<div class='icon'>
+<svg width='28' height='28' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2.2'
+stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l8 3.5v5.2c0 4.7-3.2 8.6-8 9.8
+-4.8-1.2-8-5.1-8-9.8V6.5L12 3z'/></svg>
+</div>
+<h1>This site or show isn't approved.</h1>
+<p>Ask a parent to check the dashboard if you think this should be allowed.</p>
+{% if row and row.approval_requested_at %}
+<p class="sent">Request sent -- a parent will see this on the dashboard.</p>
+{% elif row %}
+<form method="post" action="{{ url_for('request_approval') }}">
+  <input type="hidden" name="log_id" value="{{ row.id }}">
+  <button type="submit">Request approval</button>
+</form>
+{% endif %}
+</body></html>
+"""
+
+# How long after a denial the /blocked page will still offer to attach a
+# "Request approval" click to it. Generous enough for a slow device/redirect,
+# short enough that two different people getting blocked seconds apart on a
+# small home network essentially never collide.
+BLOCKED_REQUEST_LOOKBACK_SECONDS = 30
+
+
 @app.route("/blocked")
 def blocked():
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Blocked</title>"
-        "<style>"
-        ":root{color-scheme:light dark;}"
-        "body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:28rem;margin:4rem auto;"
-        "padding:0 1.25rem;text-align:center;color:#1e293b;}"
-        "@media (prefers-color-scheme:dark){body{color:#e5eaf3;}}"
-        ".icon{width:56px;height:56px;border-radius:16px;background:#2f6fed;display:inline-flex;"
-        "align-items:center;justify-content:center;margin-bottom:1rem;}"
-        "h1{font-size:1.15rem;margin:0 0 .5rem;}"
-        "p{font-size:.92rem;opacity:.75;}"
-        "</style></head><body>"
-        "<div class='icon'>"
-        "<svg width='28' height='28' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2.2' "
-        "stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l8 3.5v5.2c0 4.7-3.2 8.6-8 9.8"
-        "-4.8-1.2-8-5.1-8-9.8V6.5L12 3z'/></svg>"
-        "</div>"
-        "<h1>This site or show isn't approved.</h1>"
-        "<p>Ask a parent to check the dashboard if you think this should be allowed.</p>"
-        "</body></html>",
-        403,
-    )
+    # Reached two ways: a bump-mode denial (authz_helper.py, always shows a
+    # page) or a splice-mode denial when block_page_mode='redirect'. Either
+    # way, authz_helper.py/sni_helper.py just wrote the matching access_log
+    # row a moment before this page loaded -- correlating by recency instead
+    # of by request identity avoids depending on exactly how Squid's
+    # deny_info would need to be configured to pass the original URL through
+    # the redirect (version-specific behavior not verified against a live
+    # Squid instance; see commit notes). Only rows with a user_id are
+    # eligible, matching approve_from_report()'s own requirement.
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM access_log WHERE allowed = 0 AND user_id IS NOT NULL AND ts >= ? "
+        "ORDER BY id DESC LIMIT 1",
+        (db.iso_secs_ago(BLOCKED_REQUEST_LOOKBACK_SECONDS),),
+    ).fetchone()
+    return render_template_string(BLOCKED_BODY, row=row), 403
+
+
+@app.route("/blocked/request-approval", methods=["POST"])
+def request_approval():
+    # Deliberately unauthenticated, same as /blocked itself -- whoever got
+    # blocked is the one clicking this. Worst case of abuse is dashboard
+    # noise (an extra pending-request row an admin has to dismiss), not any
+    # data exposure or access grant: it only sets a timestamp on a row
+    # that's already denied and already visible on the Report page.
+    log_id = request.form.get("log_id", "")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM access_log WHERE id = ? AND allowed = 0 AND approval_requested_at IS NULL",
+        (log_id,),
+    ).fetchone()
+    if row is not None:
+        conn.execute(
+            "UPDATE access_log SET approval_requested_at = ? WHERE id = ?", (db.now_iso(), log_id)
+        )
+        conn.commit()
+    return redirect(url_for("blocked"))
 
 
 @app.route("/")
@@ -917,6 +978,32 @@ REPORT_BODY = """
 </div>
 {% endif %}
 
+{% if pending_requests %}
+<div class="card pending-card">
+<h2>Pending approval requests ({{ pending_requests|length }})</h2>
+<p class="hint">Someone tapped "Request approval" on a blocked page. These stay listed until you act on them below.</p>
+<div class="table-scroll">
+<table>
+  <tr><th>Requested (UTC)</th><th>User</th><th>Domain</th><th>Show / Path</th><th></th></tr>
+  {% for row in pending_requests %}
+  <tr>
+    <td>{{ row.approval_requested_at }}</td>
+    <td>{{ row.username }}</td>
+    <td><code>{{ row.domain }}</code></td>
+    <td>{{ row.series_name or row.series_id or row.path or '' }}</td>
+    <td>
+      <form class="inline" method="post" action="{{ url_for('approve_from_report') }}">
+        <input type="hidden" name="log_id" value="{{ row.id }}">
+        <button class="add small" type="submit">Approve for {{ row.username }}</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+</div>
+{% endif %}
+
 <div class="stat-strip">
   <div class="stat"><div class="stat-value">{{ total }}</div><div class="stat-label">Requests shown</div></div>
   <div class="stat"><div class="stat-value">{{ allowed_total }}</div><div class="stat-label">Allowed</div></div>
@@ -1088,9 +1175,16 @@ def report():
     allowed_by_day = {r["day"]: r["c"] for r in daily_rows if r["allowed"]}
     blocked_by_day = {r["day"]: r["c"] for r in daily_rows if not r["allowed"]}
 
+    # Independent of the user/status filter above -- this is a persistent
+    # "needs attention" list, not part of the filtered activity view.
+    pending_requests = conn.execute(
+        "SELECT * FROM access_log WHERE approval_requested_at IS NOT NULL "
+        "ORDER BY approval_requested_at DESC"
+    ).fetchall()
+
     all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
     body = render_template_string(
-        REPORT_BODY, rows=rows, all_users=all_users,
+        REPORT_BODY, rows=rows, all_users=all_users, pending_requests=pending_requests,
         filter_user=filter_user, filter_status=filter_status,
         resolver_error=db.get_setting(conn, "cr_resolver_last_error"),
         total=total, allowed_total=allowed_total, blocked_total=blocked_total, blocked_pct=blocked_pct,
@@ -1112,6 +1206,12 @@ def approve_from_report():
     row = conn.execute("SELECT * FROM access_log WHERE id = ?", (log_id,)).fetchone()
     if row is None or row["user_id"] is None:
         return flash_redirect("report", "Couldn't find that log entry.", error=True)
+
+    # Whatever happens below, the admin has now acted on this row -- clear
+    # any outstanding "Request approval" flag so it drops off the pending
+    # list. Harmless no-op if it was never set.
+    conn.execute("UPDATE access_log SET approval_requested_at = NULL WHERE id = ?", (log_id,))
+    conn.commit()
 
     if row["series_id"]:
         name = cr_api.series_title(row["series_id"]) or row["series_id"]
