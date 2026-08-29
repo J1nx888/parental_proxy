@@ -213,6 +213,18 @@ a fresh `replace_targets` rather than resuming the stale one. This is the
 concrete mechanism behind `RoadMap.md`'s "must not auto-resume an old
 target generation after restart" requirement.
 
+**Update 2026-08-29**: the controller side of this schema is now
+implemented in [`controller/ipc_client.py`](../../controller/ipc_client.py)
+(Python, per the architecture decision that the controller fits the
+existing Python stack) — `WorkerClient.replace_targets`/`.heartbeat`/
+`.shutdown()` speak exactly the JSON shape above. `controller/reconcile.py`
+implements the idempotent-reconciliation half (generation only bumps
+when desired state actually changes, order-insensitively on the target
+list), and `controller/lease.py` drives the heartbeat on an interval.
+Verified against real `AF_UNIX` sockets on the smoke-test VM — see
+`RoadMap.md`'s Milestone 3 entry for status. `main.py`'s desired-state
+source is still a placeholder pending Milestone 4.
+
 ---
 
 ## 5. nftables skeleton (four policy classes from `RoadMap.md`)

@@ -303,6 +303,17 @@ replaces its Redis-based approach.
       proven safe). See `phase3/arp-worker/README.md` for exact status.
 - [ ] **3. Controller** — versioned Unix-socket IPC, generations,
       leases, idempotent reconciliation.
+      **Scaffold written and verified 2026-08-29** in `controller/`
+      (Python, matching the architecture decision that the controller
+      "fits the existing Python stack"): a `WorkerClient` speaking the
+      exact same wire protocol as the Go worker's `internal/ipc`, an
+      order-insensitive idempotent `reconcile()`, and a
+      `HeartbeatPacer` keeping the worker's lease alive. Full test
+      suite (288 tests including 20 new ones) passes on the
+      smoke-test VM against real `AF_UNIX` sockets. Not yet a real
+      deployable: `main.py`'s desired-state source is an explicit
+      placeholder that raises rather than guessing, pending Milestone
+      4's identity model.
 - [ ] **4. Identity model** — `device_bindings`, outbox events, MAC/IP
       conflict handling.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
