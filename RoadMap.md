@@ -330,7 +330,24 @@ replaces its Redis-based approach.
       discovery daemon (rtnetlink/snapshot/AdGuard sources per the
       design doc's precedence order), still unbuilt.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
-      sets, atomic apply/rollback.
+      sets, atomic apply/rollback. **Scaffold written AND verified
+      against real nftables 2026-08-29**, in `phase3/nftables-manager/`
+      (Go, `sigs.k8s.io/knftables`): pure conflict-resolution
+      (`ResolveConflicts` — an IP requested in more than one policy set
+      keeps only its highest-priority one, matching the prerouting
+      chain's own evaluation order) and diffing (`Reconcile`) logic,
+      fully unit tested; a thin adapter that builds the exact table
+      from the design skeleton. Unlike the ARP worker, this piece could
+      be functionally verified for real with no special hardware — a
+      plain `docker run --cap-add=NET_ADMIN` container gets its own
+      nftables state in its own network namespace. Verified: bootstrap
+      produces the exact skeleton ruleset; an atomic apply of a diff
+      lands correctly; re-reconciling against unchanged desired state
+      against a *real* kernel ruleset produces an empty diff; an
+      incremental add+remove applies as one atomic transaction. Not yet
+      done: no reconciliation loop or real desired-state input wired
+      up (bootstrap-and-exit only), and `EnsureBaseline` isn't yet safe
+      to call twice against an already-populated table.
 - [ ] **6. Service health** — Squid/AdGuard/controller readiness gates,
       systemd watchdog + restart limits.
 - [ ] **7. Authentication workflow** — toggling

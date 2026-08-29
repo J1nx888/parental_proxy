@@ -261,6 +261,21 @@ table inet parental_proxy {
 }
 ```
 
+**Update 2026-08-29**: this skeleton is now implemented and
+functionally verified in
+[`phase3/nftables-manager/`](../../phase3/nftables-manager/) — a real
+`docker run --cap-add=NET_ADMIN` container's `nft list table` output
+matched this skeleton exactly (four sets, the `bypass_v4` short-circuit,
+every redirect rule), and a follow-up check confirmed atomic
+add/remove and idempotent re-reconciliation against the real kernel
+ruleset, not just an in-memory model. `internal/policy` adds one thing
+this skeleton doesn't spell out: `ResolveConflicts`, which keeps an IP
+that's (incorrectly) requested in more than one set only in its
+highest-priority one, using this chain's own evaluation order as the
+priority (`bypass > authenticated > unauthenticated > quarantine`).
+See `phase3/nftables-manager/README.md` for exact status — the
+reconciliation loop and a real desired-state input aren't wired up yet.
+
 Membership in these sets is exactly what `AUTH_CHANGED` events (from
 `RoadMap.md`'s outbox-event design) update — the controller reconciles
 `devices.is_authenticated` into set membership, `knftables` applies it
