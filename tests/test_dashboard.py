@@ -867,3 +867,132 @@ def test_approving_a_pending_request_also_clears_the_flag(client, db_conn):
 
     row = db_conn.execute("SELECT approval_requested_at FROM access_log WHERE id = ?", (log_id,)).fetchone()
     assert row["approval_requested_at"] is None
+
+
+# ============================================================
+# Report: scope=global ("approve for everyone") + date-range filter
+# ============================================================
+
+def test_approve_scope_global_makes_the_domain_global(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    client.post("/users/add", data={"username": "kid2", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    log_id = _insert_recent_denial(db_conn, user_id, domain="sharedsite.example")
+
+    resp = client.post(
+        "/report/approve", data={"log_id": log_id, "scope": "global"}, headers=_auth_header()
+    )
+    assert resp.status_code == 302
+
+    import matching
+    domain = matching.find_domain(db_conn, "sharedsite.example")
+    assert domain is not None
+    assert domain["is_global"] == 1
+    # Global means nobody needs an explicit per-user assignment -- not even
+    # the kid who originally triggered the request.
+    assert db_conn.execute(
+        "SELECT 1 FROM user_domains WHERE domain_id = ?", (domain["id"],)
+    ).fetchone() is None
+
+
+def test_approve_scope_global_flips_an_existing_non_global_domain(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    db_conn.execute(
+        "INSERT INTO domains (pattern, mode, kind, is_global, created_at) "
+        "VALUES ('existing\\.example', 'splice', 'generic', 0, datetime('now'))"
+    )
+    db_conn.commit()
+    log_id = _insert_recent_denial(db_conn, user_id, domain="existing.example")
+
+    client.post("/report/approve", data={"log_id": log_id, "scope": "global"}, headers=_auth_header())
+
+    row = db_conn.execute("SELECT is_global FROM domains WHERE pattern = 'existing\\.example'").fetchone()
+    assert row["is_global"] == 1
+
+
+def test_approve_scope_global_for_a_show_grants_every_user(client, db_conn, monkeypatch):
+    import dashboard
+    monkeypatch.setattr(dashboard.cr_api, "series_title", lambda series_id, timeout=5.0: "Ace Attorney")
+
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    client.post("/users/add", data={"username": "kid2", "password": "pw"}, headers=_auth_header())
+    kid1_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    kid2_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid2'").fetchone()[0]
+    db_conn.execute(
+        "INSERT INTO access_log "
+        "(ts, user_id, username, domain, path, series_id, series_name, allowed, reason) "
+        "VALUES (datetime('now'), ?, 'kid1', 'www.crunchyroll.com', '/watch/x', 'GYE5K0XVR', NULL, 0, 'show_not_approved')",
+        (kid1_id,),
+    )
+    db_conn.commit()
+    log_id = db_conn.execute("SELECT id FROM access_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+
+    client.post("/report/approve", data={"log_id": log_id, "scope": "global"}, headers=_auth_header())
+
+    import matching
+    assert matching.user_has_show(db_conn, kid1_id, "GYE5K0XVR") is True
+    assert matching.user_has_show(db_conn, kid2_id, "GYE5K0XVR") is True
+
+
+def test_approve_default_scope_is_still_user_only(client, db_conn):
+    """No scope field at all (the plain Recent-activity table's button
+    doesn't send one) must behave exactly like the pre-existing per-user
+    approve, not silently go global."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    log_id = _insert_recent_denial(db_conn, user_id, domain="onlykid1.example")
+
+    client.post("/report/approve", data={"log_id": log_id}, headers=_auth_header())
+
+    import matching
+    domain = matching.find_domain(db_conn, "onlykid1.example")
+    assert domain["is_global"] == 0
+    assert matching.user_has_domain(db_conn, user_id, domain["id"]) is True
+
+
+def test_report_days_filter_excludes_older_rows(client, db_conn):
+    import db as db_mod
+    old_ts = db_mod.iso_secs_ago(20 * 86400)  # 20 days ago
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason) "
+        "VALUES (?, NULL, 'kid1', 'stale.example', NULL, 1, 'global_domain')",
+        (old_ts,),
+    )
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason) "
+        "VALUES (?, NULL, 'kid1', 'fresh.example', NULL, 1, 'global_domain')",
+        (db_mod.now_iso(),),
+    )
+    db_conn.commit()
+
+    resp_default = client.get("/report", headers=_auth_header())  # default = 7 days
+    assert b"fresh.example" in resp_default.data
+    assert b"stale.example" not in resp_default.data
+
+    resp_30 = client.get("/report?days=30", headers=_auth_header())
+    assert b"fresh.example" in resp_30.data
+    assert b"stale.example" in resp_30.data
+
+
+def test_report_invalid_days_value_falls_back_to_default(client):
+    resp = client.get("/report?days=not-a-number", headers=_auth_header())
+    assert resp.status_code == 200
+    resp = client.get("/report?days=999", headers=_auth_header())
+    assert resp.status_code == 200
+
+
+def test_dismiss_request_preserves_current_filter(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    log_id = _insert_recent_denial(db_conn, user_id)
+
+    resp = client.post(
+        "/report/dismiss-request",
+        data={"log_id": log_id, "user": "kid1", "status": "blocked", "days": "30"},
+        headers=_auth_header(),
+    )
+    location = resp.headers["Location"]
+    assert "user=kid1" in location
+    assert "status=blocked" in location
+    assert "days=30" in location

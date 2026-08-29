@@ -981,10 +981,10 @@ REPORT_BODY = """
 {% if pending_requests %}
 <div class="card pending-card">
 <h2>Pending approval requests ({{ pending_requests|length }})</h2>
-<p class="hint">Someone tapped "Request approval" on a blocked page. These stay listed until you act on them below.</p>
+<p class="hint">Someone tapped "Request approval" on a blocked page. These stay listed (regardless of the filter below) until you act on them.</p>
 <div class="table-scroll">
 <table>
-  <tr><th>Requested (UTC)</th><th>User</th><th>Domain</th><th>Show / Path</th><th></th></tr>
+  <tr><th>Requested (UTC)</th><th>Kid</th><th>Domain</th><th>Show / Path</th><th></th></tr>
   {% for row in pending_requests %}
   <tr>
     <td>{{ row.approval_requested_at }}</td>
@@ -992,12 +992,29 @@ REPORT_BODY = """
     <td><code>{{ row.domain }}</code></td>
     <td>{{ row.series_name or row.series_id or row.path or '' }}</td>
     <td>
+      {% if row.reason == 'path_not_allowed' %}
       <form class="inline" method="post" action="{{ url_for('approve_from_report') }}">
         <input type="hidden" name="log_id" value="{{ row.id }}">
-        <button class="add small" type="submit">Approve for {{ row.username }}</button>
+        {% for k, v in redirect_kwargs.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+        <button class="add small" type="submit">Review path</button>
       </form>
+      {% else %}
+      <form class="inline" method="post" action="{{ url_for('approve_from_report') }}">
+        <input type="hidden" name="log_id" value="{{ row.id }}">
+        <input type="hidden" name="scope" value="user">
+        {% for k, v in redirect_kwargs.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+        <button class="add small" type="submit">Approve</button>
+      </form>
+      <form class="inline" method="post" action="{{ url_for('approve_from_report') }}">
+        <input type="hidden" name="log_id" value="{{ row.id }}">
+        <input type="hidden" name="scope" value="global">
+        {% for k, v in redirect_kwargs.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+        <button class="small" type="submit">Approve for everyone</button>
+      </form>
+      {% endif %}
       <form class="inline" method="post" action="{{ url_for('dismiss_request') }}">
         <input type="hidden" name="log_id" value="{{ row.id }}">
+        {% for k, v in redirect_kwargs.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
         <button class="small" type="submit">Dismiss</button>
       </form>
     </td>
@@ -1008,6 +1025,30 @@ REPORT_BODY = """
 </div>
 {% endif %}
 
+<div class="card">
+<h2>Filter</h2>
+<form class="add-form" method="get" action="{{ url_for('report') }}">
+  <select name="user">
+    <option value="">All kids</option>
+    {% for u in all_users %}
+    <option value="{{ u.username }}" {{ 'selected' if filter_user==u.username }}>{{ u.display_name }}</option>
+    {% endfor %}
+  </select>
+  <select name="status">
+    <option value="">All</option>
+    <option value="blocked" {{ 'selected' if filter_status=='blocked' }}>Blocked only</option>
+    <option value="allowed" {{ 'selected' if filter_status=='allowed' }}>Allowed only</option>
+  </select>
+  <select name="days">
+    {% for d in day_options %}
+    <option value="{{ d }}" {{ 'selected' if days==d }}>Last {{ d }} day{{ 's' if d != 1 else '' }}</option>
+    {% endfor %}
+  </select>
+  <button class="add" type="submit">Apply</button>
+</form>
+<p class="hint">Applies to everything below -- the totals, both graphs, and the activity table.</p>
+</div>
+
 <div class="stat-strip">
   <div class="stat"><div class="stat-value">{{ total }}</div><div class="stat-label">Requests shown</div></div>
   <div class="stat"><div class="stat-value">{{ allowed_total }}</div><div class="stat-label">Allowed</div></div>
@@ -1017,7 +1058,7 @@ REPORT_BODY = """
 
 <div class="chart-grid">
   <div class="card">
-    <h2>Activity, last 14 days</h2>
+    <h2>Activity, last {{ days }} day{{ 's' if days != 1 else '' }}</h2>
     <div class="chart-card">
       {% if total %}<canvas id="activity-chart"></canvas>{% else %}<div class="empty-note">No activity logged yet.</div>{% endif %}
     </div>
@@ -1032,21 +1073,6 @@ REPORT_BODY = """
 
 <div class="card">
 <h2>Recent activity</h2>
-<form class="add-form" method="get" action="{{ url_for('report') }}">
-  <select name="user">
-    <option value="">All users</option>
-    {% for u in all_users %}
-    <option value="{{ u.username }}" {{ 'selected' if filter_user==u.username }}>{{ u.display_name }}</option>
-    {% endfor %}
-  </select>
-  <select name="status">
-    <option value="">All</option>
-    <option value="blocked" {{ 'selected' if filter_status=='blocked' }}>Blocked only</option>
-    <option value="allowed" {{ 'selected' if filter_status=='allowed' }}>Allowed only</option>
-  </select>
-  <button class="add" type="submit">Filter</button>
-</form>
-
 <div class="table-scroll">
 <table>
   <tr><th>Time (UTC)</th><th>User</th><th>Domain</th><th>Show / Path</th><th>Result</th><th></th></tr>
@@ -1061,6 +1087,7 @@ REPORT_BODY = """
       {% if not row.allowed and row.user_id %}
       <form class="inline" method="post" action="{{ url_for('approve_from_report') }}">
         <input type="hidden" name="log_id" value="{{ row.id }}">
+        {% for k, v in redirect_kwargs.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
         <button class="add small" type="submit">Approve for {{ row.username }}</button>
       </form>
       {% endif %}
@@ -1133,14 +1160,47 @@ REPORT_BODY = """
 """
 
 
+REPORT_DAY_OPTIONS = (1, 7, 14, 30)
+REPORT_DEFAULT_DAYS = 7
+
+
+def _parse_report_days(value) -> int:
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return REPORT_DEFAULT_DAYS
+    return days if days in REPORT_DAY_OPTIONS else REPORT_DEFAULT_DAYS
+
+
+def _report_redirect_kwargs(source) -> dict:
+    """Pulls the current user/status/days filter off `source` (request.args
+    for the page itself, request.form for an action taken from it) so every
+    approve/dismiss click redirects back to the same filtered view instead
+    of silently resetting it to the defaults."""
+    kwargs = {}
+    if source.get("user"):
+        kwargs["user"] = source["user"]
+    if source.get("status"):
+        kwargs["status"] = source["status"]
+    if source.get("days"):
+        kwargs["days"] = _parse_report_days(source.get("days"))
+    return kwargs
+
+
 @app.route("/report")
 @require_admin
 def report():
     conn = get_db()
     filter_user = request.args.get("user", "")
     filter_status = request.args.get("status", "")
-    where_sql = "WHERE 1=1"
-    params: list = []
+    days = _parse_report_days(request.args.get("days"))
+
+    # The date range applies to literally everything below (stat strip, both
+    # charts, and the activity table) -- one `where_sql` built once, reused
+    # by every query, so there's no way for the charts and the table to
+    # disagree about what date/kid/status window "the Report page" means.
+    where_sql = "WHERE ts >= ?"
+    params: list = [db.iso_secs_ago(days * 86400)]
     if filter_user:
         where_sql += " AND username = ?"
         params.append(filter_user)
@@ -1170,17 +1230,18 @@ def report():
     ).fetchall()
 
     today = datetime.now(timezone.utc).date()
-    days = [today - timedelta(days=i) for i in range(13, -1, -1)]
+    chart_days = [today - timedelta(days=i) for i in range(days - 1, -1, -1)]
     daily_rows = conn.execute(
         f"SELECT substr(ts,1,10) day, allowed, COUNT(*) c FROM access_log {where_sql} "
-        "AND ts >= ? GROUP BY day, allowed ORDER BY day",
-        params + [db.iso_secs_ago(14 * 86400)],
+        "GROUP BY day, allowed ORDER BY day",
+        params,
     ).fetchall()
     allowed_by_day = {r["day"]: r["c"] for r in daily_rows if r["allowed"]}
     blocked_by_day = {r["day"]: r["c"] for r in daily_rows if not r["allowed"]}
 
-    # Independent of the user/status filter above -- this is a persistent
-    # "needs attention" list, not part of the filtered activity view.
+    # Independent of the user/status/days filter above -- this is a
+    # persistent "needs attention" list, not part of the filtered activity
+    # view, so it stays visible regardless of what window is being browsed.
     pending_requests = conn.execute(
         "SELECT * FROM access_log WHERE approval_requested_at IS NOT NULL "
         "ORDER BY approval_requested_at DESC"
@@ -1189,15 +1250,16 @@ def report():
     all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
     body = render_template_string(
         REPORT_BODY, rows=rows, all_users=all_users, pending_requests=pending_requests,
-        filter_user=filter_user, filter_status=filter_status,
+        filter_user=filter_user, filter_status=filter_status, days=days, day_options=REPORT_DAY_OPTIONS,
+        redirect_kwargs=_report_redirect_kwargs(request.args),
         resolver_error=db.get_setting(conn, "cr_resolver_last_error"),
         total=total, allowed_total=allowed_total, blocked_total=blocked_total, blocked_pct=blocked_pct,
         top_domains=top_domains,
         top_domain_labels=[r["domain"] for r in top_domains],
         top_domain_counts=[r["c"] for r in top_domains],
-        day_labels=[d.strftime("%m/%d") for d in days],
-        daily_allowed=[allowed_by_day.get(d.isoformat(), 0) for d in days],
-        daily_blocked=[blocked_by_day.get(d.isoformat(), 0) for d in days],
+        day_labels=[d.strftime("%m/%d") for d in chart_days],
+        daily_allowed=[allowed_by_day.get(d.isoformat(), 0) for d in chart_days],
+        daily_blocked=[blocked_by_day.get(d.isoformat(), 0) for d in chart_days],
     )
     return render("report", body)
 
@@ -1206,10 +1268,17 @@ def report():
 @require_admin
 def approve_from_report():
     log_id = request.form.get("log_id", "")
+    # "user" = just the person who hit this (the default, and the only
+    # option the plain Recent-activity table's inline button offers).
+    # "global" = approve for everyone -- only offered from the pending-
+    # requests card, since that's the one place a per-request choice makes
+    # sense to surface.
+    scope = request.form.get("scope", "user")
+    redirect_kwargs = _report_redirect_kwargs(request.form)
     conn = get_db()
     row = conn.execute("SELECT * FROM access_log WHERE id = ?", (log_id,)).fetchone()
     if row is None or row["user_id"] is None:
-        return flash_redirect("report", "Couldn't find that log entry.", error=True)
+        return flash_redirect("report", "Couldn't find that log entry.", error=True, **redirect_kwargs)
 
     # Whatever happens below, the admin has now acted on this row -- clear
     # any outstanding "Request approval" flag so it drops off the pending
@@ -1219,13 +1288,24 @@ def approve_from_report():
 
     if row["series_id"]:
         name = cr_api.series_title(row["series_id"]) or row["series_id"]
+        if scope == "global":
+            # user_shows has no is_global concept (unlike domains) -- "for
+            # everyone" means literally granting every existing user.
+            for user_row in conn.execute("SELECT id FROM users"):
+                conn.execute(
+                    "INSERT INTO user_shows (user_id, series_id, series_name) VALUES (?,?,?) "
+                    "ON CONFLICT(user_id, series_id) DO UPDATE SET series_name = excluded.series_name",
+                    (user_row["id"], row["series_id"], name),
+                )
+            conn.commit()
+            return flash_redirect("report", f"Approved {name} for everyone.", **redirect_kwargs)
         conn.execute(
             "INSERT INTO user_shows (user_id, series_id, series_name) VALUES (?,?,?) "
             "ON CONFLICT(user_id, series_id) DO UPDATE SET series_name = excluded.series_name",
             (row["user_id"], row["series_id"], name),
         )
         conn.commit()
-        return flash_redirect("report", f"Approved {name} for {row['username']}.")
+        return flash_redirect("report", f"Approved {name} for {row['username']}.", **redirect_kwargs)
 
     if row["reason"] == "path_not_allowed":
         # The domain is already assigned to this user -- that's *why* the
@@ -1234,9 +1314,11 @@ def approve_from_report():
         # request would be denied again immediately (GH #6). A path pattern
         # governs future access, not a one-time yes/no, so send the admin
         # to review a derived starting pattern rather than auto-saving one.
+        # Path rules are already domain-wide (see domain_paths' schema
+        # comment), so there's no separate "for everyone" version of this.
         domain = matching.find_domain(conn, row["domain"])
         if domain is None:
-            return flash_redirect("report", "Couldn't find that domain anymore.", error=True)
+            return flash_redirect("report", "Couldn't find that domain anymore.", error=True, **redirect_kwargs)
         return redirect(url_for(
             "domain_detail", domain_id=domain["id"], prefill_path=path_to_pattern(row["path"]),
         ))
@@ -1246,21 +1328,28 @@ def approve_from_report():
         # Never seen this domain before (it wasn't blocked by an existing
         # rule -- it just wasn't configured at all). Create it rather than
         # dead-ending: splice mode (host-only, matches the default for any
-        # new domain) and scoped to this user only, not global -- the
-        # safest default for something approved reactively from a block.
+        # new domain), scoped per `scope` -- global if approved for
+        # everyone, otherwise just this user, the safest default for
+        # something approved reactively from a block.
         pattern = re.escape(row["domain"])
+        is_global = 1 if scope == "global" else 0
         conn.execute(
             "INSERT OR IGNORE INTO domains (pattern, mode, kind, is_global, note, created_at) "
-            "VALUES (?, 'splice', 'generic', 0, 'Auto-added from report approval', ?)",
-            (pattern, db.now_iso()),
+            "VALUES (?, 'splice', 'generic', ?, 'Auto-added from report approval', ?)",
+            (pattern, is_global, db.now_iso()),
         )
         domain = conn.execute("SELECT * FROM domains WHERE pattern = ?", (pattern,)).fetchone()
-    conn.execute(
-        "INSERT OR IGNORE INTO user_domains (user_id, domain_id) VALUES (?,?)",
-        (row["user_id"], domain["id"]),
-    )
+    if scope == "global":
+        if not domain["is_global"]:
+            conn.execute("UPDATE domains SET is_global = 1 WHERE id = ?", (domain["id"],))
+    else:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_domains (user_id, domain_id) VALUES (?,?)",
+            (row["user_id"], domain["id"]),
+        )
     conn.commit()
-    return flash_redirect("report", f"Approved {row['domain']} for {row['username']}.")
+    label = "everyone" if scope == "global" else row["username"]
+    return flash_redirect("report", f"Approved {row['domain']} for {label}.", **redirect_kwargs)
 
 
 @app.route("/report/dismiss-request", methods=["POST"])
@@ -1271,10 +1360,11 @@ def dismiss_request():
     is the admin's "no" -- distinct from Approve, and distinct from doing
     nothing (which would leave it cluttering the pending list forever)."""
     log_id = request.form.get("log_id", "")
+    redirect_kwargs = _report_redirect_kwargs(request.form)
     conn = get_db()
     conn.execute("UPDATE access_log SET approval_requested_at = NULL WHERE id = ?", (log_id,))
     conn.commit()
-    return flash_redirect("report", "Dismissed.")
+    return flash_redirect("report", "Dismissed.", **redirect_kwargs)
 
 
 # ==========================================================
