@@ -996,3 +996,64 @@ def test_dismiss_request_preserves_current_filter(client, db_conn):
     assert "user=kid1" in location
     assert "status=blocked" in location
     assert "days=30" in location
+
+
+# ============================================================
+# Report: clickable Allowed/Blocked stats + Clear filters
+# ============================================================
+
+def _insert_logged(db_conn, domain, allowed):
+    import db as db_mod
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason) "
+        "VALUES (?, NULL, 'kid1', ?, NULL, ?, 'global_domain')",
+        (db_mod.now_iso(), domain, 1 if allowed else 0),
+    )
+    db_conn.commit()
+
+
+def test_allowed_and_blocked_stats_link_to_status_filter(client, db_conn):
+    resp = client.get("/report", headers=_auth_header())
+    assert b'href="/report?user=&amp;status=allowed&amp;days=7"' in resp.data
+    assert b'href="/report?user=&amp;status=blocked&amp;days=7"' in resp.data
+
+
+def test_clicking_allowed_stat_filters_page_to_allowed_only(client, db_conn):
+    _insert_logged(db_conn, "allowedsite.example", allowed=True)
+    _insert_logged(db_conn, "blockedsite.example", allowed=False)
+
+    resp = client.get("/report?status=allowed", headers=_auth_header())
+    assert b"allowedsite.example" in resp.data
+    assert b"blockedsite.example" not in resp.data
+    # The Blocked stat link should still be present so the admin can pivot
+    # straight to the other side without going through "Clear filters" first.
+    assert b'href="/report?user=&amp;status=blocked&amp;days=7"' in resp.data
+
+
+def test_clicking_blocked_stat_filters_page_to_blocked_only(client, db_conn):
+    _insert_logged(db_conn, "allowedsite.example", allowed=True)
+    _insert_logged(db_conn, "blockedsite.example", allowed=False)
+
+    resp = client.get("/report?status=blocked", headers=_auth_header())
+    assert b"blockedsite.example" in resp.data
+    assert b"allowedsite.example" not in resp.data
+
+
+def test_stat_link_preserves_current_kid_and_days_filter(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    resp = client.get("/report?user=kid1&days=30", headers=_auth_header())
+    assert b'href="/report?user=kid1&amp;status=allowed&amp;days=30"' in resp.data
+
+
+def test_clear_filters_button_hidden_on_default_view(client):
+    resp = client.get("/report", headers=_auth_header())
+    assert b"Clear filters" not in resp.data
+
+
+def test_clear_filters_button_shown_when_a_filter_is_active(client):
+    resp = client.get("/report?status=blocked", headers=_auth_header())
+    assert b"Clear filters" in resp.data
+    assert b'href="/report"' in resp.data
+
+    resp = client.get("/report?days=30", headers=_auth_header())
+    assert b"Clear filters" in resp.data

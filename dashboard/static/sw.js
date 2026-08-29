@@ -7,10 +7,19 @@
 // with a fetch handler), not to provide real offline use: this is an admin
 // tool that approves/blocks a child's actual internet access, so serving a
 // stale cached page while "offline" would be actively misleading, not a
-// convenience. Only our own static assets (versioned by CACHE below) are
-// cached; every dashboard page and every form submission always goes to
-// the network, no exceptions.
-const CACHE = "pp-static-v1";
+// convenience. Every dashboard page and every form submission always goes
+// to the network, no exceptions.
+//
+// Our own static assets (CSS/JS/icons) are network-FIRST, not cache-first:
+// this app's CSS and JS change as it's developed/redeployed, and a
+// cache-first strategy silently served a stale app.css during development
+// (caught by hand, not by a test -- there's no automated check for "does
+// the deployed CSS match what's on disk"). Network-first always fetches
+// the current version when online (the normal case for a LAN admin tool)
+// and only falls back to whatever's cached if the network request itself
+// fails, so there's no scenario where a real update goes unseen while the
+// network is actually up.
+const CACHE = "pp-static-v2";
 const STATIC_ASSETS = [
   "/static/css/app.css",
   "/static/vendor/chart.umd.min.js",
@@ -35,7 +44,15 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.origin === self.location.origin && url.pathname.startsWith("/static/")) {
-    event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE).then((cache) => cache.put(event.request, copy));
+          return response;
+        })
+        .catch(() => caches.match(event.request))
+    );
   }
   // Everything else (every page, every POST) is left to the browser's
   // normal network handling -- deliberately no offline fallback.

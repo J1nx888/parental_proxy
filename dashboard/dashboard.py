@@ -1045,14 +1045,19 @@ REPORT_BODY = """
     {% endfor %}
   </select>
   <button class="add" type="submit">Apply</button>
+  {% if filters_active %}<a class="btn" href="{{ url_for('report') }}">Clear filters</a>{% endif %}
 </form>
-<p class="hint">Applies to everything below -- the totals, both graphs, and the activity table.</p>
+<p class="hint">Applies to everything below -- the totals, both graphs, and the activity table. Click Allowed or Blocked below to filter to just that.</p>
 </div>
 
 <div class="stat-strip">
   <div class="stat"><div class="stat-value">{{ total }}</div><div class="stat-label">Requests shown</div></div>
-  <div class="stat"><div class="stat-value">{{ allowed_total }}</div><div class="stat-label">Allowed</div></div>
-  <div class="stat"><div class="stat-value">{{ blocked_total }}</div><div class="stat-label">Blocked</div></div>
+  <a class="stat-link {{ 'active' if filter_status=='allowed' }}" href="{{ url_for('report', user=filter_user, status='allowed', days=days) }}">
+    <div class="stat"><div class="stat-value">{{ allowed_total }}</div><div class="stat-label">Allowed</div></div>
+  </a>
+  <a class="stat-link {{ 'active' if filter_status=='blocked' }}" href="{{ url_for('report', user=filter_user, status='blocked', days=days) }}">
+    <div class="stat"><div class="stat-value">{{ blocked_total }}</div><div class="stat-label">Blocked</div></div>
+  </a>
   <div class="stat"><div class="stat-value">{{ (blocked_pct ~ '%') if total else '--' }}</div><div class="stat-label">% blocked</div></div>
 </div>
 
@@ -1251,6 +1256,7 @@ def report():
     body = render_template_string(
         REPORT_BODY, rows=rows, all_users=all_users, pending_requests=pending_requests,
         filter_user=filter_user, filter_status=filter_status, days=days, day_options=REPORT_DAY_OPTIONS,
+        filters_active=bool(filter_user or filter_status or days != REPORT_DEFAULT_DAYS),
         redirect_kwargs=_report_redirect_kwargs(request.args),
         resolver_error=db.get_setting(conn, "cr_resolver_last_error"),
         total=total, allowed_total=allowed_total, blocked_total=blocked_total, blocked_pct=blocked_pct,
