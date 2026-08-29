@@ -126,13 +126,26 @@ real router, which keeps doing 100% of actual routing/NAT/DHCP.
   assumption: a crash does not instantly and passively revert the
   network to normal; recovery has to be actively engineered.
 
+See [`docs/design/phase3-technical-design.md`](docs/design/phase3-technical-design.md)
+for the concrete follow-on to this section — language/library choices,
+packet-level pseudocode, the IPC message schema, an `nftables` skeleton
+for the four policy classes below, systemd unit sketches, and a draft DB
+migration. This section stays the "what and why"; that document is the
+"with which libraries and roughly what code."
+
 ### Daemon architecture (locked in 2026-08-29, after an independent engineering review)
 
 Three separated components, not one monolithic daemon:
 
-1. **A small, project-owned, privileged ARP worker.** Built in a
-   memory-safe compiled language (not Python/Scapy — see Licensing
-   below), holding only `CAP_NET_RAW`. Owns raw ARP transmission, target
+1. **A small, project-owned, privileged ARP worker.** Built in **Go**
+   (decided 2026-08-29 — see the design doc linked above for why:
+   `mdlayher/arp` is a purpose-built RFC 826 implementation, and
+   `kubernetes-sigs/knftables`, Apache-2.0 and production-proven inside
+   Kubernetes's own network stack, is a materially better fit for the
+   nftables-manager than the early-stage/experimental `google/nftables`
+   — Go's GC'd, bounds-checked memory model already satisfies "memory
+   safe" for this workload without needing Rust's steeper learning
+   curve). Holds only `CAP_NET_RAW`. Owns raw ARP transmission, target
    scheduling, gateway/client MAC resolution, and corrective ARP
    restoration on shutdown. One scheduler loop over an immutable
    per-generation target snapshot, not a thread per host.
