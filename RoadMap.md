@@ -349,20 +349,77 @@ replaces its Redis-based approach.
       up (bootstrap-and-exit only), and `EnsureBaseline` isn't yet safe
       to call twice against an already-populated table.
 - [ ] **6. Service health** — Squid/AdGuard/controller readiness gates,
-      systemd watchdog + restart limits.
+      systemd watchdog + restart limits. **Done and verified 2026-08-29**:
+      `common/sdnotify.py` (stdlib-only systemd sd_notify client,
+      READY=1/WATCHDOG=1) wired into the controller's heartbeat pacer;
+      `controller/health.py` writes `interception_runtime`'s
+      `mode`/`last_healthy_at`/`fail_open_reason` — the first real use
+      of that table since Milestone 4 added it. A failed reconcile
+      cycle is now logged and reported as `fail_open` rather than
+      crashing the process. Squid/AdGuard readiness *gates* specifically
+      (blocking startup until those services answer) aren't built —
+      AdGuard Home itself isn't integrated into this repo yet — but the
+      health-reporting mechanism those gates would feed into now exists
+      and is tested.
 - [ ] **7. Authentication workflow** — toggling
       `devices.is_authenticated` updates policy without restarting
-      spoofing.
+      spoofing. **Done and verified live end-to-end 2026-08-29** — see
+      Milestone 5's update above and `controller/policy_state.py`:
+      built a real DB with three devices in three policy states, ran
+      the real `pp-nftables-manager` binary in a
+      `--cap-add=NET_ADMIN` container against it, then — confirmed via
+      `docker inspect StartedAt` staying constant, i.e. **no restart**
+      — toggled one device's `is_authenticated` from the host and
+      watched the same running process move that device's IP from
+      `unauthenticated_v4` to `authenticated_v4` in the real kernel
+      ruleset on its next poll cycle. This is the milestone's exact
+      claim, proven against real components.
 - [ ] **8. Future-portal seam** — implement the `PolicyClass` enum
       (`AUTHENTICATED` / `PREAUTH` / `BYPASS` / `QUARANTINE`) now, even
-      though only the first two are used until Phase 4.
+      though only the first two are used until Phase 4. **Done
+      2026-08-29**: `common/policy_class.py`'s `PolicyClass` enum +
+      `classify_device()`, precedence `bypass > quarantine >
+      authenticated/preauth` matching the nftables chain's own
+      evaluation order. `devices.quarantined_at` added (nullable,
+      nothing sets it yet — no dashboard control exists to trigger
+      quarantine; that's future, user-facing work, not built here).
 - [ ] **9. Fault campaign** — signals, OOM kill, NIC down/up, gateway
       reboot, DB lock, malformed IPC, partial `nftables` failure.
+      **Partially done 2026-08-29 — the subset testable without real
+      network hardware or destructive host access**: malformed IPC
+      (covered since Milestone 2/3's dispatch tests); DB lock (a
+      transient SQLite lock from a concurrent writer just makes a
+      health write wait out `busy_timeout`, doesn't crash — tested);
+      partial `nftables` failure (proven a non-issue by construction:
+      `knftables.Run()` is atomic so the kernel can never be left
+      half-updated, and `internal/nft`'s fault tests plus the
+      reconciliation loop's read-fresh-every-cycle design mean a
+      process crash mid-cycle self-corrects on the next tick, no
+      special resume logic needed). **Not attempted, needs real
+      hardware or a network-namespace harness this session didn't
+      build**: NIC down/up, gateway reboot, OOM kill under real load.
 - [ ] **10. Soak test** — 7–14 days of mixed real household load,
-      roaming, sleep/wake, with memory/FD/CPU trend monitoring.
+      roaming, sleep/wake, with memory/FD/CPU trend monitoring. **Not
+      startable autonomously** — needs the real household network
+      running this stack for real, over real time, which is squarely
+      the project owner's call on when to begin (deploying an
+      ARP-spoofing daemon to the live LAN is exactly the kind of step
+      this project's own testing discipline says shouldn't happen
+      without them directly involved). Everything upstream of this
+      (Milestones 1–9) is ready to support a soak test whenever that's
+      wanted; nothing else can be done to move Milestone 10 forward
+      before then.
 
-Nothing under Phase 3 has been built yet — this section is the plan, not
-a status report on code that exists.
+Milestones 1–9 above (all but the soak test) have real, tested — several
+functionally verified against real nftables/real sockets/real subprocess
+behavior — work behind them as of 2026-08-29. What's NOT built: a
+discovery daemon to populate `device_bindings` from live traffic, an
+actual controller<->nftables-manager coordinated deployment (each half
+is verified independently and against each other via the shared DB, but
+neither has ever run outside a disposable VM/container), a dashboard
+"interception health" view reading the tables above, and running any of
+this against a real network interface (`CAP_NET_RAW`/`CAP_NET_ADMIN`
+deliberately withheld from every sandboxed test account used so far).
 
 ---
 

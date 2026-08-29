@@ -319,6 +319,17 @@ mechanism `RoadMap.md`'s fail-open section calls for, not just
 `Restart=on-failure` on its own (which only helps once a process has
 actually exited, not when it's hung but still alive).
 
+**Update 2026-08-29 (Milestone 6)**: both halves of this now exist —
+the Go worker already used `coreos/go-systemd/v22/daemon`; the
+Python controller side is `common/sdnotify.py` (stdlib-only, no new
+dependency), sending a real `WATCHDOG=1` datagram on every successful
+heartbeat round-trip. `phase3/nftables-manager`'s own
+`cmd/pp-nftables-manager` does the same on the Go side. Not yet
+written: the actual `.service` unit files above (still just this
+sketch) and Squid/AdGuard readiness *gates* specifically — the health
+tables those gates would feed (see the Milestone 7 update below) exist
+and are tested, but nothing blocks startup on them yet.
+
 ---
 
 ## 7. Database migration draft (for Milestone 4, not applied yet)
@@ -362,8 +373,23 @@ CREATE TABLE IF NOT EXISTS network_events (
 );
 ```
 
-Not wired into `common/db.py` yet — this is the reviewable draft for
-when Milestone 4 (identity model) actually starts.
+**Update 2026-08-29**: wired into `common/db.py` now, close to this
+draft with a few real refinements found along the way: `device_id` is
+nullable (a MAC seen for the first time gets a pending binding rather
+than being dropped — see `common/identity.py`), `INTEGER PRIMARY KEY`
+without `AUTOINCREMENT` (matching every other table in this schema,
+not a deliberate deviation from this draft, just consistency), and
+`interception_runtime` grew four more columns beyond this draft:
+`desired_policy_json` (the Milestone 7 `PolicyClass` output,
+`controller/policy_state.py` writes it, `phase3/nftables-manager`
+reads it directly — see section 5's own update) and `nft_mode`/
+`nft_last_healthy_at`/`nft_fail_reason` (nftables-manager's own health,
+deliberately separate columns from `mode`/`last_healthy_at`/
+`fail_open_reason` above so the ARP-worker pipeline and the
+nftables-manager never clobber each other's status in this shared
+singleton row). `devices` also gained `quarantined_at` (nullable,
+backing the `QUARANTINE` `PolicyClass` — nothing sets it yet, no
+dashboard control exists to trigger it).
 
 ---
 
@@ -371,11 +397,19 @@ when Milestone 4 (identity model) actually starts.
 
 - Exact `unauthenticated_v4` HTTPS handling pre-login (flagged above as
   still open, belongs to Phase 4 design).
-- Whether the controller and nftables-manager are one binary or two —
-  sketched here as logically separate but could ship as one process
-  with internally-separated privilege if that proves simpler; the
-  worker must remain a separate process regardless, since it's the only
-  piece holding `CAP_NET_RAW`.
+- ~~Whether the controller and nftables-manager are one binary or two~~
+  — **built as two separate binaries, coordinating through the shared
+  SQLite database rather than a new IPC protocol between them**
+  (`controller/policy_state.py` writes `desired_policy_json`;
+  `phase3/nftables-manager/internal/dbsource` reads it directly, pure
+  Go via `modernc.org/sqlite`, no cgo). This follows the project's own
+  already-stated "one shared database, live reads, no separate sync"
+  principle (`docs/project.md`'s Key technical decisions) rather than
+  inventing something new, and was verified working end-to-end (see
+  `RoadMap.md`'s Milestone 7 entry) — but it was an autonomous
+  engineering call made without the project owner's direct sign-off,
+  so treat it as a strong default worth a quick second look, not a
+  fully locked decision the way the Go-for-the-worker choice is.
 - Final interval/threshold constants (spoof interval, lease cycle count,
   corrective repeat count/spacing) — these need real numbers from the
   soak-test milestone, not guessed up front.
