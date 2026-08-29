@@ -40,14 +40,22 @@ func New() (*Manager, error) {
 }
 
 // EnsureBaseline creates the table, the four named sets, and the
-// prerouting redirect chain if they don't already exist -- idempotent,
-// safe to call on every startup against a fresh table. Matches
+// prerouting redirect chain if they don't already exist, and
+// (re-)establishes the redirect rules -- fully idempotent, safe to
+// call on every startup regardless of whether the table already has
+// the baseline from a previous run (e.g. this process restarting under
+// systemd's Restart=on-failure). Matches
 // docs/design/phase3-technical-design.md section 5's skeleton exactly;
 // keep the two in sync if either changes.
 //
-// NOT yet safe to call against a table that already has these rules
-// (see baselineRules' own doc comment) -- today's only supported use
-// is a from-scratch bootstrap.
+// The table/set/chain Add() calls are natively idempotent (knftables'
+// Add is "ensure it exists," matching `nft add table` etc.) -- the one
+// piece that ISN'T is rules, which Add() always appends rather than
+// deduplicating by content (rules have no name/identity the way
+// tables/sets/chains do). Flushing the chain before re-adding the
+// rules is what makes a second EnsureBaseline call converge back to
+// exactly the baseline rule set instead of appending a duplicate copy
+// every restart -- verified by TestEnsureBaseline_IsIdempotentAcrossRepeatedCalls.
 func (m *Manager) EnsureBaseline(ctx context.Context) error {
 	tx := m.nft.NewTransaction()
 
@@ -70,6 +78,11 @@ func (m *Manager) EnsureBaseline(ctx context.Context) error {
 		Priority: knftables.PtrTo(knftables.DNATPriority),
 	})
 
+	// Clear any rules a previous EnsureBaseline call left in this chain
+	// before re-adding the baseline below -- a no-op the very first time
+	// (empty chain), and what makes a restart not duplicate rules.
+	tx.Flush(&knftables.Chain{Name: "prerouting"})
+
 	for _, rule := range baselineRules {
 		tx.Add(&knftables.Rule{Chain: "prerouting", Rule: rule})
 	}
@@ -80,13 +93,6 @@ func (m *Manager) EnsureBaseline(ctx context.Context) error {
 // baselineRules are the redirect rules from the design skeleton,
 // applied in the order given (evaluation order matters -- bypass must
 // be checked, and short-circuit via `return`, before anything else).
-//
-// Calling EnsureBaseline a second time against a table that already
-// has these rules would duplicate them -- nftables rules aren't
-// deduplicated by content the way set elements are. TODO before this
-// ships for real: make EnsureBaseline idempotent against an
-// already-populated table (e.g. flush the chain's rules, keep the
-// sets, before re-adding), not just against a missing table/chain.
 var baselineRules = []string{
 	"ip saddr @bypass_v4 return",
 	"ip saddr @authenticated_v4 udp dport 53 redirect to :5353",

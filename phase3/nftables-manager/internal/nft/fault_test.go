@@ -175,3 +175,41 @@ func TestEnsureBaselineThenApplyDiffs_AgainstFake(t *testing.T) {
 		t.Fatalf("expected no diffs on unchanged desired state, got %+v", diffs2)
 	}
 }
+
+// TestEnsureBaseline_IsIdempotentAcrossRepeatedCalls covers the
+// scenario EnsureBaseline's own doc comment calls out: this process
+// restarting under systemd's Restart=on-failure must not duplicate the
+// prerouting chain's redirect rules on every restart. Without the
+// Flush() fix, a second EnsureBaseline call would append a second copy
+// of every rule (knftables' Add() always appends a Rule rather than
+// deduplicating it by content, unlike tables/sets/chains).
+func TestEnsureBaseline_IsIdempotentAcrossRepeatedCalls(t *testing.T) {
+	fake := knftables.NewFake(knftables.InetFamily, "parental_proxy")
+	m := &Manager{nft: fake}
+	ctx := context.Background()
+
+	if err := m.EnsureBaseline(ctx); err != nil {
+		t.Fatalf("EnsureBaseline (first call): %v", err)
+	}
+	rulesAfterFirst, err := fake.ListRules(ctx, "prerouting")
+	if err != nil {
+		t.Fatalf("ListRules (after first call): %v", err)
+	}
+	if len(rulesAfterFirst) != len(baselineRules) {
+		t.Fatalf("expected %d rules after the first EnsureBaseline, got %d",
+			len(baselineRules), len(rulesAfterFirst))
+	}
+
+	if err := m.EnsureBaseline(ctx); err != nil {
+		t.Fatalf("EnsureBaseline (second call, simulating a restart): %v", err)
+	}
+	rulesAfterSecond, err := fake.ListRules(ctx, "prerouting")
+	if err != nil {
+		t.Fatalf("ListRules (after second call): %v", err)
+	}
+	if len(rulesAfterSecond) != len(baselineRules) {
+		t.Fatalf("expected still exactly %d rules after a second EnsureBaseline call (simulating "+
+			"a process restart), got %d -- rules were duplicated instead of re-converged",
+			len(baselineRules), len(rulesAfterSecond))
+	}
+}
