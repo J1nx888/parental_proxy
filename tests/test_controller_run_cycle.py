@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from ipc_client import Target, WorkerClient
+from ipc_client import Target, WorkerClient, WorkerConnectionError
 from main import run_cycle
 from reconcile import DesiredState
 
@@ -143,6 +143,31 @@ def test_unchanged_desired_state_still_writes_policy_and_health_but_skips_the_wo
     finally:
         client.close()
         worker_sock.close()
+
+
+def test_worker_connection_error_propagates_uncaught(conn):
+    """run_cycle must NOT swallow WorkerConnectionError -- only run()
+    (which owns the WorkerClient variable and can build a replacement)
+    is able to actually reconnect; see main.py's own docstrings."""
+    client, worker_sock = _make_client()
+    try:
+        def fake_worker():
+            _read_line(worker_sock)
+            worker_sock.close()  # closes without ever replying
+
+        t = threading.Thread(target=fake_worker)
+        t.start()
+        with pytest.raises(WorkerConnectionError):
+            run_cycle(client, _placeholder_desired_state, None, health_conn=conn, policy_conn=None)
+        t.join(timeout=2)
+
+        # A cycle that propagates never reaches run_cycle's own
+        # health-reporting code -- that's run()'s job once it decides
+        # how to handle the reconnect, not run_cycle's.
+        row = _runtime_row(conn)
+        assert row is None
+    finally:
+        client.close()
 
 
 def test_none_conns_mean_no_db_writes_at_all(conn):

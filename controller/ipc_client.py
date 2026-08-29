@@ -10,15 +10,25 @@ from __future__ import annotations
 import dataclasses
 import json
 import socket
+import threading
 from typing import Any
 
 PROTOCOL_VERSION = 1
 
 
 class WorkerError(RuntimeError):
-    """Raised when the worker replies with a "fault" message, replies with
-    an unsupported protocol version, or the connection breaks mid-request
-    (EOF before a full frame, malformed JSON)."""
+    """Raised when the worker replies with a "fault" message, an
+    unsupported protocol version, or an unexpected op."""
+
+
+class WorkerConnectionError(WorkerError):
+    """Raised specifically when the underlying socket itself is the
+    problem (EOF before a full frame, a broken pipe, connection reset)
+    -- as opposed to a healthy connection carrying an application-level
+    problem (a fault reply, a version mismatch). This distinction is
+    what lets controller/main.py's run() decide when a fresh
+    WorkerClient needs to be established versus just logging and
+    retrying the next cycle on the same connection."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -46,20 +56,30 @@ class HeartbeatAck:
 class WorkerClient:
     """One connection to the arp-worker's Unix socket.
 
-    Not thread-safe, and not meant to be used from more than one thread
-    at once for request/reply calls -- this matches the worker's own
-    "single connection at a time" design (see
-    phase3/arp-worker/internal/ipc/server.go's doc comment). The one
-    exception is that heartbeat() is safe to call from a background
-    pacer thread (see controller/lease.py) as long as nothing else on
-    this client is in flight concurrently -- callers are responsible for
-    that serialization (main.py's reconciliation loop and the heartbeat
-    pacer never overlap by construction).
+    Every public method that talks on the wire holds an internal lock
+    for the full duration of its own send-then-await-reply exchange,
+    which is what actually makes it safe to call heartbeat() from a
+    background pacer thread (see controller/lease.py) at the same time
+    controller/main.py's reconciliation loop calls replace_targets()/
+    shutdown() from the main thread -- an earlier version of this class
+    claimed this was already safe "by construction" without any lock,
+    which was not true: two threads calling _send()/_read_frame()
+    concurrently could interleave their writes on the shared socket or
+    race on the shared read buffer, corrupting the JSON stream. Found
+    while building an integration test for controller/main.py's
+    reconnect-on-WorkerConnectionError logic with tight
+    heartbeat/poll intervals -- exactly the conditions likely to
+    surface it. This still matches the worker's own "single connection
+    at a time" design (phase3/arp-worker/internal/ipc/server.go's doc
+    comment) -- only one LOGICAL request is ever in flight on the wire
+    at once, the lock just makes that true under real concurrency
+    instead of by unenforced convention.
     """
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._buf = b""
+        self._lock = threading.Lock()
 
     @classmethod
     def connect(cls, path: str, timeout: float = 5.0) -> "WorkerClient":
@@ -109,11 +129,13 @@ class WorkerClient:
         of its own, so waiting here would just block until the worker
         closes the socket anyway.
         """
-        self._send({"v": PROTOCOL_VERSION, "op": "shutdown", "reason": reason})
+        with self._lock:
+            self._send({"v": PROTOCOL_VERSION, "op": "shutdown", "reason": reason})
 
     def _request(self, msg: dict[str, Any]) -> dict[str, Any]:
-        self._send(msg)
-        reply = self._read_frame()
+        with self._lock:
+            self._send(msg)
+            reply = self._read_frame()
         if reply.get("v") != PROTOCOL_VERSION:
             raise WorkerError(f"worker replied with unsupported protocol version: {reply!r}")
         if reply.get("op") == "fault":
@@ -128,13 +150,21 @@ class WorkerClient:
 
     def _send(self, msg: dict[str, Any]) -> None:
         line = json.dumps(msg, separators=(",", ":")) + "\n"
-        self._sock.sendall(line.encode("utf-8"))
+        try:
+            self._sock.sendall(line.encode("utf-8"))
+        except OSError as exc:
+            # Broken pipe, connection reset, etc. -- the socket itself
+            # is dead, not just this one request.
+            raise WorkerConnectionError(f"send failed: {exc}") from exc
 
     def _read_frame(self) -> dict[str, Any]:
         while b"\n" not in self._buf:
-            chunk = self._sock.recv(4096)
+            try:
+                chunk = self._sock.recv(4096)
+            except OSError as exc:
+                raise WorkerConnectionError(f"recv failed: {exc}") from exc
             if not chunk:
-                raise WorkerError("worker closed the connection before sending a reply")
+                raise WorkerConnectionError("worker closed the connection before sending a reply")
             self._buf += chunk
         line, self._buf = self._buf.split(b"\n", 1)
         try:

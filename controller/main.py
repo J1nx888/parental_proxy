@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 
 import health
 import sdnotify
-from ipc_client import Target, WorkerClient
+from ipc_client import Target, WorkerClient, WorkerConnectionError
 from lease import HeartbeatPacer
 from reconcile import AppliedState, DesiredState, reconcile
 
@@ -90,10 +90,29 @@ def run(
     A single failed reconcile cycle (a worker fault, a transient DB
     error) is logged and reported via health_conn rather than crashing
     the process -- matching the fail-open design's "controller drives
-    repair, not a crash" intent. What this does NOT yet do: reconnect
-    the WorkerClient if the underlying socket itself dies (as opposed
-    to one request failing) -- that needs backoff/retry logic not
-    built yet (RoadMap.md's Milestone 9 fault-campaign territory).
+    repair, not a crash" intent (RoadMap.md's Milestone 9 fault-
+    campaign). If the underlying socket itself dies (WorkerConnectionError
+    -- a broken pipe, connection reset, or EOF, as opposed to a healthy
+    connection carrying an application-level fault), run() closes the
+    dead client and tries exactly one fresh connection per loop
+    iteration -- naturally rate-limited to poll_interval without needing
+    explicit backoff, and still responsive to a stop request every
+    iteration. `applied` is reset to None on reconnect: a freshly
+    (re)connected worker process may be a brand-new process (systemd
+    restarted it) with no memory of any prior generation, so the next
+    cycle must treat this as a first application again rather than
+    possibly skipping a resend because desired state happens not to
+    have changed since the connection dropped.
+
+    Known race, accepted rather than fixed here given the scope of this
+    pass: the heartbeat pacer runs on its own thread and reads `client`
+    from this closure at call time. If it fires in the narrow window
+    between closing a dead client and a fresh one being assigned, its
+    heartbeat call raises AttributeError on None -- HeartbeatPacer's own
+    broad exception handling logs it via on_error rather than crashing,
+    so this is a harmless, if noisy, cosmetic race, not a correctness
+    bug. A future pass could add a lock around client reads/writes if
+    the noise proves annoying in practice.
     """
     client = WorkerClient.connect(socket_path)
     applied: AppliedState | None = None
@@ -123,11 +142,26 @@ def run(
 
     try:
         while not stop:
-            applied = run_cycle(client, desired_state_provider, applied, health_conn, policy_conn)
+            try:
+                applied = run_cycle(client, desired_state_provider, applied, health_conn, policy_conn)
+            except WorkerConnectionError as exc:
+                log.warning("worker connection lost (%s) -- attempting to reconnect", exc)
+                if health_conn is not None:
+                    health.report_fail_open(health_conn, f"worker connection lost: {exc}")
+                client.close()
+                try:
+                    client = WorkerClient.connect(socket_path)
+                    applied = None
+                    log.info("reconnected to worker")
+                except OSError as reconnect_exc:
+                    log.warning("reconnect attempt failed, will retry next cycle: %s", reconnect_exc)
             time.sleep(poll_interval)
     finally:
         pacer.stop()
-        client.shutdown("controller_requested")
+        try:
+            client.shutdown("controller_requested")
+        except WorkerConnectionError:
+            pass  # already dead -- nothing to tell it
         client.close()
 
 
@@ -145,9 +179,12 @@ def run_cycle(
 
     A failure anywhere in this cycle is caught and reported via
     health_conn rather than propagating -- see run()'s own docstring
-    for why a single bad cycle shouldn't crash the process. Returns the
-    (possibly unchanged) AppliedState for the caller to pass back in
-    next cycle.
+    for why a single bad cycle shouldn't crash the process -- with ONE
+    deliberate exception: WorkerConnectionError propagates to the
+    caller uncaught, since only run() (which owns the WorkerClient
+    variable) can actually reconnect; this function has no way to hand
+    its caller a replacement client. Returns the (possibly unchanged)
+    AppliedState for the caller to pass back in next cycle.
     """
     try:
         desired = desired_state_provider()
@@ -172,6 +209,8 @@ def run_cycle(
 
         if health_conn is not None:
             health.report_healthy(health_conn, applied.generation if applied else 0)
+    except WorkerConnectionError:
+        raise  # let run() handle reconnection -- see this function's own docstring
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, see run()'s own docstring
         log.warning("reconcile cycle failed: %s", exc)
         if health_conn is not None:

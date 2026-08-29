@@ -14,7 +14,14 @@ import threading
 
 import pytest
 
-from ipc_client import GenerationApplied, HeartbeatAck, Target, WorkerClient, WorkerError
+from ipc_client import (
+    GenerationApplied,
+    HeartbeatAck,
+    Target,
+    WorkerClient,
+    WorkerConnectionError,
+    WorkerError,
+)
 
 # AF_UNIX is the actual deploy-target reality (the worker only ever runs on
 # Linux -- see phase3/arp-worker), and is what CI (ubuntu-latest) exercises.
@@ -165,7 +172,7 @@ def test_shutdown_sends_without_waiting_for_reply():
         worker_sock.close()
 
 
-def test_worker_closing_connection_mid_request_raises():
+def test_worker_closing_connection_mid_request_raises_connection_error():
     client, worker_sock = _make_pair()
     try:
         def fake_worker():
@@ -174,8 +181,97 @@ def test_worker_closing_connection_mid_request_raises():
 
         t = threading.Thread(target=fake_worker)
         t.start()
-        with pytest.raises(WorkerError, match="closed the connection"):
+        with pytest.raises(WorkerConnectionError, match="closed the connection"):
             client.heartbeat(1)
         t.join(timeout=2)
     finally:
         client.close()
+
+
+def test_fault_and_version_mismatch_are_not_connection_errors():
+    """Distinguishing WorkerConnectionError (the socket itself is dead)
+    from a plain WorkerError (a healthy connection carrying an
+    application-level problem) is what lets controller/main.py decide
+    whether reconnecting is warranted -- a fault reply must NOT trigger
+    a reconnect, since the connection is fine."""
+    client, worker_sock = _make_pair()
+    try:
+        def fake_worker():
+            _read_line(worker_sock)
+            _send_line(worker_sock, {
+                "v": 1, "op": "fault", "reason": "lease_expired",
+                "action": "entering_repair_only_mode",
+            })
+
+        t = threading.Thread(target=fake_worker)
+        t.start()
+        try:
+            client.heartbeat(1)
+        except WorkerConnectionError:
+            pytest.fail("a fault reply must raise plain WorkerError, not WorkerConnectionError")
+        except WorkerError:
+            pass
+        t.join(timeout=2)
+    finally:
+        client.close()
+
+
+def test_send_on_a_closed_socket_raises_connection_error():
+    client, worker_sock = _make_pair()
+    client.close()
+    worker_sock.close()
+    with pytest.raises(WorkerConnectionError):
+        client.heartbeat(1)
+
+
+def test_concurrent_calls_from_multiple_threads_do_not_corrupt_the_stream():
+    """WorkerClient is used from two threads in practice -- the heartbeat
+    pacer (controller/lease.py) and the main reconciliation loop
+    (controller/main.py) -- with no coordination between them beyond
+    WorkerClient's own internal lock. Without that lock, two threads
+    calling _send()/_read_frame() concurrently could interleave partial
+    socket writes or race on the shared read buffer, corrupting the
+    JSON stream. This drives real concurrent heartbeat() calls from
+    many threads against a real fake-worker socket and confirms every
+    reply matches its own request with no corruption or exception."""
+    client, worker_sock = _make_pair()
+    results: dict[int, int] = {}
+    results_lock = threading.Lock()
+    errors: list[Exception] = []
+    call_count = 40
+
+    def fake_worker():
+        for _ in range(call_count):
+            req = _read_line(worker_sock)
+            _send_line(worker_sock, {
+                "v": 1, "op": "heartbeat_ack", "sequence": req["sequence"], "sent_counters": {},
+            })
+
+    server_thread = threading.Thread(target=fake_worker)
+    server_thread.start()
+
+    def caller(n: int) -> None:
+        try:
+            ack = client.heartbeat(n)
+            with results_lock:
+                results[n] = ack.sequence
+        except Exception as exc:  # noqa: BLE001 -- captured for the assertion, not swallowed
+            with results_lock:
+                errors.append(exc)
+
+    try:
+        callers = [threading.Thread(target=caller, args=(i,)) for i in range(call_count)]
+        for t in callers:
+            t.start()
+        for t in callers:
+            t.join(timeout=5)
+        server_thread.join(timeout=5)
+
+        assert errors == [], f"concurrent calls raised unexpected errors: {errors}"
+        assert results == {i: i for i in range(call_count)}, (
+            "every reply must match its own request's sequence -- a mismatch here "
+            "means the stream got corrupted/interleaved under concurrency"
+        )
+    finally:
+        client.close()
+        worker_sock.close()
