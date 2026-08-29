@@ -153,6 +153,7 @@ BASE = """
       </a>
       <a href="{{ url_for('users') }}" class="{{ 'active' if active=='users' else '' }}">Users</a>
       <a href="{{ url_for('domains') }}" class="{{ 'active' if active=='domains' else '' }}">Domains</a>
+      <a href="{{ url_for('devices') }}" class="{{ 'active' if active=='devices' else '' }}">Devices</a>
       <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
     </nav>
   </div>
@@ -961,6 +962,177 @@ def delete_path():
     conn.commit()
     domain_id = row["domain_id"] if row else None
     return flash_redirect("domain_detail", "Path removed.", domain_id=domain_id)
+
+
+# ==========================================================
+# DEVICES (v2 roadmap groundwork -- see common/db.py's `devices` table
+# comment. Nothing in the proxy/dashboard enforcement path reads these
+# flags yet; this page just lets an admin start tracking devices and
+# curating the future SSL-Bump list ahead of the interception-layer work.)
+# ==========================================================
+
+MAC_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
+def normalize_mac(value: str) -> str | None:
+    """Accepts colon- or hyphen-separated hex pairs, returns lowercase
+    colon-separated form, or None if it isn't a MAC address at all."""
+    value = (value or "").strip().lower().replace("-", ":")
+    return value if MAC_ADDRESS_RE.match(value) else None
+
+
+DEVICES_BODY = """
+<div class="card">
+<h2>Devices ({{ devices|length }})</h2>
+<p class="hint">
+  Track known devices by MAC address ahead of the interception-layer work.
+  <span class="badge mode-bump">SSL-Bump</span> devices will get full
+  path/show-level rules on bump-mode domains once that's wired up -- keep
+  this list small and deliberate. Everything else will get that domain's
+  whole-domain treatment instead. Nothing here is enforced yet.
+</p>
+<div class="table-scroll">
+<table>
+  <tr><th>MAC address</th><th>Label</th><th>Kid</th><th>SSL-Bump</th><th>Bypass login</th><th></th></tr>
+  {% for d in devices %}
+  <tr>
+    <td><code>{{ d.mac_address }}</code></td>
+    <td>{{ d.label or '' }}</td>
+    <td>{{ d.display_name or 'Unassigned' }}</td>
+    <td>{% if d.bump_enabled %}<span class="badge mode-bump">yes</span>{% else %}<span class="badge mode-splice">no</span>{% endif %}</td>
+    <td>{% if d.bypass_login %}<span class="badge pending">yes</span>{% else %}&mdash;{% endif %}</td>
+    <td>
+      <a class="btn small" href="{{ url_for('device_detail', device_id=d.id) }}">Manage</a>
+      <form class="inline" method="post" action="{{ url_for('delete_device') }}">
+        <input type="hidden" name="device_id" value="{{ d.id }}">
+        <button class="danger small" type="submit" onclick="return confirm('Remove this device?')">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6"><em>No devices tracked yet.</em></td></tr>
+  {% endfor %}
+</table>
+</div>
+<form class="add-form" method="post" action="{{ url_for('add_device') }}">
+  <input type="text" name="mac_address" placeholder="aa:bb:cc:dd:ee:ff" required>
+  <input type="text" name="label" placeholder="Label, e.g. Alex's iPad">
+  <select name="user_id">
+    <option value="">Unassigned</option>
+    {% for u in all_users %}
+    <option value="{{ u.id }}">{{ u.display_name }}</option>
+    {% endfor %}
+  </select>
+  <button class="add" type="submit">Add device</button>
+</form>
+</div>
+"""
+
+
+@app.route("/devices")
+@require_admin
+def devices():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT d.*, u.display_name FROM devices d LEFT JOIN users u ON u.id = d.user_id "
+        "ORDER BY d.created_at DESC"
+    ).fetchall()
+    all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+    return render("devices", render_template_string(DEVICES_BODY, devices=rows, all_users=all_users))
+
+
+@app.route("/devices/add", methods=["POST"])
+@require_admin
+def add_device():
+    mac = normalize_mac(request.form.get("mac_address", ""))
+    if mac is None:
+        return flash_redirect(
+            "devices", "Enter a valid MAC address, e.g. aa:bb:cc:dd:ee:ff.", error=True
+        )
+    label = request.form.get("label", "").strip() or None
+    user_id = request.form.get("user_id") or None
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO devices (mac_address, label, user_id, created_at) VALUES (?,?,?,?)",
+            (mac, label, user_id, db.now_iso()),
+        )
+        conn.commit()
+    except Exception as exc:
+        if "UNIQUE" in str(exc):
+            return flash_redirect("devices", f"{mac} is already tracked.", error=True)
+        raise
+    return flash_redirect("devices", f"Added {mac}.")
+
+
+DEVICE_DETAIL_BODY = """
+<p><a href="{{ url_for('devices') }}">&larr; All devices</a></p>
+<h1><code>{{ d.mac_address }}</code></h1>
+
+<div class="card">
+<form class="add-form" method="post" action="{{ url_for('update_device') }}">
+  <input type="hidden" name="device_id" value="{{ d.id }}">
+  <input type="text" name="label" value="{{ d.label or '' }}" placeholder="Label, e.g. Alex's iPad">
+  <select name="user_id">
+    <option value="">Unassigned</option>
+    {% for u in all_users %}
+    <option value="{{ u.id }}" {{ 'selected' if d.user_id==u.id }}>{{ u.display_name }}</option>
+    {% endfor %}
+  </select>
+  <label><input type="checkbox" name="bump_enabled" {{ 'checked' if d.bump_enabled }}> SSL-Bump enabled</label>
+  <label><input type="checkbox" name="bypass_login" {{ 'checked' if d.bypass_login }}> Bypass login</label>
+  <button class="add" type="submit">Save</button>
+</form>
+<p class="hint">
+  <strong>SSL-Bump enabled</strong> marks this as one of the small, deliberately
+  curated devices that will get full path/show-level rules on bump-mode
+  domains -- everything else will fall back to whole-domain treatment once
+  the DNS/interception tier exists. <strong>Bypass login</strong> is for a
+  device that can never complete a login flow (a smart TV, Echo, thermostat)
+  -- it'll be exempted from the future captive-portal gate and fall back to
+  admin-assigned device-level rules instead of per-user ones. Neither
+  setting does anything yet -- this page is groundwork for that work.
+</p>
+</div>
+"""
+
+
+@app.route("/devices/<int:device_id>")
+@require_admin
+def device_detail(device_id: int):
+    conn = get_db()
+    d = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    if d is None:
+        return flash_redirect("devices", "That device no longer exists.", error=True)
+    all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+    return render("devices", render_template_string(DEVICE_DETAIL_BODY, d=d, all_users=all_users))
+
+
+@app.route("/devices/update", methods=["POST"])
+@require_admin
+def update_device():
+    device_id = request.form.get("device_id", "")
+    label = request.form.get("label", "").strip() or None
+    user_id = request.form.get("user_id") or None
+    bump_enabled = 1 if request.form.get("bump_enabled") else 0
+    bypass_login = 1 if request.form.get("bypass_login") else 0
+    conn = get_db()
+    conn.execute(
+        "UPDATE devices SET label = ?, user_id = ?, bump_enabled = ?, bypass_login = ? WHERE id = ?",
+        (label, user_id, bump_enabled, bypass_login, device_id),
+    )
+    conn.commit()
+    return flash_redirect("device_detail", "Saved.", device_id=device_id)
+
+
+@app.route("/devices/delete", methods=["POST"])
+@require_admin
+def delete_device():
+    device_id = request.form.get("device_id", "")
+    conn = get_db()
+    conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+    conn.commit()
+    return flash_redirect("devices", "Device removed.")
 
 
 # ==========================================================

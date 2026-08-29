@@ -1057,3 +1057,105 @@ def test_clear_filters_button_shown_when_a_filter_is_active(client):
 
     resp = client.get("/report?days=30", headers=_auth_header())
     assert b"Clear filters" in resp.data
+
+
+# ============================================================
+# Devices (v2 roadmap groundwork -- not enforced anywhere yet)
+# ============================================================
+
+def test_normalize_mac_accepts_colon_and_hyphen_forms():
+    import dashboard
+    assert dashboard.normalize_mac("AA:BB:CC:DD:EE:FF") == "aa:bb:cc:dd:ee:ff"
+    assert dashboard.normalize_mac("aa-bb-cc-dd-ee-ff") == "aa:bb:cc:dd:ee:ff"
+    assert dashboard.normalize_mac("not a mac") is None
+    assert dashboard.normalize_mac("aa:bb:cc:dd:ee") is None
+    assert dashboard.normalize_mac("") is None
+
+
+def test_add_device_then_appears_in_list(client, db_conn):
+    resp = client.post(
+        "/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:01", "label": "Test Tablet"},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT * FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:01'").fetchone()
+    assert row is not None
+    assert row["label"] == "Test Tablet"
+    assert row["bump_enabled"] == 0
+    assert row["bypass_login"] == 0
+    assert row["is_authenticated"] == 1
+
+    resp = client.get("/devices", headers=_auth_header())
+    assert b"aa:bb:cc:dd:ee:01" in resp.data
+    assert b"Test Tablet" in resp.data
+
+
+def test_add_device_invalid_mac_rejected(client, db_conn):
+    resp = client.post("/devices/add", data={"mac_address": "not-a-mac"}, headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT * FROM devices").fetchone() is None
+
+
+def test_add_device_duplicate_mac_rejected(client, db_conn):
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:02"}, headers=_auth_header())
+    resp = client.post("/devices/add", data={"mac_address": "aa:bb:cc:dd:ee:02"}, headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+    count = db_conn.execute("SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    assert count == 1
+
+
+def test_update_device_sets_flags_and_user(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:03"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+
+    resp = client.post(
+        "/devices/update",
+        data={
+            "device_id": device_id, "label": "Alex's Phone", "user_id": user_id,
+            "bump_enabled": "on", "bypass_login": "",
+        },
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["label"] == "Alex's Phone"
+    assert row["user_id"] == user_id
+    assert row["bump_enabled"] == 1
+    assert row["bypass_login"] == 0
+
+
+def test_delete_device_removes_row(client, db_conn):
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:04"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+
+    resp = client.post("/devices/delete", data={"device_id": device_id}, headers=_auth_header())
+    assert resp.status_code == 302
+    assert db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone() is None
+
+
+def test_deleting_a_user_unassigns_their_devices_instead_of_deleting_them(client, db_conn):
+    """devices.user_id is ON DELETE SET NULL, not CASCADE -- a device is a
+    physical object that still exists after the person who used it is
+    removed from the system, unlike e.g. a user's site/show approvals."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    client.post(
+        "/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:05", "user_id": user_id},
+        headers=_auth_header(),
+    )
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+    assert db_conn.execute("SELECT user_id FROM devices WHERE id = ?", (device_id,)).fetchone()[0] == user_id
+
+    client.post("/users/delete", data={"user_id": user_id}, headers=_auth_header())
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row is not None
+    assert row["user_id"] is None
+
+
+def test_devices_requires_admin_auth(client):
+    assert client.get("/devices").status_code == 401
+    assert client.post("/devices/add", data={"mac_address": "aa:bb:cc:dd:ee:06"}).status_code == 401

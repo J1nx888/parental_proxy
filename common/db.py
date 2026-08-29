@@ -79,6 +79,40 @@ CREATE TABLE IF NOT EXISTS series_cache (
     expires_at REAL NOT NULL
 );
 
+-- v2 roadmap groundwork (no enforcement reads this yet -- Phase 3+): a
+-- physical device on the network, identified by MAC address.
+--   user_id: who this device belongs to. Nullable -- a shared household
+--       device or a bypass_login smart-home gadget may not belong to any
+--       one person.
+--   bump_enabled: whether this device is one of the small, deliberately
+--       curated set allowed to use SSL-Bump (path/show-level rules) at
+--       all. A domain's 'bump' mode only actually bumps traffic from a
+--       bump_enabled device; every other device gets that domain's
+--       DNS/splice-level (whole-domain) treatment instead -- bump-tier is
+--       device-driven, not domain-driven (see the v2 roadmap).
+--   bypass_login: exempts a device that can't complete a login flow at
+--       all (smart TV, Echo, thermostat) from the eventual captive-portal
+--       gate, falling back to admin-assigned device-level rules instead
+--       of user-level ones.
+--   is_authenticated: the eventual captive-portal gate's per-device flag.
+--       Defaults to 1 (authenticated) for every device today, since
+--       there's no login gate yet to fail -- added now, ahead of that
+--       feature, specifically so building it later is additive (one more
+--       rule keyed on this flag) rather than a schema change.
+CREATE TABLE IF NOT EXISTS devices (
+    id               INTEGER PRIMARY KEY,
+    mac_address      TEXT UNIQUE NOT NULL,
+    label            TEXT,
+    user_id          INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    last_known_ip    TEXT,
+    bump_enabled     INTEGER NOT NULL DEFAULT 0,
+    bypass_login     INTEGER NOT NULL DEFAULT 0,
+    is_authenticated INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+
 CREATE TABLE IF NOT EXISTS access_log (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,
