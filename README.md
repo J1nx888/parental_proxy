@@ -20,6 +20,13 @@ around three new features:
    need to know the dashboard exists for their request to show up as a
    pending alert an admin can act on immediately.
 
+This README describes the system **as it exists in code today**. A larger
+redesign -- network-level interception so filtering applies to every
+device on the LAN without per-device proxy setup, a captive-portal
+enrollment flow, and YouTube channel-level filtering -- is planned but not
+yet built; see [RoadMap.md](RoadMap.md) for the full plan and current
+status.
+
 ## How it decides what to do with a site
 
 Every domain has a **mode**, set from the dashboard:

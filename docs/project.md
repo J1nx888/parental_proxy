@@ -8,7 +8,7 @@ Parental Proxy v2 is a from-scratch rewrite of an earlier Crunchyroll-only white
 
 The system is two Docker containers sharing one SQLite database: a Squid proxy container that does the actual traffic filtering (via `external_acl_type` helper scripts, not Squid's native ACL language), and a Flask dashboard container that's the only place an admin ever touches configuration. Squid's SSL-Bump feature lets the proxy selectively decrypt specific domains ("bump" mode) to enforce path-level and show-level rules (e.g. which Crunchyroll series a kid may watch), while most domains stay in cheaper, privacy-preserving "splice" mode (SNI-only, never decrypted, domain-level allow/deny only).
 
-The project is currently mid-way through a larger v2 redesign aimed at replacing a commercial whole-home filter (Bark Home): adding a DNS-based filtering tier for devices that can't run a proxy at all (game consoles, smart TVs), a captive-portal-style forced-enrollment flow, and expanding the Crunchyroll-style show-level filtering pattern to YouTube channels. None of that is built yet — see [`docs/../../../` roadmap note below] for where that planning lives. **This documentation describes the system as it exists in code today**, not the in-progress redesign.
+The project is currently mid-way through a larger v2 redesign aimed at replacing a commercial whole-home filter (Bark Home): adding a DNS-based filtering tier for devices that can't run a proxy at all (game consoles, smart TVs), a captive-portal-style forced-enrollment flow, and expanding the Crunchyroll-style show-level filtering pattern to YouTube channels. None of that is built yet — see [`../RoadMap.md`](../RoadMap.md) for the full plan. **This documentation describes the system as it exists in code today**, not the in-progress redesign.
 
 ## How it works
 
@@ -88,4 +88,4 @@ Dashboard defaults to `http://127.0.0.1:8787` (not LAN-reachable until `DASHBOAR
 
 ## Where the v2 redesign discussion lives
 
-There's an active, larger design conversation (DNS-tier filtering, captive-portal forced enrollment, per-device SSL-Bump curation, YouTube channel filtering, dashboard UI rework, eventual remote access) tracked outside this repo in project memory, not yet reflected in any code or in the docs above. Ask about "the v2 roadmap" to pick that back up.
+The full plan (DNS-tier filtering via a Layer-2 ARP-interception daemon, captive-portal forced enrollment, per-device SSL-Bump curation, YouTube channel filtering, dashboard UI rework, eventual remote access) is tracked in [`RoadMap.md`](../RoadMap.md) at the repo root — kept up to date as phases complete, not just a one-time snapshot. None of it is reflected in the docs above yet, since those describe the system as it exists in code today.
