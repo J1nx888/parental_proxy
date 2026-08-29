@@ -196,25 +196,25 @@ def test_delete_domain_refuses_crunchyroll_builtin(client, db_conn):
     assert db_conn.execute("SELECT * FROM domains WHERE id = ?", (domain_id,)).fetchone() is not None
 
 
-def test_toggle_user_domain_add_and_remove(client, db_conn):
+def test_domain_access_grants_and_revokes_a_user(client, db_conn):
     client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
     client.post("/domains/add", data={"pattern": r"example\.com", "mode": "splice"}, headers=_auth_header())
     user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
     domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"example\.com",)).fetchone()[0]
 
     client.post(
-        "/domains/toggle-user",
-        data={"domain_id": domain_id, "user_id": user_id, "action": "add"},
+        "/domains/access",
+        data={"domain_id": domain_id, "user_ids": [str(user_id)]},
         headers=_auth_header(),
     )
     assert db_conn.execute(
         "SELECT 1 FROM user_domains WHERE user_id = ? AND domain_id = ?", (user_id, domain_id)
     ).fetchone() is not None
 
+    # Saving again with that user simply not selected is how access is
+    # revoked -- there's no separate "remove" action.
     client.post(
-        "/domains/toggle-user",
-        data={"domain_id": domain_id, "user_id": user_id, "action": "remove"},
-        headers=_auth_header(),
+        "/domains/access", data={"domain_id": domain_id}, headers=_auth_header(),
     )
     assert db_conn.execute(
         "SELECT 1 FROM user_domains WHERE user_id = ? AND domain_id = ?", (user_id, domain_id)
@@ -482,7 +482,10 @@ def test_domains_filtered_by_user_shows_only_assigned_and_global(client, db_conn
 
     global_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"global\.example",)).fetchone()[0]
     kid1_domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"kid1-only\.example",)).fetchone()[0]
-    client.post("/domains/toggle-user", data={"domain_id": kid1_domain_id, "user_id": user1_id, "action": "add"}, headers=_auth_header())
+    client.post(
+        "/domains/access", data={"domain_id": kid1_domain_id, "user_ids": [str(user1_id)]},
+        headers=_auth_header(),
+    )
 
     resp = client.get(f"/domains?user_id={user1_id}", headers=_auth_header())
     assert resp.status_code == 200
@@ -677,20 +680,31 @@ def test_domain_detail_unknown_id_redirects_with_error(client):
     assert "error=1" in resp.headers["Location"]
 
 
-def test_update_domain_changes_mode_and_global_flag(client, db_conn):
+def test_update_domain_changes_mode_and_note(client, db_conn):
     client.post("/domains/add", data={"pattern": r"example\.com", "mode": "splice"}, headers=_auth_header())
     domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"example\.com",)).fetchone()[0]
 
     resp = client.post(
         "/domains/update",
-        data={"domain_id": domain_id, "mode": "bump", "is_global": "on", "note": "updated"},
+        data={"domain_id": domain_id, "mode": "bump", "note": "updated"},
         headers=_auth_header(),
     )
     assert resp.status_code == 302
     row = db_conn.execute("SELECT * FROM domains WHERE id = ?", (domain_id,)).fetchone()
     assert row["mode"] == "bump"
-    assert row["is_global"] == 1
     assert row["note"] == "updated"
+
+
+def test_domain_access_sets_global_flag(client, db_conn):
+    client.post("/domains/add", data={"pattern": r"example\.com", "mode": "splice"}, headers=_auth_header())
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"example\.com",)).fetchone()[0]
+
+    resp = client.post(
+        "/domains/access", data={"domain_id": domain_id, "is_global": "on"}, headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT is_global FROM domains WHERE id = ?", (domain_id,)).fetchone()
+    assert row["is_global"] == 1
 
 
 # ============================================================
@@ -1243,8 +1257,8 @@ def test_domains_filter_by_group_shows_group_assigned_and_global_domains(client,
     domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = 'netflix\\.example'").fetchone()[0]
 
     resp = client.post(
-        "/domains/toggle-group",
-        data={"domain_id": domain_id, "group_id": group_id, "action": "add"},
+        "/domains/access",
+        data={"domain_id": domain_id, "group_ids": [str(group_id)]},
         headers=_auth_header(),
     )
     assert resp.status_code == 302
@@ -1257,20 +1271,120 @@ def test_domains_filter_by_group_shows_group_assigned_and_global_domains(client,
     assert b"notassigned" not in resp.data
 
 
-def test_toggle_group_domain_remove(client, db_conn):
+def test_domain_access_revokes_a_group_by_omission(client, db_conn):
     client.post("/groups/add", data={"name": "IoT"}, headers=_auth_header())
     group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'IoT'").fetchone()[0]
     client.post("/domains/add", data={"pattern": "iot\\.example", "mode": "splice"}, headers=_auth_header())
     domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = 'iot\\.example'").fetchone()[0]
     client.post(
-        "/domains/toggle-group", data={"domain_id": domain_id, "group_id": group_id, "action": "add"},
+        "/domains/access", data={"domain_id": domain_id, "group_ids": [str(group_id)]},
         headers=_auth_header(),
     )
 
-    client.post(
-        "/domains/toggle-group", data={"domain_id": domain_id, "group_id": group_id, "action": "remove"},
-        headers=_auth_header(),
-    )
+    client.post("/domains/access", data={"domain_id": domain_id}, headers=_auth_header())
     assert db_conn.execute(
         "SELECT 1 FROM group_domains WHERE group_id = ? AND domain_id = ?", (group_id, domain_id)
     ).fetchone() is None
+
+
+def test_domain_access_grants_and_filters_by_device(client, db_conn):
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:20", "label": "Roku"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:20'").fetchone()[0]
+    client.post("/domains/add", data={"pattern": "disneyplus\\.example", "mode": "splice"}, headers=_auth_header())
+    client.post("/domains/add", data={"pattern": "other\\.example", "mode": "splice"}, headers=_auth_header())
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = 'disneyplus\\.example'").fetchone()[0]
+
+    resp = client.post(
+        "/domains/access", data={"domain_id": domain_id, "device_ids": [str(device_id)]},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    assert db_conn.execute(
+        "SELECT 1 FROM device_domains WHERE device_id = ? AND domain_id = ?", (device_id, domain_id)
+    ).fetchone() is not None
+
+    resp = client.get(f"/domains?device_id={device_id}", headers=_auth_header())
+    assert b"disneyplus" in resp.data
+    assert b"other" not in resp.data
+
+
+def test_add_domain_with_multiple_users_groups_and_devices_at_once(client, db_conn):
+    """The add-domain form itself supports assigning to any combination of
+    users, groups, and devices in one step, not just after the fact from
+    the Manage page."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    client.post("/users/add", data={"username": "kid2", "password": "pw"}, headers=_auth_header())
+    kid1 = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    kid2 = db_conn.execute("SELECT id FROM users WHERE username = 'kid2'").fetchone()[0]
+    client.post("/groups/add", data={"name": "TVs"}, headers=_auth_header())
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()[0]
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:21"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+
+    resp = client.post(
+        "/domains/add",
+        data={
+            "pattern": "combo\\.example", "mode": "splice",
+            "user_ids": [str(kid1), str(kid2)], "group_ids": [str(group_id)],
+            "device_ids": [str(device_id)],
+        },
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = 'combo\\.example'").fetchone()[0]
+    assert db_conn.execute(
+        "SELECT COUNT(*) c FROM user_domains WHERE domain_id = ?", (domain_id,)
+    ).fetchone()["c"] == 2
+    assert db_conn.execute(
+        "SELECT 1 FROM group_domains WHERE domain_id = ? AND group_id = ?", (domain_id, group_id)
+    ).fetchone() is not None
+    assert db_conn.execute(
+        "SELECT 1 FROM device_domains WHERE domain_id = ? AND device_id = ?", (domain_id, device_id)
+    ).fetchone() is not None
+
+
+def test_add_domain_from_filtered_device_view_assigns_it_implicitly(client, db_conn):
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:22"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+
+    client.post(
+        "/domains/add", data={"pattern": "implicit\\.example", "mode": "splice", "device_id": device_id},
+        headers=_auth_header(),
+    )
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = 'implicit\\.example'").fetchone()[0]
+    assert db_conn.execute(
+        "SELECT 1 FROM device_domains WHERE domain_id = ? AND device_id = ?", (domain_id, device_id)
+    ).fetchone() is not None
+
+
+def test_deleting_a_device_removes_its_domain_assignments(client, db_conn):
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:23"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+    client.post("/domains/add", data={"pattern": "gone\\.example", "mode": "splice"}, headers=_auth_header())
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = 'gone\\.example'").fetchone()[0]
+    client.post(
+        "/domains/access", data={"domain_id": domain_id, "device_ids": [str(device_id)]},
+        headers=_auth_header(),
+    )
+
+    client.post("/devices/delete", data={"device_id": device_id}, headers=_auth_header())
+
+    assert db_conn.execute(
+        "SELECT 1 FROM device_domains WHERE device_id = ?", (device_id,)
+    ).fetchone() is None
+
+
+# ============================================================
+# Logout (HTTP Basic Auth has no real session -- best-effort browser-cache
+# trick, see the /logout route's docstring)
+# ============================================================
+
+def test_logout_with_bogus_credentials_returns_401(client):
+    resp = client.get("/logout", headers=_auth_header(username="logout", password="logout"))
+    assert resp.status_code == 401
+    assert "WWW-Authenticate" in resp.headers
+
+
+def test_logout_requires_some_credential(client):
+    resp = client.get("/logout")
+    assert resp.status_code == 401

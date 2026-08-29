@@ -146,6 +146,18 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
 CREATE INDEX IF NOT EXISTS idx_devices_group ON devices(group_id);
 
+-- A single device's own domain allow-list -- for granting one specific
+-- device access directly, without needing to create a whole group for
+-- it. Independent of (and can coexist with) that device's user_id/
+-- group_id assignment -- e.g. a device assigned to a kid can still get
+-- an extra domain granted just to it, on top of whatever that kid has.
+CREATE TABLE IF NOT EXISTS device_domains (
+    id        INTEGER PRIMARY KEY,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    domain_id INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+    UNIQUE(device_id, domain_id)
+);
+
 CREATE TABLE IF NOT EXISTS access_log (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,

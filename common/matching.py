@@ -84,6 +84,17 @@ def group_has_domain(conn: sqlite3.Connection, group_id: int, domain_id: int) ->
     return row is not None
 
 
+def device_has_domain(conn: sqlite3.Connection, device_id: int, domain_id: int) -> bool:
+    """v2 roadmap groundwork, same status as group_has_domain() above --
+    device_domains grants one specific device access directly, independent
+    of any user/group assignment. Not consulted by proxy enforcement yet."""
+    row = conn.execute(
+        "SELECT 1 FROM device_domains WHERE device_id = ? AND domain_id = ?",
+        (device_id, domain_id),
+    ).fetchone()
+    return row is not None
+
+
 def user_has_show(conn: sqlite3.Connection, user_id: int, series_id: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM user_shows WHERE user_id = ? AND series_id = ?",

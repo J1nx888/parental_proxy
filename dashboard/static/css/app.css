@@ -115,7 +115,41 @@ nav.tabs {
   gap: 1.5rem;
   flex-wrap: wrap;
   overflow-x: auto;
+  flex: 1 1 auto;
 }
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  margin-left: auto;
+  padding-bottom: 1rem;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  border-radius: 999px;
+  font-size: 1.15rem;
+  line-height: 1;
+  color: var(--text-muted);
+  text-decoration: none;
+}
+.icon-btn:hover { background: var(--surface-alt); color: var(--text); }
+.icon-btn.active { background: var(--surface-alt); color: var(--brand); }
+
+.logout-link {
+  font-size: .85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: .3rem .5rem;
+  border-radius: var(--radius-sm);
+}
+.logout-link:hover { background: var(--surface-alt); color: var(--danger); }
 
 nav.tabs a {
   text-decoration: none;
@@ -216,6 +250,25 @@ input:focus, select:focus, button:focus-visible, a.btn:focus-visible {
   outline-offset: 1px;
 }
 label { font-size: .88rem; color: var(--text-muted); display: inline-flex; align-items: center; gap: .3rem; }
+
+/* ---- Access grid: the Users/Groups/Devices multi-selects ---- */
+.access-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(140px, 1fr));
+  gap: .8rem;
+  margin-top: .6rem;
+  max-width: 640px;
+}
+.access-label { font-size: .78rem; font-weight: 600; color: var(--text-muted); margin-bottom: .3rem; }
+select[multiple] {
+  width: 100%;
+  min-height: 7.5rem;
+  padding: .3rem;
+}
+select[multiple] option { padding: .3rem .4rem; border-radius: 4px; }
+@media (max-width: 720px) {
+  .access-grid { grid-template-columns: 1fr; }
+}
 
 /* ---- Buttons ---- */
 button, .btn {

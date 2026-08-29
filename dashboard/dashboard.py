@@ -123,6 +123,24 @@ def require_admin(view):
     return wrapped
 
 
+@app.route("/logout")
+@require_admin
+def logout():
+    """HTTP Basic Auth has no real server-side session to revoke -- the
+    browser just caches the credential per-origin until it's closed. The
+    Logout link in BASE navigates here with a deliberately wrong credential
+    embedded in the URL (http://logout:logout@host/logout); that overwrites
+    whatever the browser had cached for this origin, @require_admin above
+    then 401s it (same as any other bad credential), and browsers respond
+    to a 401 + WWW-Authenticate on a top-level navigation by showing a
+    fresh native sign-in prompt. This body only runs in the practically
+    impossible case that the real admin credentials happen to literally be
+    "logout"/"logout"."""
+    return Response(
+        "Logged out.", 401, {"WWW-Authenticate": 'Basic realm="Parental Proxy Admin"'}
+    )
+
+
 # ==========================================================
 # SHARED PAGE CHROME
 # ==========================================================
@@ -154,8 +172,11 @@ BASE = """
       <a href="{{ url_for('users') }}" class="{{ 'active' if active=='users' else '' }}">Users</a>
       <a href="{{ url_for('domains') }}" class="{{ 'active' if active=='domains' else '' }}">Domains</a>
       <a href="{{ url_for('devices') }}" class="{{ 'active' if active=='devices' else '' }}">Devices</a>
-      <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
     </nav>
+    <div class="topbar-actions">
+      <a class="icon-btn {{ 'active' if active=='settings' else '' }}" href="{{ url_for('settings_page') }}" title="Settings" aria-label="Settings">&#9881;</a>
+      <a class="logout-link" href="http://logout:logout@{{ request.host }}{{ url_for('logout') }}" title="Log out">Logout</a>
+    </div>
   </div>
 </header>
 <div class="page">
@@ -575,6 +596,44 @@ def path_to_pattern(path: str) -> str:
     return "^" + re.escape((path or "/").split("?", 1)[0])
 
 
+# Shared by the add-domain form and the domain Manage page's Access card --
+# one Everyone checkbox plus three independent multi-selects (Users,
+# Groups, Devices), so "single user, multiple users, a device, a group, or
+# any combination" is just whatever's selected across these three lists at
+# once. Needs all_users/all_groups/all_devices and preselected_user_ids/
+# preselected_group_ids/preselected_device_ids/is_global_checked in scope
+# wherever it's used.
+ACCESS_SELECTS = """
+  <label><input type="checkbox" name="is_global" {{ 'checked' if is_global_checked }}> Everyone</label>
+  <div class="access-grid">
+    <div>
+      <div class="access-label">Users</div>
+      <select name="user_ids" multiple size="5">
+        {% for u in all_users %}
+        <option value="{{ u.id }}" {{ 'selected' if u.id in preselected_user_ids }}>{{ u.display_name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <div class="access-label">Groups</div>
+      <select name="group_ids" multiple size="5">
+        {% for g in all_groups %}
+        <option value="{{ g.id }}" {{ 'selected' if g.id in preselected_group_ids }}>{{ g.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <div class="access-label">Devices</div>
+      <select name="device_ids" multiple size="5">
+        {% for dev in all_devices %}
+        <option value="{{ dev.id }}" {{ 'selected' if dev.id in preselected_device_ids }}>{{ dev.label or dev.mac_address }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+"""
+
+
 DOMAINS_BODY = """
 <div class="card">
 <h2>Domains ({{ domains|length }})</h2>
@@ -587,6 +646,12 @@ DOMAINS_BODY = """
 {% elif filtered_group %}
 <p class="hint">
   Showing domains assigned to the <strong>{{ filtered_group.name }}</strong> group
+  (plus everyone's global domains) --
+  <a href="{{ url_for('domains') }}">clear filter</a>
+</p>
+{% elif filtered_device %}
+<p class="hint">
+  Showing domains assigned to <strong>{{ filtered_device.label or filtered_device.mac_address }}</strong>
   (plus everyone's global domains) --
   <a href="{{ url_for('domains') }}">clear filter</a>
 </p>
@@ -603,7 +668,7 @@ DOMAINS_BODY = """
   <tr>
     <td><code>{{ d.pattern }}</code></td>
     <td><span class="badge mode-{{ d.mode }}">{{ d.mode }}</span></td>
-    <td>{{ 'Everyone' if d.is_global else 'Per-user/group' }}</td>
+    <td>{{ 'Everyone' if d.is_global else 'Per-user/group/device' }}</td>
     <td>{{ d.note or '' }}</td>
     <td>
       <a class="btn small" href="{{ url_for('domain_detail', domain_id=d.id) }}">Manage</a>
@@ -611,6 +676,7 @@ DOMAINS_BODY = """
         <input type="hidden" name="domain_id" value="{{ d.id }}">
         {% if filtered_user %}<input type="hidden" name="user_id" value="{{ filtered_user.id }}">{% endif %}
         {% if filtered_group %}<input type="hidden" name="group_id" value="{{ filtered_group.id }}">{% endif %}
+        {% if filtered_device %}<input type="hidden" name="device_id" value="{{ filtered_device.id }}">{% endif %}
         <button class="danger small" type="submit" onclick="return confirm('Delete this domain rule?')">Delete</button>
       </form>
     </td>
@@ -624,17 +690,22 @@ DOMAINS_BODY = """
 <form class="add-form" method="post" action="{{ url_for('add_domain') }}">
   {% if filtered_user %}<input type="hidden" name="user_id" value="{{ filtered_user.id }}">{% endif %}
   {% if filtered_group %}<input type="hidden" name="group_id" value="{{ filtered_group.id }}">{% endif %}
+  {% if filtered_device %}<input type="hidden" name="device_id" value="{{ filtered_device.id }}">{% endif %}
   <input type="text" name="pattern" placeholder="e.g. example\\.com" required>
   <select name="mode">
     <option value="splice">splice (host-only)</option>
     <option value="bump">bump (decrypt, path rules)</option>
     <option value="trusted">trusted (always pass, unchecked)</option>
   </select>
-  <label><input type="checkbox" name="is_global"> Everyone gets this</label>
   <input type="text" name="note" placeholder="Note (optional)">
   <button class="add" type="submit">Add domain</button>
+""" + ACCESS_SELECTS + """
 </form>
-<p class="hint">"Everyone gets this" is for shared infrastructure (fonts, auth providers, CDNs) -- leave it unchecked for sites you want to assign to specific users or groups individually.</p>
+<p class="hint">
+  "Everyone" is for shared infrastructure (fonts, auth providers, CDNs). Otherwise pick any
+  combination of specific users, groups, and/or devices -- hold Ctrl/Cmd (or Shift for a range)
+  to select more than one in a list. You can adjust all of this later from the domain's Manage page.
+</p>
 </div>
 
 {% if filtered_user %}
@@ -651,48 +722,61 @@ DOMAINS_BODY = """
 """
 
 
+def _get_filtered_target(conn, args_or_form):
+    """Resolves the ?user_id= / ?group_id= / ?device_id= filter (Domains
+    page) or the equivalent hidden form fields (add/delete actions taken
+    from a filtered view) to at most one of (filtered_user, filtered_group,
+    filtered_device, error_message). user_id wins if more than one is
+    somehow present."""
+    user_id = args_or_form.get("user_id", "")
+    group_id = args_or_form.get("group_id", "")
+    device_id = args_or_form.get("device_id", "")
+    if user_id:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return (row, None, None, None) if row else (None, None, None, "That user no longer exists.")
+    if group_id:
+        row = conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+        return (None, row, None, None) if row else (None, None, None, "That group no longer exists.")
+    if device_id:
+        row = conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        return (None, None, row, None) if row else (None, None, None, "That device no longer exists.")
+    return None, None, None, None
+
+
 @app.route("/domains")
 @require_admin
 def domains():
     conn = get_db()
-    filter_user_id = request.args.get("user_id", "")
-    filter_group_id = request.args.get("group_id", "")
-    filtered_user = None
-    filtered_group = None
-    if filter_user_id:
-        filtered_user = conn.execute(
-            "SELECT * FROM users WHERE id = ?", (filter_user_id,)
-        ).fetchone()
-        if filtered_user is None:
-            return flash_redirect("domains", "That user no longer exists.", error=True)
-    elif filter_group_id:
-        filtered_group = conn.execute(
-            "SELECT * FROM groups WHERE id = ?", (filter_group_id,)
-        ).fetchone()
-        if filtered_group is None:
-            return flash_redirect("domains", "That group no longer exists.", error=True)
+    filtered_user, filtered_group, filtered_device, error = _get_filtered_target(conn, request.args)
+    if error:
+        return flash_redirect("domains", error, error=True)
 
-    if filtered_user or filtered_group:
+    if filtered_user or filtered_group or filtered_device:
         # Same rule the proxy itself uses at request time (matching.py),
         # reused here rather than reimplemented as a second copy of the
-        # "is this domain visible to this user/group" logic.
+        # "is this domain visible to this user/group/device" logic.
         all_rows = conn.execute("SELECT * FROM domains ORDER BY is_global DESC, pattern").fetchall()
         if filtered_user:
-            rows = [
-                d for d in all_rows
-                if bool(d["is_global"]) or matching.user_has_domain(conn, filter_user_id, d["id"])
-            ]
+            rows = [d for d in all_rows if bool(d["is_global"]) or matching.user_has_domain(conn, filtered_user["id"], d["id"])]
+        elif filtered_group:
+            rows = [d for d in all_rows if bool(d["is_global"]) or matching.group_has_domain(conn, filtered_group["id"], d["id"])]
         else:
-            rows = [
-                d for d in all_rows
-                if bool(d["is_global"]) or matching.group_has_domain(conn, filter_group_id, d["id"])
-            ]
+            rows = [d for d in all_rows if bool(d["is_global"]) or matching.device_has_domain(conn, filtered_device["id"], d["id"])]
     else:
         rows = conn.execute("SELECT * FROM domains ORDER BY is_global DESC, pattern").fetchall()
+
+    all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+    all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
+    all_devices = conn.execute("SELECT * FROM devices ORDER BY COALESCE(label, mac_address)").fetchall()
     return render(
         "domains",
         render_template_string(
-            DOMAINS_BODY, domains=rows, filtered_user=filtered_user, filtered_group=filtered_group
+            DOMAINS_BODY, domains=rows, filtered_user=filtered_user, filtered_group=filtered_group,
+            filtered_device=filtered_device, all_users=all_users, all_groups=all_groups, all_devices=all_devices,
+            is_global_checked=False,
+            preselected_user_ids={filtered_user["id"]} if filtered_user else set(),
+            preselected_group_ids={filtered_group["id"]} if filtered_group else set(),
+            preselected_device_ids={filtered_device["id"]} if filtered_device else set(),
         ),
     )
 
@@ -704,15 +788,22 @@ def add_domain():
     mode = request.form.get("mode", "splice")
     is_global = 1 if request.form.get("is_global") else 0
     note = request.form.get("note", "").strip() or None
-    # Preserves the Users-page "N assigned" filter (?user_id=) or a group
-    # filter (?group_id=) across this POST, so adding a domain from a
+    conn = get_db()
+
+    # Preserves the Users/Domains/Devices-page filter (?user_id=/
+    # ?group_id=/?device_id=) across this POST, so adding a domain from a
     # filtered view doesn't silently drop the admin back into the
-    # unfiltered list.
+    # unfiltered list -- and (see below) also assigns the new domain to
+    # that filter's subject, not just redirects back to it.
+    _, _, _, error = _get_filtered_target(conn, request.form)
     redirect_kwargs = {}
     if request.form.get("user_id"):
         redirect_kwargs["user_id"] = request.form["user_id"]
     elif request.form.get("group_id"):
         redirect_kwargs["group_id"] = request.form["group_id"]
+    elif request.form.get("device_id"):
+        redirect_kwargs["device_id"] = request.form["device_id"]
+
     if not pattern:
         return flash_redirect("domains", "Pattern is required.", error=True, **redirect_kwargs)
     if mode not in ("splice", "bump", "trusted"):
@@ -723,7 +814,22 @@ def add_domain():
         re.compile(pattern)
     except re.error as exc:
         return flash_redirect("domains", f"Not a valid regex: {exc}", error=True, **redirect_kwargs)
-    conn = get_db()
+
+    # Explicit multi-select assignment (the add-domain form's own Users/
+    # Groups/Devices lists) plus the implicit single target from a
+    # filtered view -- both can contribute, so a domain added from a
+    # filtered view is assigned to that view's subject even if the admin
+    # didn't also touch the lists.
+    user_ids = {int(x) for x in request.form.getlist("user_ids") if x.isdigit()}
+    group_ids = {int(x) for x in request.form.getlist("group_ids") if x.isdigit()}
+    device_ids = {int(x) for x in request.form.getlist("device_ids") if x.isdigit()}
+    if request.form.get("user_id", "").isdigit():
+        user_ids.add(int(request.form["user_id"]))
+    if request.form.get("group_id", "").isdigit():
+        group_ids.add(int(request.form["group_id"]))
+    if request.form.get("device_id", "").isdigit():
+        device_ids.add(int(request.form["device_id"]))
+
     try:
         conn.execute(
             "INSERT INTO domains (pattern, mode, kind, is_global, note, created_at) VALUES (?,?,?,?,?,?)",
@@ -734,6 +840,15 @@ def add_domain():
         if "UNIQUE" in str(exc):
             return flash_redirect("domains", f"{pattern!r} is already configured.", error=True, **redirect_kwargs)
         raise
+
+    domain_id = conn.execute("SELECT id FROM domains WHERE pattern = ?", (pattern,)).fetchone()["id"]
+    for uid in user_ids:
+        conn.execute("INSERT OR IGNORE INTO user_domains (user_id, domain_id) VALUES (?,?)", (uid, domain_id))
+    for gid in group_ids:
+        conn.execute("INSERT OR IGNORE INTO group_domains (group_id, domain_id) VALUES (?,?)", (gid, domain_id))
+    for did in device_ids:
+        conn.execute("INSERT OR IGNORE INTO device_domains (device_id, domain_id) VALUES (?,?)", (did, domain_id))
+    conn.commit()
     return flash_redirect("domains", f"Added {pattern}.", **redirect_kwargs)
 
 
@@ -811,6 +926,8 @@ def delete_domain():
         redirect_kwargs["user_id"] = request.form["user_id"]
     elif request.form.get("group_id"):
         redirect_kwargs["group_id"] = request.form["group_id"]
+    elif request.form.get("device_id"):
+        redirect_kwargs["device_id"] = request.form["device_id"]
     conn = get_db()
     row = conn.execute("SELECT kind FROM domains WHERE id = ?", (domain_id,)).fetchone()
     if row and row["kind"] == "crunchyroll":
@@ -833,6 +950,7 @@ DOMAIN_DETAIL_BODY = """
 {% endif %}
 
 <div class="card">
+<h2>Mode</h2>
 <form class="add-form" method="post" action="{{ url_for('update_domain') }}">
   <input type="hidden" name="domain_id" value="{{ d.id }}">
   <select name="mode">
@@ -840,64 +958,26 @@ DOMAIN_DETAIL_BODY = """
     <option value="bump" {{ 'selected' if d.mode=='bump' }}>bump (decrypt, path rules)</option>
     <option value="trusted" {{ 'selected' if d.mode=='trusted' }}>trusted (always pass, unchecked)</option>
   </select>
-  <label><input type="checkbox" name="is_global" {{ 'checked' if d.is_global }}> Everyone gets this</label>
   <input type="text" name="note" value="{{ d.note or '' }}" placeholder="Note">
   <button class="add" type="submit">Save</button>
 </form>
 </div>
 
-{% if not d.is_global %}
 <div class="card">
-<h2>Assigned users</h2>
-<div class="table-scroll">
-<table>
-  <tr><th></th><th>User</th></tr>
-  {% for u in all_users %}
-  <tr>
-    <td>
-      <form class="inline" method="post" action="{{ url_for('toggle_user_domain') }}">
-        <input type="hidden" name="domain_id" value="{{ d.id }}">
-        <input type="hidden" name="user_id" value="{{ u.id }}">
-        <input type="hidden" name="action" value="{{ 'remove' if u.id in assigned_ids else 'add' }}">
-        <button class="small {{ '' if u.id in assigned_ids else 'add' }}" type="submit">
-          {{ 'Remove' if u.id in assigned_ids else 'Grant' }}
-        </button>
-      </form>
-    </td>
-    <td>{{ u.display_name }} <code>({{ u.username }})</code></td>
-  </tr>
-  {% endfor %}
-</table>
+<h2>Access</h2>
+<form method="post" action="{{ url_for('update_domain_access') }}">
+  <input type="hidden" name="domain_id" value="{{ d.id }}">
+""" + ACCESS_SELECTS + """
+  <button class="add" type="submit" style="margin-top:.8rem;">Save access</button>
+</form>
+<p class="hint">
+  Pick any combination of specific users, groups, and/or devices -- hold Ctrl/Cmd (or Shift for a
+  range) to select more than one in a list. Saving replaces the current assignment with exactly
+  what's selected, so removing access is the same action as granting it: just change the selection.
+  "Everyone" grants it regardless of the lists below, but they're still saved underneath it, so
+  turning "Everyone" back off later doesn't lose them.
+</p>
 </div>
-</div>
-
-<div class="card">
-<h2>Assigned groups</h2>
-<p class="hint">Grants every device in a group access to this domain -- independent of any user assignment above.</p>
-<div class="table-scroll">
-<table>
-  <tr><th></th><th>Group</th></tr>
-  {% for g in all_groups %}
-  <tr>
-    <td>
-      <form class="inline" method="post" action="{{ url_for('toggle_group_domain') }}">
-        <input type="hidden" name="domain_id" value="{{ d.id }}">
-        <input type="hidden" name="group_id" value="{{ g.id }}">
-        <input type="hidden" name="action" value="{{ 'remove' if g.id in assigned_group_ids else 'add' }}">
-        <button class="small {{ '' if g.id in assigned_group_ids else 'add' }}" type="submit">
-          {{ 'Remove' if g.id in assigned_group_ids else 'Grant' }}
-        </button>
-      </form>
-    </td>
-    <td>{{ g.name }}</td>
-  </tr>
-  {% else %}
-  <tr><td colspan="2"><em>No groups yet -- create one from the Devices page.</em></td></tr>
-  {% endfor %}
-</table>
-</div>
-</div>
-{% endif %}
 
 {% if d.mode == 'bump' %}
 <div class="card">
@@ -942,22 +1022,28 @@ def domain_detail(domain_id: int):
     if d is None:
         return flash_redirect("domains", "That domain no longer exists.", error=True)
     all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
-    assigned_ids = {
+    all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
+    all_devices = conn.execute("SELECT * FROM devices ORDER BY COALESCE(label, mac_address)").fetchall()
+    assigned_user_ids = {
         row["user_id"] for row in
         conn.execute("SELECT user_id FROM user_domains WHERE domain_id = ?", (domain_id,))
     }
-    all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
     assigned_group_ids = {
         row["group_id"] for row in
         conn.execute("SELECT group_id FROM group_domains WHERE domain_id = ?", (domain_id,))
+    }
+    assigned_device_ids = {
+        row["device_id"] for row in
+        conn.execute("SELECT device_id FROM device_domains WHERE domain_id = ?", (domain_id,))
     }
     paths = conn.execute(
         "SELECT * FROM domain_paths WHERE domain_id = ? ORDER BY pattern", (domain_id,)
     ).fetchall()
     body = render_template_string(
-        DOMAIN_DETAIL_BODY, d=d, all_users=all_users, assigned_ids=assigned_ids,
-        all_groups=all_groups, assigned_group_ids=assigned_group_ids, paths=paths,
-        prefill_path=request.args.get("prefill_path"),
+        DOMAIN_DETAIL_BODY, d=d, all_users=all_users, all_groups=all_groups, all_devices=all_devices,
+        preselected_user_ids=assigned_user_ids, preselected_group_ids=assigned_group_ids,
+        preselected_device_ids=assigned_device_ids, is_global_checked=bool(d["is_global"]),
+        paths=paths, prefill_path=request.args.get("prefill_path"),
     )
     return render("domains", body)
 
@@ -967,55 +1053,42 @@ def domain_detail(domain_id: int):
 def update_domain():
     domain_id = request.form.get("domain_id", "")
     mode = request.form.get("mode", "splice")
-    is_global = 1 if request.form.get("is_global") else 0
     note = request.form.get("note", "").strip() or None
     conn = get_db()
     conn.execute(
-        "UPDATE domains SET mode = ?, is_global = ?, note = ? WHERE id = ?",
-        (mode, is_global, note, domain_id),
+        "UPDATE domains SET mode = ?, note = ? WHERE id = ?",
+        (mode, note, domain_id),
     )
     conn.commit()
     return flash_redirect("domain_detail", "Saved.", domain_id=domain_id)
 
 
-@app.route("/domains/toggle-user", methods=["POST"])
+@app.route("/domains/access", methods=["POST"])
 @require_admin
-def toggle_user_domain():
+def update_domain_access():
+    """Replaces a domain's entire access grant (Everyone + users + groups
+    + devices) with exactly what was submitted -- granting and revoking
+    are the same action here, just a changed selection, rather than
+    separate add/remove endpoints per assignment type."""
     domain_id = request.form.get("domain_id", "")
-    user_id = request.form.get("user_id", "")
-    action = request.form.get("action", "add")
-    conn = get_db()
-    if action == "add":
-        conn.execute(
-            "INSERT OR IGNORE INTO user_domains (user_id, domain_id) VALUES (?,?)",
-            (user_id, domain_id),
-        )
-    else:
-        conn.execute(
-            "DELETE FROM user_domains WHERE user_id = ? AND domain_id = ?", (user_id, domain_id)
-        )
-    conn.commit()
-    return flash_redirect("domain_detail", "Updated.", domain_id=domain_id)
+    is_global = 1 if request.form.get("is_global") else 0
+    user_ids = {int(x) for x in request.form.getlist("user_ids") if x.isdigit()}
+    group_ids = {int(x) for x in request.form.getlist("group_ids") if x.isdigit()}
+    device_ids = {int(x) for x in request.form.getlist("device_ids") if x.isdigit()}
 
-
-@app.route("/domains/toggle-group", methods=["POST"])
-@require_admin
-def toggle_group_domain():
-    domain_id = request.form.get("domain_id", "")
-    group_id = request.form.get("group_id", "")
-    action = request.form.get("action", "add")
     conn = get_db()
-    if action == "add":
-        conn.execute(
-            "INSERT OR IGNORE INTO group_domains (group_id, domain_id) VALUES (?,?)",
-            (group_id, domain_id),
-        )
-    else:
-        conn.execute(
-            "DELETE FROM group_domains WHERE group_id = ? AND domain_id = ?", (group_id, domain_id)
-        )
+    conn.execute("UPDATE domains SET is_global = ? WHERE id = ?", (is_global, domain_id))
+    conn.execute("DELETE FROM user_domains WHERE domain_id = ?", (domain_id,))
+    for uid in user_ids:
+        conn.execute("INSERT OR IGNORE INTO user_domains (user_id, domain_id) VALUES (?,?)", (uid, domain_id))
+    conn.execute("DELETE FROM group_domains WHERE domain_id = ?", (domain_id,))
+    for gid in group_ids:
+        conn.execute("INSERT OR IGNORE INTO group_domains (group_id, domain_id) VALUES (?,?)", (gid, domain_id))
+    conn.execute("DELETE FROM device_domains WHERE domain_id = ?", (domain_id,))
+    for did in device_ids:
+        conn.execute("INSERT OR IGNORE INTO device_domains (device_id, domain_id) VALUES (?,?)", (did, domain_id))
     conn.commit()
-    return flash_redirect("domain_detail", "Updated.", domain_id=domain_id)
+    return flash_redirect("domain_detail", "Access updated.", domain_id=domain_id)
 
 
 @app.route("/domains/paths/add", methods=["POST"])
@@ -1180,6 +1253,7 @@ DEVICES_BODY = """
     <td>{% if d.bypass_login %}<span class="badge pending">yes</span>{% else %}&mdash;{% endif %}</td>
     <td>
       <a class="btn small" href="{{ url_for('device_detail', device_id=d.id) }}">Manage</a>
+      <a class="btn small" href="{{ url_for('domains', device_id=d.id) }}">Domains</a>
       <form class="inline" method="post" action="{{ url_for('delete_device') }}">
         <input type="hidden" name="device_id" value="{{ d.id }}">
         <button class="danger small" type="submit" onclick="return confirm('Remove this device?')">Delete</button>
