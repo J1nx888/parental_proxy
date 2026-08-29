@@ -37,7 +37,7 @@ Pi-hole setup:
 | 1 | Dashboard modernization (design system, charts, PWA) | ✅ Done |
 | 2 | Device/group data model groundwork | ✅ Done |
 | — | Filter/picker UI scaling (GH #8) | ✅ Done |
-| 3 | Network-level interception (the actual Bark Home replacement mechanism) | 🔶 Architecture locked, implementation not started |
+| 3 | Network-level interception (the actual Bark Home replacement mechanism) | 🔶 Milestones 1–9 have real, tested (several functionally verified live) work; not yet deployed anywhere real — see the Milestones list below |
 | 4 | Captive-portal forced enrollment | ⬜ Design sketch only, not started |
 | 5 | YouTube channel/creator-level filtering | ⬜ Assessed, not started |
 | 6 | Admin control surface: responsive/PWA, eventual remote access | ⬜ Not started |
