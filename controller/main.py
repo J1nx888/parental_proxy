@@ -16,9 +16,7 @@ component, no discovery daemon populating device_bindings from live
 traffic, and the gateway is passed in on the command line rather than
 resolved live (that's the ARP worker's own job at startup -- see
 phase3/arp-worker/internal/worker/safety.go's ResolveGateway -- not
-something the controller should do a second time). Reconnection after
-the worker socket itself dies (as opposed to a single failed request)
-isn't implemented either -- see run()'s own note. See
+something the controller should do a second time). See
 docs/design/phase3-technical-design.md and RoadMap.md's milestone list.
 """
 from __future__ import annotations

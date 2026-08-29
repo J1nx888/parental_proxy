@@ -344,10 +344,15 @@ replaces its Redis-based approach.
       produces the exact skeleton ruleset; an atomic apply of a diff
       lands correctly; re-reconciling against unchanged desired state
       against a *real* kernel ruleset produces an empty diff; an
-      incremental add+remove applies as one atomic transaction. Not yet
-      done: no reconciliation loop or real desired-state input wired
-      up (bootstrap-and-exit only), and `EnsureBaseline` isn't yet safe
-      to call twice against an already-populated table.
+      incremental add+remove applies as one atomic transaction. A
+      reconciliation loop and real desired-state input (Milestone 7,
+      below) were wired up later the same day, and `EnsureBaseline` was
+      fixed to be safe across repeated calls (a restart no longer
+      duplicates the redirect rules — `knftables`'s `Add()` is
+      idempotent for tables/sets/chains but not rules, which it always
+      appends; fixed with a chain `Flush()` before re-adding, verified
+      both against `knftables.Fake` and live against real nftables
+      bootstrapped twice in a row).
 - [ ] **6. Service health** — Squid/AdGuard/controller readiness gates,
       systemd watchdog + restart limits. **Done and verified 2026-08-29**:
       `common/sdnotify.py` (stdlib-only systemd sd_notify client,
