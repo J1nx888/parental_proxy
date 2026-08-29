@@ -217,6 +217,18 @@ to avoid fighting Orbi's own ARP table for its downstream client
 entries; full duplex is only enabled if testing proves the reverse path
 bypasses the interception box.
 
+**Coexistence with Bark Home during active testing**: Bark Home is
+presumably already ARP-spoofing this same LAN today (the basis for
+believing ARP-spoofing protection is off). Two boxes spoofing the same
+hosts at once will fight over ARP-cache entries with unpredictable
+results, so active spoof tests need one of: pausing Bark Home for the
+test window/devices, or running the initial tests against devices on
+Orbi's guest network (a separate subnet, so no L2 conflict at all —
+though it can't validate satellite-backhaul behavior, since guest
+clients may not traverse the same path as main-LAN ones). Passive
+discovery (packet capture, `ip neigh` reads) has no such conflict and
+can run any time — it doesn't put anything on the wire.
+
 ### New database tables planned
 
 - `device_bindings` — MAC/IPv4 pairs with first/last-seen timestamps,
