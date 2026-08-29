@@ -220,14 +220,16 @@ bypasses the interception box.
 **Coexistence with Bark Home during active testing**: Bark Home is
 presumably already ARP-spoofing this same LAN today (the basis for
 believing ARP-spoofing protection is off). Two boxes spoofing the same
-hosts at once will fight over ARP-cache entries with unpredictable
-results, so active spoof tests need one of: pausing Bark Home for the
-test window/devices, or running the initial tests against devices on
-Orbi's guest network (a separate subnet, so no L2 conflict at all —
-though it can't validate satellite-backhaul behavior, since guest
-clients may not traverse the same path as main-LAN ones). Passive
-discovery (packet capture, `ip neigh` reads) has no such conflict and
-can run any time — it doesn't put anything on the wire.
+hosts at once would fight over ARP-cache entries with unpredictable
+results, so **Bark Home will be paused for the duration of each active
+test window** — confirmed feasible by the project owner. This means
+active tests can run directly against the main LAN (including
+satellite-attached devices) without the guest-network workaround, at
+the cost of the household briefly losing Bark Home's protection during
+each test window (mitigate by testing at low-stakes times, kept short).
+Passive discovery (packet capture, `ip neigh` reads) has no such
+conflict and doesn't require pausing anything — it doesn't put anything
+on the wire.
 
 ### New database tables planned
 
