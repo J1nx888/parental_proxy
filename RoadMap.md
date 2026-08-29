@@ -100,11 +100,13 @@ router.
 - Modem: Netgear Nighthawk CM2050V (modem only, not the routing
   boundary).
 - IPv6: already disabled.
-- ARP-spoofing protection (e.g. Dynamic ARP Inspection): believed
-  absent, inferred from Bark Home already operating successfully on
-  this same LAN. Not yet confirmed by a direct admin-panel check — first
-  thing to verify directly if the interception daemon has trouble
-  holding ARP-cache entries.
+- ARP-spoofing protection (e.g. Dynamic ARP Inspection): **confirmed
+  absent** as of the Milestone 1 passive probe (2026-08-29) — captured
+  neighbor-table data showed Bark Home's own MAC actively answering for
+  both its own IP and the gateway's IP simultaneously, direct evidence
+  of it successfully ARP-spoofing this LAN today. Upgrades the earlier
+  inference (based only on "Bark Home already works") to an observed
+  fact.
 
 ### Chosen architecture
 
