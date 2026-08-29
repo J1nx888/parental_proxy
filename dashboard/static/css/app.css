@@ -251,24 +251,66 @@ input:focus, select:focus, button:focus-visible, a.btn:focus-visible {
 }
 label { font-size: .88rem; color: var(--text-muted); display: inline-flex; align-items: center; gap: .3rem; }
 
-/* ---- Access grid: the Users/Groups/Devices multi-selects ---- */
+/* ---- Access grid: the Users/Groups/Devices picker widgets ---- */
 .access-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(140px, 1fr));
+  grid-template-columns: repeat(3, minmax(150px, 1fr));
   gap: .8rem;
   margin-top: .6rem;
-  max-width: 640px;
+  max-width: 680px;
 }
 .access-label { font-size: .78rem; font-weight: 600; color: var(--text-muted); margin-bottom: .3rem; }
-select[multiple] {
-  width: 100%;
-  min-height: 7.5rem;
-  padding: .3rem;
-}
-select[multiple] option { padding: .3rem .4rem; border-radius: 4px; }
 @media (max-width: 720px) {
   .access-grid { grid-template-columns: 1fr; }
 }
+
+/* ---- Picker: a searchable checkbox/radio list, replaces native
+   <select multiple> everywhere an admin picks one or more
+   users/groups/devices -- no Ctrl/Cmd-click required, just click. ---- */
+.picker {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+.picker-search {
+  width: 100%;
+  border: none !important;
+  border-bottom: 1px solid var(--border) !important;
+  border-radius: 0 !important;
+  padding: .5rem .6rem !important;
+  font-size: .82rem !important;
+  background: var(--surface-alt) !important;
+}
+.picker-search:focus { outline: none !important; }
+.picker-list {
+  max-height: 180px;
+  overflow-y: auto;
+  padding: .3rem;
+  display: flex;
+  flex-direction: column;
+  gap: .05rem;
+}
+.picker-section {
+  font-size: .68rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-muted);
+  padding: .5rem .5rem .2rem;
+}
+.picker-item {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .4rem .5rem;
+  border-radius: 5px;
+  font-size: .85rem;
+  color: var(--text);
+  cursor: pointer;
+}
+.picker-item:hover { background: var(--surface-alt); }
+.picker-item input { margin: 0; flex-shrink: 0; }
+.picker-empty { padding: .5rem; font-size: .82rem; color: var(--text-muted); font-style: italic; }
 
 /* ---- Buttons ---- */
 button, .btn {

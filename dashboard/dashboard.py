@@ -188,25 +188,45 @@ if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
 }
 
-// Instant client-side search for any table on the page: an input tagged
-// data-filter-table="<table id>" hides every <tr> that doesn't contain its
-// typed text (case-insensitive substring, anywhere in the row), without a
-// page reload -- separate from and layered on top of the server-side ?user_id=
+// Instant client-side search, no page reload, two flavors sharing one
+// delegated listener:
+//   data-filter-table="<table id>"  hides non-matching <tr>s (header rows,
+//       identified by containing a <th> since these tables don't use
+//       <thead>, are never hidden) -- used by the Users/Domains/Devices/
+//       Groups list pages.
+//   data-filter-list="<container id>"  hides non-matching direct children
+//       (a "no results" placeholder, tagged .picker-empty, is never
+//       hidden) -- used by the Users/Groups/Devices picker widgets
+//       (ACCESS_SELECTS, the device-assignment picker, the Domains-page
+//       filter picker).
+// Both are separate from and layered on top of the server-side ?user_id=
 // / ?group_id= / ?device_id= filters elsewhere, which narrow what's sent
-// down in the first place. Header rows (identified by containing a <th>,
-// since these tables don't use <thead>) are never hidden.
+// down in the first place.
 document.addEventListener("input", function (event) {
-  var input = event.target.closest("[data-filter-table]");
-  if (!input) return;
-  var table = document.getElementById(input.getAttribute("data-filter-table"));
-  if (!table) return;
-  var term = input.value.trim().toLowerCase();
-  var rows = table.rows;
-  for (var i = 0; i < rows.length; i++) {
-    var row = rows[i];
-    if (row.querySelector("th")) continue;
-    var matches = !term || row.textContent.toLowerCase().indexOf(term) !== -1;
-    row.style.display = matches ? "" : "none";
+  var tableInput = event.target.closest("[data-filter-table]");
+  if (tableInput) {
+    var table = document.getElementById(tableInput.getAttribute("data-filter-table"));
+    if (!table) return;
+    var tableTerm = tableInput.value.trim().toLowerCase();
+    var rows = table.rows;
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (row.querySelector("th")) continue;
+      row.style.display = (!tableTerm || row.textContent.toLowerCase().indexOf(tableTerm) !== -1) ? "" : "none";
+    }
+    return;
+  }
+  var listInput = event.target.closest("[data-filter-list]");
+  if (listInput) {
+    var list = document.getElementById(listInput.getAttribute("data-filter-list"));
+    if (!list) return;
+    var listTerm = listInput.value.trim().toLowerCase();
+    var items = list.children;
+    for (var j = 0; j < items.length; j++) {
+      var item = items[j];
+      if (item.classList.contains("picker-empty")) continue;
+      item.style.display = (!listTerm || item.textContent.toLowerCase().indexOf(listTerm) !== -1) ? "" : "none";
+    }
   }
 });
 </script>
@@ -351,12 +371,18 @@ def index():
 # ==========================================================
 
 USERS_BODY = """
+{% if not cert_banner_dismissed %}
 <div class="cert-banner">
   <strong>Setting up a new device or user?</strong> Each person needs their
   own login (below) configured in the device's proxy settings, and the
   device needs the CA certificate trusted.
   <br><a class="btn add" href="{{ url_for('ca_cert') }}">Download CA certificate</a>
+  <form class="inline" method="post" action="{{ url_for('dismiss_cert_banner') }}">
+    <button class="small" type="submit" style="margin-left:.6rem;">Dismiss</button>
+  </form>
+  <p class="hint" style="margin:.5rem 0 0;">Dismissing moves this permanently to Settings -- it won't come back here.</p>
 </div>
+{% endif %}
 
 <div class="card">
 <h2>Users ({{ users|length }})</h2>
@@ -413,7 +439,19 @@ def users():
             "SELECT COUNT(*) c FROM user_shows WHERE user_id = ?", (u["id"],)
         ).fetchone()["c"]
         out.append({**dict(u), "domain_count": domain_count, "show_count": show_count})
-    return render("users", render_template_string(USERS_BODY, users=out))
+    cert_banner_dismissed = bool(db.get_setting(conn, "cert_banner_dismissed", ""))
+    return render(
+        "users", render_template_string(USERS_BODY, users=out, cert_banner_dismissed=cert_banner_dismissed)
+    )
+
+
+@app.route("/users/dismiss-cert-banner", methods=["POST"])
+@require_admin
+def dismiss_cert_banner():
+    conn = get_db()
+    db.set_setting(conn, "cert_banner_dismissed", "1")
+    conn.commit()
+    return flash_redirect("users", "Dismissed -- find the CA certificate under Settings from now on.")
 
 
 @app.route("/users/add", methods=["POST"])
@@ -631,54 +669,99 @@ ACCESS_SELECTS = """
   <div class="access-grid">
     <div>
       <div class="access-label">Users</div>
-      <select name="user_ids" multiple size="5">
-        {% for u in all_users %}
-        <option value="{{ u.id }}" {{ 'selected' if u.id in preselected_user_ids }}>{{ u.display_name }}</option>
-        {% endfor %}
-      </select>
+      <div class="picker">
+        <input type="search" class="picker-search" data-filter-list="usersPicker" placeholder="Search users&hellip;">
+        <div class="picker-list" id="usersPicker">
+          {% for u in all_users %}
+          <label class="picker-item"><input type="checkbox" name="user_ids" value="{{ u.id }}" {{ 'checked' if u.id in preselected_user_ids }}> {{ u.display_name }}</label>
+          {% else %}
+          <div class="picker-empty">No users yet.</div>
+          {% endfor %}
+        </div>
+      </div>
     </div>
     <div>
       <div class="access-label">Groups</div>
-      <select name="group_ids" multiple size="5">
-        {% for g in all_groups %}
-        <option value="{{ g.id }}" {{ 'selected' if g.id in preselected_group_ids }}>{{ g.name }}</option>
-        {% endfor %}
-      </select>
+      <div class="picker">
+        <input type="search" class="picker-search" data-filter-list="groupsPicker" placeholder="Search groups&hellip;">
+        <div class="picker-list" id="groupsPicker">
+          {% for g in all_groups %}
+          <label class="picker-item"><input type="checkbox" name="group_ids" value="{{ g.id }}" {{ 'checked' if g.id in preselected_group_ids }}> {{ g.name }}</label>
+          {% else %}
+          <div class="picker-empty">No groups yet.</div>
+          {% endfor %}
+        </div>
+      </div>
     </div>
     <div>
       <div class="access-label">Devices</div>
-      <select name="device_ids" multiple size="5">
-        {% for dev in all_devices %}
-        <option value="{{ dev.id }}" {{ 'selected' if dev.id in preselected_device_ids }}>{{ dev.label or dev.mac_address }}</option>
-        {% endfor %}
-      </select>
+      <div class="picker">
+        <input type="search" class="picker-search" data-filter-list="devicesPicker" placeholder="Search devices&hellip;">
+        <div class="picker-list" id="devicesPicker">
+          {% for dev in all_devices %}
+          <label class="picker-item"><input type="checkbox" name="device_ids" value="{{ dev.id }}" {{ 'checked' if dev.id in preselected_device_ids }}> {{ dev.label or dev.mac_address }}</label>
+          {% else %}
+          <div class="picker-empty">No devices yet.</div>
+          {% endfor %}
+        </div>
+      </div>
     </div>
   </div>
+  <p class="hint" style="margin-top:.5rem;">Click any number of users, groups, and/or devices -- no Ctrl/Cmd needed. Type in a box to search it.</p>
 """
 
 
 DOMAINS_BODY = """
 <div class="card">
-<h2>Domains ({{ domains|length }})</h2>
-{% if filtered_user %}
+<h2>Filter</h2>
+<form method="get" action="{{ url_for('domains') }}">
+  <div class="picker" style="max-width:340px;">
+    <input type="search" class="picker-search" data-filter-list="domainFilterPicker" placeholder="Search&hellip;">
+    <div class="picker-list" id="domainFilterPicker">
+      <label class="picker-item">
+        <input type="radio" name="target" value="" {{ 'checked' if not current_filter_target }} onchange="this.form.submit()"> All domains
+      </label>
+      {% if all_users %}
+      <div class="picker-section">Kid</div>
+      {% for u in all_users %}
+      <label class="picker-item">
+        <input type="radio" name="target" value="user:{{ u.id }}" {{ 'checked' if current_filter_target==('user:' ~ u.id) }} onchange="this.form.submit()"> {{ u.display_name }}
+      </label>
+      {% endfor %}
+      {% endif %}
+      {% if all_groups %}
+      <div class="picker-section">Group</div>
+      {% for g in all_groups %}
+      <label class="picker-item">
+        <input type="radio" name="target" value="group:{{ g.id }}" {{ 'checked' if current_filter_target==('group:' ~ g.id) }} onchange="this.form.submit()"> {{ g.name }}
+      </label>
+      {% endfor %}
+      {% endif %}
+      {% if all_devices %}
+      <div class="picker-section">Device</div>
+      {% for dev in all_devices %}
+      <label class="picker-item">
+        <input type="radio" name="target" value="device:{{ dev.id }}" {{ 'checked' if current_filter_target==('device:' ~ dev.id) }} onchange="this.form.submit()"> {{ dev.label or dev.mac_address }}
+      </label>
+      {% endfor %}
+      {% endif %}
+    </div>
+  </div>
+  <noscript><button class="add" type="submit" style="margin-top:.5rem;">Apply</button></noscript>
+</form>
+{% if filtered_user or filtered_group or filtered_device %}
 <p class="hint">
-  Showing domains assigned to <strong>{{ filtered_user.display_name }}</strong>
-  (plus everyone's global domains) --
-  <a href="{{ url_for('domains') }}">clear filter</a>
-</p>
-{% elif filtered_group %}
-<p class="hint">
-  Showing domains assigned to the <strong>{{ filtered_group.name }}</strong> group
-  (plus everyone's global domains) --
-  <a href="{{ url_for('domains') }}">clear filter</a>
-</p>
-{% elif filtered_device %}
-<p class="hint">
-  Showing domains assigned to <strong>{{ filtered_device.label or filtered_device.mac_address }}</strong>
-  (plus everyone's global domains) --
-  <a href="{{ url_for('domains') }}">clear filter</a>
+  Showing domains assigned to
+  {% if filtered_user %}<strong>{{ filtered_user.display_name }}</strong>
+  {% elif filtered_group %}the <strong>{{ filtered_group.name }}</strong> group
+  {% else %}<strong>{{ filtered_device.label or filtered_device.mac_address }}</strong>{% endif %}
+  (plus everyone's global domains) -- <a href="{{ url_for('domains') }}">clear filter</a>
 </p>
 {% endif %}
+</div>
+
+<div class="card">
+<h2>Domains ({{ domains|length }})</h2>
 <p class="hint">
   <span class="badge mode-splice">splice</span> host-only, never decrypted &nbsp;
   <span class="badge mode-bump">bump</span> fully decrypted, path/show rules apply &nbsp;
@@ -726,9 +809,8 @@ DOMAINS_BODY = """
 """ + ACCESS_SELECTS + """
 </form>
 <p class="hint">
-  "Everyone" is for shared infrastructure (fonts, auth providers, CDNs). Otherwise pick any
-  combination of specific users, groups, and/or devices -- hold Ctrl/Cmd (or Shift for a range)
-  to select more than one in a list. You can adjust all of this later from the domain's Manage page.
+  "Everyone" is for shared infrastructure (fonts, auth providers, CDNs). You can adjust any of
+  this later from the domain's Manage page.
 </p>
 </div>
 
@@ -746,15 +828,37 @@ DOMAINS_BODY = """
 """
 
 
+def _parse_filter_target(raw: str) -> dict:
+    """Decodes the Domains page's single combined filter picker (radio
+    value like 'user:5', matching the same encoding as the device
+    assignment picker) into the user_id/group_id/device_id shape
+    _get_filtered_target already understands -- one control instead of
+    three separate dropdowns that could disagree with each other."""
+    if raw.startswith("user:"):
+        return {"user_id": raw[len("user:"):]}
+    if raw.startswith("group:"):
+        return {"group_id": raw[len("group:"):]}
+    if raw.startswith("device:"):
+        return {"device_id": raw[len("device:"):]}
+    return {}
+
+
 def _get_filtered_target(conn, args_or_form):
-    """Resolves the ?user_id= / ?group_id= / ?device_id= filter (Domains
-    page) or the equivalent hidden form fields (add/delete actions taken
-    from a filtered view) to at most one of (filtered_user, filtered_group,
-    filtered_device, error_message). user_id wins if more than one is
-    somehow present."""
-    user_id = args_or_form.get("user_id", "")
-    group_id = args_or_form.get("group_id", "")
-    device_id = args_or_form.get("device_id", "")
+    """Resolves the Domains page's filter -- either the combined ?target=
+    picker or the older individual ?user_id= / ?group_id= / ?device_id=
+    params (still used by "N assigned" / "Manage domains" / "Domains"
+    links elsewhere) or the equivalent hidden form fields (add/delete
+    actions taken from a filtered view) -- to at most one of
+    (filtered_user, filtered_group, filtered_device, error_message).
+    ?target=, when present, takes priority over the individual params."""
+    target = args_or_form.get("target", "")
+    if target:
+        decoded = _parse_filter_target(target)
+        user_id, group_id, device_id = decoded.get("user_id", ""), decoded.get("group_id", ""), decoded.get("device_id", "")
+    else:
+        user_id = args_or_form.get("user_id", "")
+        group_id = args_or_form.get("group_id", "")
+        device_id = args_or_form.get("device_id", "")
     if user_id:
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         return (row, None, None, None) if row else (None, None, None, "That user no longer exists.")
@@ -792,12 +896,20 @@ def domains():
     all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
     all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
     all_devices = conn.execute("SELECT * FROM devices ORDER BY COALESCE(label, mac_address)").fetchall()
+    if filtered_user:
+        current_filter_target = f"user:{filtered_user['id']}"
+    elif filtered_group:
+        current_filter_target = f"group:{filtered_group['id']}"
+    elif filtered_device:
+        current_filter_target = f"device:{filtered_device['id']}"
+    else:
+        current_filter_target = ""
     return render(
         "domains",
         render_template_string(
             DOMAINS_BODY, domains=rows, filtered_user=filtered_user, filtered_group=filtered_group,
             filtered_device=filtered_device, all_users=all_users, all_groups=all_groups, all_devices=all_devices,
-            is_global_checked=False,
+            current_filter_target=current_filter_target, is_global_checked=False,
             preselected_user_ids={filtered_user["id"]} if filtered_user else set(),
             preselected_group_ids={filtered_group["id"]} if filtered_group else set(),
             preselected_device_ids={filtered_device["id"]} if filtered_device else set(),
@@ -995,11 +1107,10 @@ DOMAIN_DETAIL_BODY = """
   <button class="add" type="submit" style="margin-top:.8rem;">Save access</button>
 </form>
 <p class="hint">
-  Pick any combination of specific users, groups, and/or devices -- hold Ctrl/Cmd (or Shift for a
-  range) to select more than one in a list. Saving replaces the current assignment with exactly
-  what's selected, so removing access is the same action as granting it: just change the selection.
-  "Everyone" grants it regardless of the lists below, but they're still saved underneath it, so
-  turning "Everyone" back off later doesn't lose them.
+  Saving replaces the current assignment with exactly what's checked, so removing access is the
+  same action as granting it: just uncheck it and save. "Everyone" grants it regardless of what's
+  checked below, but those are still saved underneath it, so turning "Everyone" back off later
+  doesn't lose them.
 </p>
 </div>
 
@@ -1201,24 +1312,26 @@ def _parse_device_assignment(raw: str) -> tuple[int | None, int | None, int]:
 # dropdown pair to keep in sync (this app doesn't use JS to show/hide
 # fields based on another field's value).
 DEVICE_ASSIGNMENT_SELECT = """
-  <select name="assignment">
-    <option value="" {{ 'selected' if current=='' }}>Unassigned</option>
-    <option value="ignored" {{ 'selected' if current=='ignored' }}>Ignore (never filtered)</option>
-    {% if all_users %}
-    <optgroup label="Kid">
+  <div class="access-label">Assign to</div>
+  <div class="picker" style="max-width:320px;">
+    <input type="search" class="picker-search" data-filter-list="assignmentPicker" placeholder="Search&hellip;">
+    <div class="picker-list" id="assignmentPicker">
+      <label class="picker-item"><input type="radio" name="assignment" value="" {{ 'checked' if current=='' }}> Unassigned</label>
+      <label class="picker-item"><input type="radio" name="assignment" value="ignored" {{ 'checked' if current=='ignored' }}> Ignore (never filtered)</label>
+      {% if all_users %}
+      <div class="picker-section">Kid</div>
       {% for u in all_users %}
-      <option value="user:{{ u.id }}" {{ 'selected' if current==('user:' ~ u.id) }}>{{ u.display_name }}</option>
+      <label class="picker-item"><input type="radio" name="assignment" value="user:{{ u.id }}" {{ 'checked' if current==('user:' ~ u.id) }}> {{ u.display_name }}</label>
       {% endfor %}
-    </optgroup>
-    {% endif %}
-    {% if all_groups %}
-    <optgroup label="Group">
+      {% endif %}
+      {% if all_groups %}
+      <div class="picker-section">Group</div>
       {% for g in all_groups %}
-      <option value="group:{{ g.id }}" {{ 'selected' if current==('group:' ~ g.id) }}>{{ g.name }}</option>
+      <label class="picker-item"><input type="radio" name="assignment" value="group:{{ g.id }}" {{ 'checked' if current==('group:' ~ g.id) }}> {{ g.name }}</label>
       {% endfor %}
-    </optgroup>
-    {% endif %}
-  </select>
+      {% endif %}
+    </div>
+  </div>
 """
 
 
@@ -1867,6 +1980,12 @@ def dismiss_request():
 # ==========================================================
 
 SETTINGS_BODY = """
+<div class="card">
+<h2>CA certificate</h2>
+<p class="hint">Every device needs this certificate trusted to use bump-mode filtering (Crunchyroll, or any other domain switched to bump mode) -- same certificate for every device, no per-user certs.</p>
+<a class="btn add" href="{{ url_for('ca_cert') }}">Download CA certificate</a>
+</div>
+
 <div class="card">
 <h2>Local network</h2>
 <form class="add-form" method="post" action="{{ url_for('update_local_network') }}">

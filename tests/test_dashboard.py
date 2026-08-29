@@ -1525,3 +1525,101 @@ def test_cleanup_stale_devices_requires_threshold_set_first(client, db_conn):
 def test_cleanup_stale_devices_requires_admin_auth(client):
     resp = client.post("/devices/cleanup")
     assert resp.status_code == 401
+
+
+# ============================================================
+# CA certificate banner: shown on Users until dismissed, always on Settings
+# ============================================================
+
+def test_cert_banner_shown_on_users_by_default(client):
+    resp = client.get("/users", headers=_auth_header())
+    assert b"Setting up a new device or user?" in resp.data
+
+
+def test_cert_banner_hidden_after_dismiss(client, db_conn):
+    resp = client.post("/users/dismiss-cert-banner", headers=_auth_header())
+    assert resp.status_code == 302
+
+    resp = client.get("/users", headers=_auth_header())
+    assert b"Setting up a new device or user?" not in resp.data
+
+
+def test_cert_banner_dismiss_requires_admin_auth(client):
+    resp = client.post("/users/dismiss-cert-banner")
+    assert resp.status_code == 401
+
+
+def test_settings_always_has_ca_certificate_section(client, db_conn):
+    resp = client.get("/settings", headers=_auth_header())
+    assert b"CA certificate" in resp.data
+    assert b'href="/ca-cert"' in resp.data
+
+    client.post("/users/dismiss-cert-banner", headers=_auth_header())
+    resp = client.get("/settings", headers=_auth_header())
+    assert b"CA certificate" in resp.data
+
+
+# ============================================================
+# Domains page: combined ?target= filter picker
+# ============================================================
+
+def test_domains_target_filter_for_user(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    client.post("/domains/add", data={"pattern": r"kid1only\.example", "mode": "splice"}, headers=_auth_header())
+    client.post("/domains/add", data={"pattern": r"other\.example", "mode": "splice"}, headers=_auth_header())
+    domain_id = db_conn.execute("SELECT id FROM domains WHERE pattern = ?", (r"kid1only\.example",)).fetchone()[0]
+    client.post(
+        "/domains/access", data={"domain_id": domain_id, "user_ids": [str(user_id)]}, headers=_auth_header()
+    )
+
+    resp = client.get(f"/domains?target=user:{user_id}", headers=_auth_header())
+    assert b"kid1only" in resp.data
+    assert b"other\\.example" not in resp.data
+
+
+def test_domains_target_filter_reflects_selection_in_picker(client, db_conn):
+    client.post("/groups/add", data={"name": "TVs"}, headers=_auth_header())
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()[0]
+    resp = client.get(f"/domains?target=group:{group_id}", headers=_auth_header())
+    assert resp.status_code == 200
+    import re
+    match = re.search(rb'value="group:%d"[^>]*' % group_id, resp.data)
+    assert match is not None
+    assert b"checked" in match.group(0)
+
+
+def test_domains_target_filter_invalid_falls_back_to_all(client, db_conn):
+    resp = client.get("/domains?target=user:999999", headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_domains_target_takes_priority_over_individual_params(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    client.post("/groups/add", data={"name": "TVs"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()[0]
+
+    resp = client.get(f"/domains?target=group:{group_id}&user_id={user_id}", headers=_auth_header())
+    assert resp.status_code == 200
+    assert f"TVs".encode() in resp.data
+
+
+# ============================================================
+# Picker widgets render checkboxes/radios, not native multi-selects
+# ============================================================
+
+def test_add_domain_form_uses_checkbox_pickers_not_multiselect(client):
+    resp = client.get("/domains", headers=_auth_header())
+    # The mode dropdown (splice/bump/trusted) is still a plain <select>;
+    # what's gone is the old <select multiple> for users/groups/devices.
+    assert b"multiple" not in resp.data.lower()
+    assert b'data-filter-list="usersPicker"' in resp.data
+    assert b'data-filter-list="groupsPicker"' in resp.data
+    assert b'data-filter-list="devicesPicker"' in resp.data
+
+
+def test_device_assignment_uses_radio_picker(client):
+    resp = client.get("/devices", headers=_auth_header())
+    assert b'data-filter-list="assignmentPicker"' in resp.data
+    assert b'name="assignment" value="ignored"' in resp.data
