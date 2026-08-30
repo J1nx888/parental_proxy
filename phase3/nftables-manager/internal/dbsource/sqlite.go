@@ -30,6 +30,18 @@ type desiredPolicyWire struct {
 	Unauthenticated []string `json:"unauthenticated"`
 	Bypass          []string `json:"bypass"`
 	Quarantine      []string `json:"quarantine"`
+
+	// Bump: added 2026-08-30 alongside policy.DesiredPolicy.Bump /
+	// policy.SetBump for the "two independent axes" architecture. This
+	// struct's fields are what actually gets populated from the JSON --
+	// missing this one meant ReadDesiredPolicy silently returned an
+	// empty Bump list on every cycle regardless of what
+	// controller/policy_state.py had written, so pp-nftables-manager
+	// would never actually redirect any device to Squid no matter how
+	// many devices had bump_enabled set. Found by inspection while
+	// preparing a live-Squid verification pass, before that pass ever
+	// ran -- see RoadMap.md.
+	Bump []string `json:"bump"`
 }
 
 // ReadDesiredPolicy opens dbPath read-only and reads the current
@@ -69,6 +81,7 @@ func ReadDesiredPolicy(dbPath string) (policy.DesiredPolicy, error) {
 		Unauthenticated: wire.Unauthenticated,
 		Bypass:          wire.Bypass,
 		Quarantine:      wire.Quarantine,
+		Bump:            wire.Bump,
 	}, nil
 }
 
