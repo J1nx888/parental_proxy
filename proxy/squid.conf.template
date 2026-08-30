@@ -18,6 +18,17 @@
 # fundamentally incompatible with NAT-redirected traffic anyway, since
 # intercepted connections never send a CONNECT for HTTPS in the first place.
 
+# Loopback-only, deliberately NOT intercept: an intercept-only Squid (no
+# conventional forward-proxy http_port at all) has no "normal" address to
+# build its own internal URLs from (used for built-in icons, e.g. FTP
+# directory listings) -- it computes host:0 and FATALs at startup with
+# "mimeLoadIcon: cannot parse internal URL", before ever opening the real
+# intercept ports below. Confirmed live 2026-08-30, the first time this
+# config was ever booted against a real Squid binary. Nothing routes real
+# traffic here; it exists purely so that URL construction has somewhere
+# valid to point at.
+http_port 127.0.0.1:3128
+
 http_port 3129 intercept
 
 https_port 3130 intercept ssl-bump generate-host-certificates=on \
