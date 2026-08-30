@@ -227,11 +227,72 @@ source is still a placeholder pending Milestone 4.
 
 ---
 
-## 5. nftables skeleton (four policy classes from `RoadMap.md`)
+## 5. nftables skeleton (four auth-state policy classes + one orthogonal bump flag)
 
 Illustrative `nft` syntax for what the nftables-manager (via `knftables`)
 would maintain — a dedicated table, so nothing here interferes with any
-other firewall rules on the box:
+other firewall rules on the box.
+
+**Update 2026-08-30 — corrected, replaces the original skeleton below**:
+the original version redirected *every* `authenticated_v4` device's
+HTTP/HTTPS to Squid, which turned out to be wrong — most devices (a
+Smart TV, a kid's everyday device) should get DNS-tier protection only,
+never Squid. Squid access is a separate, admin-chosen, per-device
+opt-in (`devices.bump_enabled`), independent of authentication state —
+a device can be simultaneously `authenticated_v4` (for DNS) and
+`bump_v4` (for Squid), or `authenticated_v4` alone. `bump_v4` is a
+**fifth, orthogonal set**, not a fifth mutually-exclusive policy class
+— nftables can't be selective by domain within it (no SNI visibility
+below TLS), so a `bump_v4` device gets *all* its port 80/443 traffic
+redirected, with Squid's own SNI-based logic (unchanged) narrowing that
+down to only the domains that actually need refinement. See
+`RoadMap.md`'s "Authentication and bump-tier" section for the full
+reasoning and the "Squid: explicit-proxy-with-login → transparent
+intercept" section for why Squid's own config needs to change to
+receive this traffic without a login at all.
+
+```
+table inet parental_proxy {
+    set authenticated_v4   { type ipv4_addr; flags interval; }
+    set unauthenticated_v4 { type ipv4_addr; flags interval; }
+    set bypass_v4          { type ipv4_addr; flags interval; }
+    set quarantine_v4      { type ipv4_addr; flags interval; }
+    set bump_v4            { type ipv4_addr; flags interval; }  # orthogonal -- overlaps authenticated_v4
+
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+
+        ip saddr @bypass_v4 return
+
+        ip saddr @authenticated_v4 udp dport 53  redirect to :5353   # -> AdGuard Home
+        ip saddr @authenticated_v4 tcp dport 53  redirect to :5353
+
+        # Independent of the auth-state rules above -- a device only
+        # reaches here if bump_enabled=1 (computed alongside, not
+        # instead of, its authenticated_v4 membership).
+        ip saddr @bump_v4 tcp dport 80  redirect to :3129   # -> Squid, HTTP (intercept mode)
+        ip saddr @bump_v4 tcp dport 443 redirect to :3130   # -> Squid, HTTPS (intercept + ssl-bump)
+
+        ip saddr @unauthenticated_v4 udp dport 53 redirect to :5353  # still gets DNS
+        ip saddr @unauthenticated_v4 tcp dport 80 redirect to :3131  # -> future portal
+        # unauthenticated_v4 HTTPS: deliberately not redirected yet --
+        # this is the "deliberate pre-auth policy" RoadMap.md flags as
+        # still an open call for Phase 4, not decided here.
+
+        ip saddr @quarantine_v4 counter drop
+    }
+}
+```
+
+The hard-deny invariant for `mode='bump'` domains on a device that
+*isn't* in `bump_v4` (e.g. a kid trying Crunchyroll on a DNS-only
+device) can't be enforced here — nftables has no domain visibility.
+That has to happen at AdGuard (block the domain outright for that
+device) or, as a backstop, Squid itself if the connection somehow still
+arrives there. See RoadMap.md's changes-needed checklist.
+
+**Below is the original (2026-08-29) skeleton, before the above
+correction — kept for history, not current:**
 
 ```
 table inet parental_proxy {
@@ -283,6 +344,18 @@ as one atomic transaction, and the worker's target list is **not**
 affected by any of this (every enrolled device stays in the worker's
 target list regardless of which set it's in — spoofing scope and policy
 scope are different axes, per `RoadMap.md`).
+
+**Note on the live end-to-end tests already run (2026-08-30)**: both
+the Milestone 7 live auth-toggle proof and the full three-component
+pipeline test (RoadMap.md's "core architectural claim" section) were
+run against the **original, now-superseded** skeleton above (blanket
+`authenticated_v4` → Squid redirect), before the `bump_v4` correction
+existed. The underlying mechanisms those tests proved — real ARP
+poisoning, real atomic nftables reconciliation, real live policy
+toggling reaching real traffic — all still hold; what changes is only
+*which* set the HTTP/HTTPS redirect rules attach to. Re-verifying
+specifically against `bump_v4` once it's implemented is still
+worthwhile, not assumed to carry over automatically.
 
 ---
 

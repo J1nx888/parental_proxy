@@ -173,19 +173,184 @@ pentest/red-team tool). If used at all, it stays stripped down (only
 localhost) behind a swappable adapter interface, so it's never something
 the system actually depends on.
 
-### `devices.is_authenticated` semantics
+### Authentication and bump-tier: two independent axes (locked 2026-08-30)
 
-This flag does **not** control whether a device is ARP-spoofed — every
-in-scope device stays intercepted regardless. It only selects policy
-once intercepted:
+Neither flag below controls whether a device is ARP-spoofed — every
+in-scope device stays intercepted regardless (that's still governed
+purely by `ignored`, per `controller/desired_state.py`). What they
+control is what happens to that device's traffic once intercepted, and
+they are **two separate, orthogonal decisions**, not one:
 
-- `authenticated_v4` — normal Squid/AdGuard policy.
-- `unauthenticated_v4` — DNS to AdGuard, HTTP redirected to the future
-  Phase 4 login portal, HTTPS handled by a deliberate pre-auth policy.
+**Axis 1 — `devices.is_authenticated`** (the captive-portal gate, Phase
+4): every device defaults to gated behind the portal until a person
+logs in with their own account, or an admin bypasses/pre-registers it.
+Once authenticated, DNS-tier protection (AdGuard) applies — the same
+baseline coverage Bark Home provides today, on any device, zero
+per-device config. This alone is the ceiling for most devices (the
+Smart TV, most kids' primary devices): DNS-tier is *all* they ever get,
+by design, not a lesser/temporary state.
+
+- `authenticated_v4` — DNS redirected to AdGuard, normal domain/category
+  policy.
+- `unauthenticated_v4` — DNS to AdGuard, HTTP redirected to the login
+  portal, HTTPS handled by a deliberate pre-auth policy (still open,
+  see Phase 4 below).
 - `bypass_v4` — infrastructure that must never be touched: Orbi nodes,
-  the interception box itself, manually-exempted devices.
+  the interception box itself, manually-exempted devices. Same set
+  `ignored` devices map to in the ARP-scope decision, per
+  `controller/desired_state.py`'s own note.
 - `quarantine_v4` — an optional, explicitly operator-triggered isolation
   state.
+
+**Axis 2 — `devices.bump_enabled`** (already existed from Phase 2, now
+given a real mechanism): a separate, admin-only, per-device choice —
+"this specific device also gets Squid-level refinement" — layered *on
+top of* an already-authenticated device, never a substitute for
+authentication. This is the mechanism that replaces the household's
+current fragile "use Firefox for Crunchyroll, Chrome for everything
+else" split with something that works transparently on any app on that
+device, no per-app configuration.
+
+- A device with `bump_enabled = 0` (the common case): its port 80/443
+  traffic is never touched by this layer at all — DNS-tier is its
+  entire filtering story.
+- A device with `bump_enabled = 1`: **all** of its port 80/443 traffic
+  additionally gets redirected to Squid (nftables can't be selective by
+  domain — it can't see hostnames below the TLS layer at all — so this
+  redirect is all-or-nothing per device; Squid's own existing SNI-based
+  splice/bump decision, unchanged, is what actually narrows this down
+  to only the specific domains that need refinement, splicing
+  everything else through essentially untouched). The device needs the
+  CA certificate trusted once — see the Squid architecture change
+  below — no proxy host/port setting anywhere, on any browser or app.
+
+**The hard-deny invariant this session settled on**: a domain marked
+`domains.mode = 'bump'` (Crunchyroll today) must never be reachable via
+plain unrefined DNS-tier access — it's either properly refined through
+Squid, or denied outright with a friendly "ask a parent" page, never a
+silent fallback to unfiltered access. Concretely, for a device with
+`bump_enabled = 0`, AdGuard itself needs to block `mode='bump'` domains
+outright (not just decline to add refinement) — see the AdGuard
+integration item in the changes-needed list below, since that
+integration doesn't exist in this repo yet.
+
+Nftables consequence: the four sets above stay mutually exclusive
+(a device is in exactly one) and continue to drive DNS redirection.
+`bump_enabled` needs a **fifth, independent** set (`bump_v4`) that a
+device can belong to *simultaneously* with being in `authenticated_v4`
+— it is not a fifth mutually-exclusive policy class, it's an add-on
+flag. The nftables skeleton and `internal/policy`'s `ResolveConflicts`
+(Milestone 5) need correcting for this — see the changes-needed list.
+
+### Squid: explicit-proxy-with-login → transparent intercept (locked 2026-08-30)
+
+**Decision: fully replace, not supplement, today's explicit-proxy +
+per-login model for bump-enabled devices.** Today's `proxy/squid.conf.template`
+requires a client to be manually pointed at Squid's address (explicit
+proxy config) and challenges every request with per-login HTTP Basic
+Auth (`proxy_auth`). Neither survives contact with transparent
+interception: a NAT-redirected connection has no `CONNECT` handshake,
+so there's no way for a client to answer a 407 challenge, and there's
+no proxy address to configure in the first place — the whole point is
+that no app or browser needs any proxy setting at all.
+
+The replacement is Squid's own **intercept mode** — a standard,
+documented feature for exactly this scenario, not something exotic:
+
+- `http_port 3129 intercept` and `https_port 3130 intercept ssl-bump
+  ...` replace `http_port 3128 ssl-bump ...`. Squid recovers the real
+  destination from the NAT-redirected socket itself
+  (`SO_ORIGINAL_DST`) and applies the *same* `ssl_bump peek/splice/bump`
+  SNI logic already in the config today — nothing about the per-domain
+  decision chain changes, only how the connection arrives.
+- **Identity shifts from login to device.** `auth_param basic ...`,
+  `acl authenticated proxy_auth REQUIRED`, and `http_access deny
+  !authenticated` all go away — there's no login to check anymore. The
+  replacement: the client's source IP (`%>a`) resolved through
+  `device_bindings` → `devices.user_id` tells Squid which kid this is,
+  the same identity data the DNS tier already relies on, just reused
+  here instead of a credential prompt. Arguably better UX too — no more
+  entering a password into a browser's proxy dialog.
+- **The `ssl_bump` catch-all flips from deny to pass-through.** Today's
+  `ssl_bump terminate step2 all` is correct only because Squid is
+  currently the *sole* filter — nothing else decides "is this domain
+  allowed at all." Once AdGuard becomes the authoritative domain-level
+  gate (any domain that resolves at all already passed a real check),
+  Squid's remaining job narrows to "does this specific domain need
+  *extra* refinement" — everything it doesn't recognize should splice
+  through by default, not terminate.
+- The one thing that does **not** change: the CA certificate still
+  needs to be trusted on a bump-enabled device for SSL-Bump to work
+  without certificate warnings — same manual step as today, just the
+  only one left.
+
+This is a locked architecture decision, not yet implemented — see the
+changes-needed checklist immediately below for the concrete work.
+
+### Changes needed to implement this (not yet started)
+
+Schema: no new columns needed — `devices.is_authenticated` and
+`devices.bump_enabled` already exist from Phase 2. What's missing is
+entirely in the policy-computation and enforcement layers:
+
+- [ ] **`common/policy_class.py`** — `bump_enabled` needs to become a
+      second, independent signal alongside `PolicyClass`, not folded
+      into the same mutually-exclusive enum. A device's *desired
+      policy* is really `(PolicyClass, bump_eligible: bool)`, where
+      `bump_eligible` is only ever true when `PolicyClass ==
+      AUTHENTICATED` and `bump_enabled = 1` and the device isn't
+      ignored.
+- [ ] **`controller/policy_state.py`** — `compute_desired_policy()`
+      needs to also emit a `bump` key (IPs where `bump_eligible` is
+      true) alongside today's four auth-state keys, computed
+      independently — a device's IP can appear in both
+      `authenticated` and `bump` at once.
+- [ ] **`phase3/nftables-manager/internal/policy`** — add a `Bump
+      []string` field to `DesiredPolicy`/`ActualPolicy`. It must be
+      handled independently of `AllSetNames`'s mutual-exclusivity
+      logic in `ResolveConflicts` — a device belonging to both
+      `authenticated_v4` and `bump_v4` simultaneously is correct, not
+      a conflict to resolve.
+- [ ] **`phase3/nftables-manager/internal/nft/knftables_adapter.go`**
+      — `EnsureBaseline`'s `baselineRules`: remove the blanket `ip
+      saddr @authenticated_v4 tcp dport 80/443 redirect to :3129/:3130`
+      rules; add a new `bump_v4` set and its own independent `tcp
+      dport 80/443 redirect` rules, ordered so it composes with (not
+      instead of) the DNS rules `authenticated_v4` still needs.
+- [ ] **`proxy/squid.conf.template`** — replace the explicit
+      `http_port 3128 ssl-bump` + `proxy_auth` block with
+      `http_port 3129 intercept` / `https_port 3130 intercept
+      ssl-bump ...`; remove the `auth_param`/`acl authenticated`/
+      `http_access deny !authenticated` lines; flip the `ssl_bump
+      terminate step2 all` catch-all to `splice`. Whether
+      `sni_trusted_check`/`sni_splice_check`/`sni_block_page_check`
+      still each pull their own weight once AdGuard is the domain-level
+      gate needs a closer look at that point, not assumed here.
+- [ ] **`proxy/sni_helper.py` / `proxy/authz_helper.py`** — both
+      currently take `%LOGIN` as their user-identity input; need a
+      shared device-identity resolver (source IP → `device_bindings` →
+      `devices.user_id`) as the replacement, used by both.
+- [ ] **AdGuard Home integration — not started at all yet** (this repo
+      has designed *for* AdGuard, never actually integrated it). When
+      built, it needs a per-client rule set that blocks every
+      `domains.mode = 'bump'` domain outright for devices where
+      `bump_enabled = 0`, and allows normal resolution for
+      `bump_enabled = 1` devices — this is what makes the hard-deny
+      invariant above real. Needs a friendly landing page for the
+      blocked case, mirroring the existing `/blocked` page pattern.
+- [ ] **Captive portal (Phase 4) — not started**, but now has concrete
+      shape from this session's discussion: gate any newly-seen MAC
+      not already registered as bypass/ignore; a kid-facing login that
+      grants `is_authenticated` (DNS-tier) only, never `bump_enabled`;
+      an admin-facing quick-add path at first sight of a new device
+      (add to bypass, assign to a group, or full dashboard access from
+      another device); and a reminder screen for an account that's
+      meant to have both DNS and Squid but hasn't had the one-time CA
+      cert install done yet. Recommendation, not yet confirmed: an
+      admin should only flip `bump_enabled` *after* confirming the CA
+      cert is actually installed, so there's no window where a device
+      is bump-enabled but showing confusing certificate warnings
+      instead of a clean "ask a parent" experience.
 
 ### The core architectural claim, verified live end-to-end (2026-08-30)
 
@@ -570,12 +735,37 @@ without manual registration, and defeating MAC-randomization as an
 identity-evasion trick as a side effect (any unrecognized identity,
 randomized or not, just triggers another login).
 
+**Concrete flow, worked out 2026-08-30 (still a design, no code yet):**
+
+- A newly-seen MAC is gated behind the portal by default, **unless**
+  it's already registered as bypass/ignore or assigned to a device
+  group ahead of time (e.g. a smart TV or IoT device an admin never
+  wants interrupted at all).
+- **Kid-facing path**: logging in with a personal account grants
+  `is_authenticated` (DNS-tier protection) for that device, and nothing
+  else — never `bump_enabled`. If that kid's usual device set is known
+  to include a Squid-enabled one and this is a new/different device,
+  show a reminder that Squid-level access needs a parent's help to set
+  up (CA cert), rather than silently granting or silently failing.
+- **Admin-facing path**, available at the same portal screen (or from
+  a separate device with real dashboard access) for a device an admin
+  is physically present for: add it straight to the bypass list, or
+  assign it to a device group with its own DNS-tier rules — skipping
+  the login flow entirely for devices that will never have their own
+  user (the thermostat, a shared family device).
+- See the "Authentication and bump-tier" section above for how this
+  interacts with `bump_enabled` — the portal only ever touches
+  `is_authenticated`; enabling Squid for a specific device is a
+  separate, deliberate admin action taken afterward, once the CA cert
+  is actually installed.
+
 Open questions not yet resolved: the session/token design for
 "authorized" state at the network layer (MAC is unreliable, raw IP
 alone isn't perfectly stable either); login-frequency tuning depending
 on how aggressively a given OS rotates its MAC address; a MAC allowlist
 for non-interactive devices (smart TVs, voice assistants) that can't
-complete a login flow.
+complete a login flow; the exact UI for the admin quick-add path
+described above.
 
 ## Phase 5 — YouTube channel/creator-level filtering (assessed, not started)
 
