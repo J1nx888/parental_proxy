@@ -112,6 +112,52 @@ if [ ! -f "$CONF" ]; then
   exit 1
 fi
 
+# Ad/tracker blocking, layered on top of AdGuard's own default filter --
+# confirmed live 2026-08-30 that install/configure itself already
+# registers and enables "AdGuard DNS filter" with real rules moments
+# after configuring (checking the raw AdGuardHome.yaml file too early
+# makes it look empty; the live /control/filtering/status API is the
+# one that's actually accurate). These additional lists are pulled from
+# uBlockOrigin/uAssets, at the user's own request -- but NOT the whole
+# repo blindly: uBO's lists are written for a browser extension
+# (cosmetic element-hiding, JS scriptlet injection) that a DNS server
+# fundamentally cannot apply -- only each list's DOMAIN-blocking subset
+# is usable here. Every URL below was confirmed live to parse with a
+# meaningful nonzero count of exactly that subset (not picked from the
+# repo's file listing blindly): filters.txt (uBO's main list, ~6k usable
+# domain rules despite being mostly cosmetic), badware.txt, privacy.txt,
+# resource-abuse.txt. unbreak.txt is included specifically to counteract
+# the others' false positives (uAssets ships it as the matching
+# exception list for exactly this purpose) -- never subscribe to one of
+# these without its companion exceptions list. Explicitly left out:
+# annoyances*.txt (cookie-banner/cosmetic-heavy, low DNS-blocking value,
+# real over-blocking risk), experimental.txt (opt-in even within uBO
+# itself), the per-year filters-20XX.txt archives and ubol-filters.txt/
+# lan-block.txt/ubo-link-shorteners.txt (niche, not obviously a sane
+# default for a household). Set ADGUARD_SKIP_EXTRA_BLOCKLISTS=1 to skip
+# this step entirely and keep only AdGuard's own default filter.
+if [ "${ADGUARD_SKIP_EXTRA_BLOCKLISTS:-}" != "1" ]; then
+  echo "Adding uBlock Origin (uAssets) filter lists..." >&2
+  AUTH_B64=$(printf '%s:%s' "${ADGUARD_USERNAME:-admin}" "$ADGUARD_PASSWORD" | base64 -w0)
+  UASSETS_BASE="https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters"
+  for entry in \
+    "uBO - filters|$UASSETS_BASE/filters.txt" \
+    "uBO - Badware|$UASSETS_BASE/badware.txt" \
+    "uBO - Privacy|$UASSETS_BASE/privacy.txt" \
+    "uBO - Resource abuse|$UASSETS_BASE/resource-abuse.txt" \
+    "uBO - Unbreak (exceptions)|$UASSETS_BASE/unbreak.txt"
+  do
+    list_name=$(_json_escape "${entry%%|*}")
+    list_url=$(_json_escape "${entry#*|}")
+    wget -q -O /dev/null \
+      --header "Authorization: Basic $AUTH_B64" \
+      --header 'Content-Type: application/json' \
+      --post-data "{\"name\":\"$list_name\",\"url\":\"$list_url\",\"whitelist\":false}" \
+      http://127.0.0.1:3000/control/filtering/add_url \
+      || echo "  warning: failed to add blocklist '$list_name' -- continuing anyway" >&2
+  done
+fi
+
 # Same reasoning as dashboard/dashboard.py's DASHBOARD_BIND default:
 # with `network_mode: host` (required for DNS interception, see
 # docker-compose.yml's own comment), the wildcard bind above would put

@@ -66,6 +66,13 @@ services:
       - ADGUARD_USERNAME=${ADGUARD_USERNAME:-admin}
       - ADGUARD_PASSWORD=${ADGUARD_PASSWORD:-}
       - ADGUARD_DNS_PORT=5353
+      # First-run only: subscribes to a curated set of uBlockOrigin/uAssets
+      # domain-blocking lists (badware/privacy/resource-abuse/unbreak/
+      # filters), layered on top of AdGuard's own default filter (already
+      # enabled automatically). Set to 1 to skip this and keep only
+      # AdGuard's own default filter -- see adguard/entrypoint.sh's own
+      # comment for exactly which lists and why.
+      - ADGUARD_SKIP_EXTRA_BLOCKLISTS=${ADGUARD_SKIP_EXTRA_BLOCKLISTS:-}
       # 127.0.0.1 = AdGuard Home's OWN admin UI (separate from this
       # project's dashboard) only reachable from this machine. 0.0.0.0 =
       # reachable from any device on the LAN -- see adguard/entrypoint.sh's
