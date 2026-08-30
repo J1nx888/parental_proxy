@@ -20,13 +20,12 @@ tests check the config's text/structure directly instead.
    qualifying both with CONNECT, which only matches during the tunnel/
    negotiation phase.
 
-A third, in proxy/basic_auth_helper.py: despite the module's own docstring
-claiming "classic Basic doesn't percent-encode", a real Squid 5.7 instance
-does percent-encode both auth_param basic fields, identically to the
-external_acl_type helpers. A raw capture showed a password of `a b%c d`
-arriving as `a%20b%25c%20d`. With unquote=False (the previous setting), any
-password containing a space, `%`, or other character needing escaping could
-never successfully authenticate.
+proxy/basic_auth_helper.py (and the auth_param basic percent-encoding
+regression that used to be tested here) was removed 2026-08-30 along with
+the rest of Squid's explicit-proxy-with-login model -- see RoadMap.md's
+"Squid: explicit-proxy-with-login -> transparent intercept" section. Squid
+now runs in native intercept mode with no per-request login at all, so
+there is nothing left for that helper (or these tests) to cover.
 """
 from __future__ import annotations
 
@@ -34,7 +33,6 @@ import re
 from pathlib import Path
 
 import authz_helper
-import basic_auth_helper
 import sni_helper
 import squid_helper
 
@@ -75,20 +73,6 @@ def _captured_field_count(monkeypatch, call) -> int:
     return captured["field_count"]
 
 
-def _captured_run_kwargs(monkeypatch, call) -> dict:
-    captured: dict = {}
-
-    def fake_run(name, field_count, handler, **kwargs):
-        captured.update(kwargs)
-        captured["_called"] = True
-        return 0
-
-    monkeypatch.setattr(squid_helper, "run", fake_run)
-    call()
-    assert captured.pop("_called", False), "squid_helper.run was never called"
-    return captured
-
-
 def test_sni_helper_field_count_matches_squid_conf_template(monkeypatch):
     for mode, acl_name in [
         ("bump", "sni_bump_check"),
@@ -111,20 +95,6 @@ def test_authz_helper_field_count_matches_squid_conf_template(monkeypatch):
     assert actual == expected, (
         f"authz_helper.py: registered field_count={actual} but "
         f"squid.conf.template's authz_check FORMAT actually sends {expected} fields"
-    )
-
-
-def test_basic_auth_helper_unquotes_fields(monkeypatch):
-    """Regression: a real Squid 5.7 instance percent-encodes auth_param basic
-    fields (confirmed by raw capture: a password of `a b%c d` arrived as
-    `a%20b%25c%20d`) despite basic_auth_helper.py's old docstring claiming
-    otherwise. unquote=False meant any password needing escaping (a space,
-    a `%`, ...) could never authenticate."""
-    kwargs = _captured_run_kwargs(monkeypatch, basic_auth_helper.main)
-    assert kwargs.get("unquote", True) is True, (
-        "basic_auth_helper.main() must pass unquote=True (or omit it) -- a "
-        "real Squid instance percent-encodes these fields; see "
-        "docs/review-2026-08-28.md item 2.8."
     )
 
 
@@ -154,10 +124,57 @@ def test_step_acls_in_http_access_are_qualified_with_connect():
             )
 
 
-def test_basic_auth_is_not_affected_by_the_data_macro_rule():
-    """auth_param basic (not external_acl_type) uses a different protocol --
-    Squid does not append %DATA to it. Documents why basic_auth_helper.py's
-    field_count=2 is correct and was never part of this bug."""
+def test_no_proxy_auth_left_in_intercept_mode():
+    """Regression guard for RoadMap.md's Squid intercept-mode migration
+    (2026-08-30): an intercepted connection has no CONNECT handshake for
+    Squid to challenge with a 407, so auth_param basic/proxy_auth must never
+    creep back in -- if it did, every intercepted connection would be denied
+    outright (fails closed, but silently breaks the entire bump-tier
+    feature)."""
     text = TEMPLATE_PATH.read_text()
-    assert "auth_param basic program" in text
-    assert "%DATA" not in text.split("auth_param basic program")[1].split("\n")[0]
+    assert "auth_param basic" not in text
+    assert "proxy_auth" not in text
+
+
+def test_ports_are_intercept_mode_not_explicit_proxy():
+    """Regression guard: the old explicit-proxy `http_port 3128 ssl-bump`
+    must not come back -- it's fundamentally incompatible with NAT-redirected
+    traffic (no CONNECT is ever sent for an intercepted HTTPS connection)."""
+    text = TEMPLATE_PATH.read_text()
+    assert re.search(r"^http_port\s+3129\s+intercept\s*$", text, re.MULTILINE)
+    assert re.search(r"^https_port\s+3130\s+intercept\s+ssl-bump\b", text, re.MULTILINE)
+    assert "3128" not in text
+
+
+def test_ssl_bump_catchall_is_still_terminate_not_splice():
+    """Guards a deliberate deviation from RoadMap.md's changes-needed
+    checklist: that checklist lists flipping `ssl_bump terminate step2 all`
+    to `splice` as part of this item, but also flags (in the same breath)
+    that whether the SNI-layer helpers still pull their own weight "needs a
+    closer look... not assumed here." Closer look: flipping it now, before
+    the AdGuard hard-deny integration exists (a separate, not-yet-started
+    checklist item) to actually be the domain-level gate, would make
+    block_page_mode='terminate' (the default) silently splice unconfigured/
+    unassigned domains through unfiltered instead of denying them -- a real
+    regression, not a no-op. See squid.conf.template's own comment on this
+    line. Revisit together with the AdGuard item."""
+    text = TEMPLATE_PATH.read_text()
+    assert re.search(r"^ssl_bump\s+terminate\s+step2\s+all\s*$", text, re.MULTILINE), (
+        "the ssl_bump catch-all must stay 'terminate' until the AdGuard "
+        "hard-deny integration exists -- see the comment above this rule "
+        "in squid.conf.template"
+    )
+    assert not re.search(r"^ssl_bump\s+splice\s+step2\s+all\s*$", text, re.MULTILINE)
+
+
+def test_http_access_catchall_is_still_deny_not_allow():
+    """Companion guard to the ssl_bump catch-all test above, for the same
+    reason: plain HTTP (intercept, no ssl_bump) falls straight through to
+    the final http_access line with no other check in front of it, so it
+    must stay deny-by-default until AdGuard is actually the authoritative
+    domain-level gate."""
+    text = TEMPLATE_PATH.read_text()
+    lines = [l.strip() for l in text.splitlines() if l.strip().startswith("http_access")]
+    assert lines[-1] == "http_access deny all", (
+        f"expected the final http_access rule to be 'http_access deny all', got {lines[-1]!r}"
+    )

@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Shared stdin/stdout loop for the Squid helper scripts.
 
-Squid speaks one line protocol to every ``external_acl_type`` and
-``auth_param basic`` helper: one request per line, fields separated by a
-single space, reply ``OK`` or ``ERR`` flushed immediately. The three
-helpers (basic_auth, sni, authz) differ only in the field count, whether
-those fields are percent-encoded, and the decision function -- everything
-else lived duplicated in each ``main()`` before this module.
+Squid speaks one line protocol to every ``external_acl_type`` helper: one
+request per line, fields separated by a single space, reply ``OK`` or
+``ERR`` flushed immediately. The two helpers (sni, authz) differ only in
+the field count and the decision function -- everything else lived
+duplicated in each ``main()`` before this module.
+
+A third helper, basic_auth_helper (``auth_param basic``, per-login
+Basic-Auth), was removed 2026-08-30 along with Squid's explicit-proxy
+model -- see RoadMap.md's Squid intercept-mode section. The ``unquote``/
+``keep_trailing_spaces`` parameters below predate that removal: both
+current callers always percent-encode (``external_acl_type``'s own
+protocol) and need no trailing-space handling, so both now always pass
+their defaults -- kept as parameters rather than inlined, since they're
+still real, independently testable protocol variations (see
+tests/test_helpers_protocol.py's own protocol-level tests), not dead code.
 """
 from __future__ import annotations
 
@@ -31,8 +40,8 @@ def run(
     field_count          number of space-separated fields expected per line.
     handler              called as ``handler(conn, *fields) -> bool``.
     unquote              percent-decode each field. ``external_acl_type``
-                         always encodes its fields; the classic Basic auth
-                         scheme does not, so basic_auth_helper passes False.
+                         always encodes its fields, so both current
+                         callers leave this at its default.
     keep_trailing_spaces split into exactly ``field_count`` fields, leaving
                          any further spaces in the final field (a proxy
                          password may legitimately contain spaces).

@@ -211,12 +211,12 @@ common/            shared by every component
   logging_util.py     deduped access-log writer
 
 proxy/
-  basic_auth_helper.py  Squid `auth_param basic` helper -- per-person login
   sni_helper.py          Squid `external_acl_type` for the ssl_bump decision
                           (bump/trusted/splice, checked via SNI)
   authz_helper.py        Squid `external_acl_type` for the HTTP-layer
                           decision on bump-mode domains (paths + shows)
-  squid.conf.template
+  squid.conf.template    intercept-mode config (2026-08-30) -- see
+                          RoadMap.md's Squid intercept-mode section
   entrypoint.sh
   Dockerfile
 
@@ -247,11 +247,13 @@ hasn't been run. What *has* been tested is a real, runnable suite under
 [`tests/`](tests/README.md) (`pip install pytest && pytest`, no Docker or
 network needed -- see that file for what's covered):
 
-- All three Squid helper scripts (`basic_auth_helper.py`, `sni_helper.py`
-  in all three modes, `authz_helper.py`), including the shared stdin/stdout
-  protocol loop itself -- correct auth, correct per-user domain/show
-  decisions, correct LAN/authentication fail-closed behavior, correct
-  access logging with dedupe.
+- Both Squid helper scripts (`sni_helper.py` in all four modes,
+  `authz_helper.py`), including the shared stdin/stdout protocol loop
+  itself -- correct per-user domain/show decisions, correct LAN/identity
+  fail-closed behavior, correct access logging with dedupe. (As of
+  2026-08-30, identity is resolved from the client's device rather than a
+  per-request login -- see RoadMap.md's Squid intercept-mode section;
+  `basic_auth_helper.py` was removed along with the login it supported.)
 - The full dashboard workflow via Flask's test client: admin auth, user
   CRUD, domain CRUD, per-user domain assignment, the CSRF/cross-origin
   guard, and -- specifically -- the click-to-approve flow for both a

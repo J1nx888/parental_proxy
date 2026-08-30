@@ -333,20 +333,38 @@ entirely in the policy-computation and enforcement layers:
       proven against a real build, not written from memory and left
       unverified.
 
-Still not started:
-- [ ] **`proxy/squid.conf.template`** — replace the explicit
-      `http_port 3128 ssl-bump` + `proxy_auth` block with
+- [x] **`proxy/squid.conf.template`** — done 2026-08-30. Replaced the
+      explicit `http_port 3128 ssl-bump` + `proxy_auth` block with
       `http_port 3129 intercept` / `https_port 3130 intercept
-      ssl-bump ...`; remove the `auth_param`/`acl authenticated`/
-      `http_access deny !authenticated` lines; flip the `ssl_bump
-      terminate step2 all` catch-all to `splice`. Whether
-      `sni_trusted_check`/`sni_splice_check`/`sni_block_page_check`
-      still each pull their own weight once AdGuard is the domain-level
-      gate needs a closer look at that point, not assumed here.
-- [ ] **`proxy/sni_helper.py` / `proxy/authz_helper.py`** — both
-      currently take `%LOGIN` as their user-identity input; need a
-      shared device-identity resolver (source IP → `device_bindings` →
-      `devices.user_id`) as the replacement, used by both.
+      ssl-bump ...`; removed the `auth_param`/`acl authenticated`/
+      `http_access deny !authenticated` lines entirely. **Deliberately
+      did NOT flip the `ssl_bump terminate step2 all` catch-all (or the
+      final `http_access deny all`) to allow/splice**, despite this
+      checklist entry originally listing that flip — the entry's own
+      caveat ("needs a closer look... not assumed here") turned out to
+      matter: `sni_show_block_page`'s ERR case (i.e.
+      `block_page_mode = 'terminate'`, the default) falls through to
+      exactly this catch-all, so flipping it now — before the AdGuard
+      hard-deny integration below actually exists to be the domain-level
+      gate — would silently splice unconfigured/unassigned domains
+      through unfiltered instead of denying them. A real regression, not
+      a no-op. Both catch-alls stay deny-by-default until the AdGuard
+      item ships; guarded by two new regression tests
+      (`test_ssl_bump_catchall_is_still_terminate_not_splice`,
+      `test_http_access_catchall_is_still_deny_not_allow`) so this isn't
+      silently re-flipped later without the AdGuard piece actually being
+      in place. `proxy/basic_auth_helper.py` (now orphaned — nothing in
+      intercept mode calls `auth_param basic`) was removed, along with
+      its Dockerfile `COPY` line and its dedicated tests.
+- [x] **`proxy/sni_helper.py` / `proxy/authz_helper.py`** — done
+      2026-08-30. Both dropped their `login` parameter entirely; identity
+      is now resolved via a new shared `common/device_identity.py`
+      (source IP → `device_bindings` → `devices.user_id` → `users` row),
+      used by both. `external_acl_type` FORMAT strings in
+      `squid.conf.template` updated to match (no more `%LOGIN`, field
+      counts down by one each). Full local pytest suite green (339
+      passed) after updating `tests/test_helpers_protocol.py` and
+      `tests/test_squid_conf_regressions.py` to match.
 - [ ] **AdGuard Home integration — not started at all yet** (this repo
       has designed *for* AdGuard, never actually integrated it). When
       built, it needs a per-client rule set that blocks every

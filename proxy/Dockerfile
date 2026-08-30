@@ -22,13 +22,16 @@ RUN mkdir -p /opt/parental-proxy/defaults /config \
     && chown -R proxy:proxy /config
 
 COPY common/*.py /opt/parental-proxy/
-COPY proxy/basic_auth_helper.py proxy/sni_helper.py proxy/authz_helper.py /opt/parental-proxy/
+COPY proxy/sni_helper.py proxy/authz_helper.py /opt/parental-proxy/
 COPY defaults/seed_defaults.py /opt/parental-proxy/defaults/
 COPY proxy/squid.conf.template /etc/squid/squid.conf.template
 COPY proxy/entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh /opt/parental-proxy/*.py /opt/parental-proxy/defaults/*.py
 
-EXPOSE 3128
+# Intercept-mode ports (RoadMap.md's Squid intercept-mode section, locked
+# 2026-08-30) -- nftables NAT-redirects a bump_v4 device's own port 80/443
+# traffic here, replacing the old explicit-proxy 3128.
+EXPOSE 3129 3130
 
 ENTRYPOINT ["/entrypoint.sh"]

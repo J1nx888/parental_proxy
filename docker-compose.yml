@@ -6,7 +6,10 @@ services:
     container_name: parental-proxy
     restart: unless-stopped
     ports:
-      - "3128:3128"
+      # Intercept-mode ports (RoadMap.md's Squid intercept-mode section,
+      # locked 2026-08-30), replacing the old explicit-proxy 3128:3128.
+      - "3129:3129"
+      - "3130:3130"
     environment:
       - LOCAL_NETWORK=${LOCAL_NETWORK:-192.168.1.0/24}
       - DASHBOARD_URL=${DASHBOARD_URL:-}

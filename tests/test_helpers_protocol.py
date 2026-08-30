@@ -8,11 +8,12 @@ their real `import auth` / `import db` etc. resolve correctly either way.
 from __future__ import annotations
 
 import io
+import itertools
 
 import auth
 import authz_helper
-import basic_auth_helper
 import db
+import identity
 import series_resolve
 import sni_helper
 import squid_helper
@@ -25,6 +26,26 @@ def _add_user(conn, username, password, display_name=None):
     )
     conn.commit()
     return conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+
+
+_mac_counter = itertools.count(1)
+
+
+def _bind_ip_to_user(conn, user_id, ip):
+    """Give `ip` a resolvable device identity (RoadMap.md's intercept-mode
+    identity model): a `devices` row assigned to user_id, bound to ip via a
+    real common/identity.record_binding() call -- the same path the DNS
+    tier's own identity resolution goes through, exercised here instead of
+    inserting device_bindings rows by hand. A fresh MAC per call, since
+    device_bindings is unique on (mac_address, ipv4_address) and several
+    tests reuse the same IP for different users."""
+    mac = f"aa:bb:cc:dd:ee:{next(_mac_counter):02x}"
+    conn.execute(
+        "INSERT INTO devices (mac_address, user_id, created_at) VALUES (?, ?, ?)",
+        (mac, user_id, db.now_iso()),
+    )
+    conn.commit()
+    identity.record_binding(conn, mac, ip, source="rtnetlink")
 
 
 def _add_domain(conn, pattern, mode, is_global=1, kind="generic"):
@@ -102,44 +123,28 @@ def test_protocol_handler_exception_is_err_and_does_not_kill_the_loop(conn, monk
 
 
 # ============================================================
-# basic_auth_helper.check
-# ============================================================
-
-def test_basic_auth_correct_credentials(conn):
-    _add_user(conn, "kid1", "s3cret")
-    assert basic_auth_helper.check(conn, "kid1", "s3cret") is True
-
-
-def test_basic_auth_wrong_password(conn):
-    _add_user(conn, "kid1", "s3cret")
-    assert basic_auth_helper.check(conn, "kid1", "wrong") is False
-
-
-def test_basic_auth_unknown_user(conn):
-    assert basic_auth_helper.check(conn, "nosuchuser", "whatever") is False
-
-
-# ============================================================
 # sni_helper -- ssl_bump step2 decisions
 # ============================================================
 
 def test_sni_handle_bump_true_only_for_bump_mode(conn):
     _add_domain(conn, r"crunchyroll\.com", mode="bump")
     _add_domain(conn, r"example\.com", mode="splice")
-    assert sni_helper.handle_bump(conn, "-", "1.2.3.4", "crunchyroll.com") is True
-    assert sni_helper.handle_bump(conn, "-", "1.2.3.4", "example.com") is False
-    assert sni_helper.handle_bump(conn, "-", "1.2.3.4", "unknown.com") is False
+    assert sni_helper.handle_bump(conn, "1.2.3.4", "crunchyroll.com") is True
+    assert sni_helper.handle_bump(conn, "1.2.3.4", "example.com") is False
+    assert sni_helper.handle_bump(conn, "1.2.3.4", "unknown.com") is False
 
 
 def test_sni_handle_trusted_true_only_for_trusted_mode(conn):
     _add_domain(conn, r"crunchyrollcdn\.com", mode="trusted")
-    assert sni_helper.handle_trusted(conn, "-", "1.2.3.4", "crunchyrollcdn.com") is True
-    assert sni_helper.handle_trusted(conn, "-", "1.2.3.4", "elsewhere.com") is False
+    assert sni_helper.handle_trusted(conn, "1.2.3.4", "crunchyrollcdn.com") is True
+    assert sni_helper.handle_trusted(conn, "1.2.3.4", "elsewhere.com") is False
 
 
-def test_sni_handle_splice_unauthenticated_denied_and_logged(conn):
+def test_sni_handle_splice_unresolved_identity_denied_and_logged(conn):
+    # No device_bindings row at all for this IP -- device_identity.resolve_user
+    # returns None, the intercept-mode equivalent of the old empty %LOGIN.
     _add_domain(conn, r"example\.com", mode="splice")
-    assert sni_helper.handle_splice(conn, "-", "192.168.1.5", "example.com") is False
+    assert sni_helper.handle_splice(conn, "192.168.1.5", "example.com") is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["reason"] == "not_authenticated"
     assert row["allowed"] == 0
@@ -148,17 +153,19 @@ def test_sni_handle_splice_unauthenticated_denied_and_logged(conn):
 def test_sni_handle_splice_outside_lan_denied_and_logged(conn):
     db.set_setting(conn, "local_network", "192.168.1.0/24")
     conn.commit()
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "10.0.0.9")
     _add_domain(conn, r"example\.com", mode="splice")
-    assert sni_helper.handle_splice(conn, "kid1", "10.0.0.9", "example.com") is False
+    assert sni_helper.handle_splice(conn, "10.0.0.9", "example.com") is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["reason"] == "outside_lan"
 
 
 def test_sni_handle_splice_global_domain_allowed(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"example\.com", mode="splice", is_global=1)
-    assert sni_helper.handle_splice(conn, "kid1", "192.168.1.5", "example.com") is True
+    assert sni_helper.handle_splice(conn, "192.168.1.5", "example.com") is True
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["allowed"] == 1
     assert row["reason"] == "global_domain"
@@ -166,36 +173,39 @@ def test_sni_handle_splice_global_domain_allowed(conn):
 
 def test_sni_handle_splice_per_user_domain_requires_assignment(conn):
     user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     domain = _add_domain(conn, r"example\.com", mode="splice", is_global=0)
-    assert sni_helper.handle_splice(conn, "kid1", "192.168.1.5", "example.com") is False
+    assert sni_helper.handle_splice(conn, "192.168.1.5", "example.com") is False
 
     conn.execute("INSERT INTO user_domains (user_id, domain_id) VALUES (?,?)", (user["id"], domain["id"]))
     conn.commit()
-    assert sni_helper.handle_splice(conn, "kid1", "192.168.1.5", "example.com") is True
+    assert sni_helper.handle_splice(conn, "192.168.1.5", "example.com") is True
 
 
 def test_sni_handle_splice_wrong_mode_domain_denied(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"crunchyroll\.com", mode="bump", is_global=1)
-    assert sni_helper.handle_splice(conn, "kid1", "192.168.1.5", "crunchyroll.com") is False
+    assert sni_helper.handle_splice(conn, "192.168.1.5", "crunchyroll.com") is False
 
 
 def test_sni_handle_block_page_terminate_default(conn):
-    assert sni_helper.handle_block_page(conn, "-", "1.2.3.4", "anything.com") is False
+    assert sni_helper.handle_block_page(conn, "1.2.3.4", "anything.com") is False
 
 
 def test_sni_handle_block_page_redirect_when_configured(conn):
     db.set_setting(conn, "block_page_mode", "redirect")
     conn.commit()
-    assert sni_helper.handle_block_page(conn, "-", "1.2.3.4", "anything.com") is True
+    assert sni_helper.handle_block_page(conn, "1.2.3.4", "anything.com") is True
 
 
 def test_sni_handle_block_page_terminate_logs_unconfigured_domain(conn):
     """GH #1: a genuinely unconfigured domain must be visible on the Report
     page even under the safe default (terminate) mode, since nothing else
     in the SNI-layer chain -- or downstream -- ever logs it otherwise."""
-    _add_user(conn, "kid1", "pw")
-    assert sni_helper.handle_block_page(conn, "kid1", "192.168.1.5", "unknown-site.example") is False
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
+    assert sni_helper.handle_block_page(conn, "192.168.1.5", "unknown-site.example") is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row is not None
     assert row["username"] == "kid1"
@@ -205,8 +215,8 @@ def test_sni_handle_block_page_terminate_logs_unconfigured_domain(conn):
     assert row["reason"] == "unknown_domain"
 
 
-def test_sni_handle_block_page_terminate_unauthenticated_uses_placeholder(conn):
-    sni_helper.handle_block_page(conn, "-", "192.168.1.5", "unknown-site.example")
+def test_sni_handle_block_page_terminate_unresolved_identity_uses_placeholder(conn):
+    sni_helper.handle_block_page(conn, "192.168.1.5", "unknown-site.example")
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row is not None
     assert row["username"] == "(unauthenticated)"
@@ -217,9 +227,10 @@ def test_sni_handle_block_page_terminate_does_not_double_log_configured_domain(c
     """A configured splice-mode domain the user isn't permitted is already
     logged by handle_splice before this rule is ever reached -- logging it
     again here would just be a worse duplicate."""
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"example\.com", mode="splice", is_global=0)
-    sni_helper.handle_block_page(conn, "kid1", "192.168.1.5", "example.com")
+    sni_helper.handle_block_page(conn, "192.168.1.5", "example.com")
     assert conn.execute("SELECT * FROM access_log").fetchone() is None
 
 
@@ -230,8 +241,9 @@ def test_sni_handle_block_page_unrecognized_mode_value_still_logs(conn):
     silently reintroducing the GH #1 blind spot."""
     db.set_setting(conn, "block_page_mode", "some-unexpected-value")
     conn.commit()
-    _add_user(conn, "kid1", "pw")
-    assert sni_helper.handle_block_page(conn, "kid1", "192.168.1.5", "unknown-site.example") is False
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
+    assert sni_helper.handle_block_page(conn, "192.168.1.5", "unknown-site.example") is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row is not None
     assert row["reason"] == "unknown_domain"
@@ -243,8 +255,9 @@ def test_sni_handle_block_page_redirect_does_not_log(conn):
     just lose to the dedupe window (GH #5) and hide the richer entry."""
     db.set_setting(conn, "block_page_mode", "redirect")
     conn.commit()
-    _add_user(conn, "kid1", "pw")
-    sni_helper.handle_block_page(conn, "kid1", "192.168.1.5", "unknown-site.example")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
+    sni_helper.handle_block_page(conn, "192.168.1.5", "unknown-site.example")
     assert conn.execute("SELECT * FROM access_log").fetchone() is None
 
 
@@ -252,129 +265,143 @@ def test_sni_handle_block_page_redirect_does_not_log(conn):
 # authz_helper.decide -- HTTP-layer decision on bump-mode domains
 # ============================================================
 
-def test_authz_unauthenticated_denied(conn):
-    assert authz_helper.decide(conn, "-", "192.168.1.5", "example.com:443", "/") is False
+def test_authz_unresolved_identity_denied(conn):
+    # No device_bindings row at all for this IP.
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:443", "/") is False
 
 
 def test_authz_outside_lan_denied_and_logged(conn):
     db.set_setting(conn, "local_network", "192.168.1.0/24")
     conn.commit()
-    _add_user(conn, "kid1", "pw")
-    assert authz_helper.decide(conn, "kid1", "10.0.0.1", "example.com:443", "/") is False
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "10.0.0.1")
+    assert authz_helper.decide(conn, "10.0.0.1", "example.com:443", "/") is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["reason"] == "outside_lan"
 
 
 def test_authz_unknown_domain_denied(conn):
-    _add_user(conn, "kid1", "pw")
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "unknown.example:443", "/") is False
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
+    assert authz_helper.decide(conn, "192.168.1.5", "unknown.example:443", "/") is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["reason"] == "unknown_domain"
 
 
 def test_authz_splice_mode_domain_denied_as_not_bump_mode(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"example\.com", mode="splice", is_global=1)
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "example.com:443", "/") is False
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:443", "/") is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["reason"] == "not_bump_mode"
 
 
 def test_authz_bump_domain_not_assigned_to_user_denied(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"example\.com", mode="bump", is_global=0)
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "example.com:443", "/") is False
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:443", "/") is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["reason"] == "domain_not_assigned"
 
 
 def test_authz_generic_bump_domain_no_path_rules_allows_any_path(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"example\.com", mode="bump", is_global=1)
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "example.com:443", "/whatever") is True
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:443", "/whatever") is True
 
 
 def test_authz_generic_bump_domain_with_path_rules_enforces_them(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     domain = _add_domain(conn, r"example\.com", mode="bump", is_global=1)
     conn.execute("INSERT INTO domain_paths (domain_id, pattern) VALUES (?, ?)", (domain["id"], r"^/allowed"))
     conn.commit()
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "example.com:443", "/allowed/x") is True
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "example.com:443", "/blocked") is False
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:443", "/allowed/x") is True
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:443", "/blocked") is False
 
 
 def test_authz_strips_port_from_dst(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"example\.com", mode="bump", is_global=1)
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "example.com:8443", "/") is True
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:8443", "/") is True
 
 
 def test_authz_crunchyroll_cms_objects_always_allowed(conn):
     user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"crunchyroll\.com", mode="bump", is_global=1, kind="crunchyroll")
     assert authz_helper.decide(
-        conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443",
+        conn, "192.168.1.5", "www.crunchyroll.com:443",
         "/content/v2/cms/objects/GYE5K0XVR",
     ) is True
 
 
 def test_authz_crunchyroll_series_page_requires_approval(conn):
     user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"crunchyroll\.com", mode="bump", is_global=1, kind="crunchyroll")
     path = "/series/GYE5K0XVR/ace-attorney"
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443", path) is False
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", path) is False
 
     conn.execute(
         "INSERT INTO user_shows (user_id, series_id, series_name) VALUES (?, 'GYE5K0XVR', 'Ace Attorney')",
         (user["id"],),
     )
     conn.commit()
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443", path) is True
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", path) is True
 
 
 def test_authz_crunchyroll_watch_page_resolves_series_and_checks_approval(conn, monkeypatch):
     user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"crunchyroll\.com", mode="bump", is_global=1, kind="crunchyroll")
 
     monkeypatch.setattr(
         series_resolve, "resolve_series_ids", lambda c, ids: {i: "GYE5K0XVR" for i in ids}
     )
     path = "/watch/G6NQ5DWX6/episode-1"
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443", path) is False
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", path) is False
 
     conn.execute(
         "INSERT INTO user_shows (user_id, series_id, series_name) VALUES (?, 'GYE5K0XVR', 'Ace Attorney')",
         (user["id"],),
     )
     conn.commit()
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443", path) is True
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", path) is True
 
 
 def test_authz_crunchyroll_resolution_failure_fails_closed(conn, monkeypatch):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"crunchyroll\.com", mode="bump", is_global=1, kind="crunchyroll")
 
     monkeypatch.setattr(series_resolve, "resolve_series_ids", lambda c, ids: None)
     path = "/watch/G6NQ5DWX6/episode-1"
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443", path) is False
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", path) is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["reason"] == "resolution_failed"
 
 
 def test_authz_crunchyroll_blocked_shape_denied(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     _add_domain(conn, r"crunchyroll\.com", mode="bump", is_global=1, kind="crunchyroll")
     # '/watch/' marker present but id has an invalid character -> BLOCKED_SHAPE
     path = "/watch/bad!id"
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443", path) is False
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", path) is False
     row = conn.execute("SELECT * FROM access_log").fetchone()
     assert row["reason"] == "blocked_shape"
 
 
 def test_authz_crunchyroll_other_shape_falls_back_to_path_allowlist(conn):
-    _add_user(conn, "kid1", "pw")
+    user = _add_user(conn, "kid1", "pw")
+    _bind_ip_to_user(conn, user["id"], "192.168.1.5")
     domain = _add_domain(conn, r"crunchyroll\.com", mode="bump", is_global=1, kind="crunchyroll")
     conn.execute("INSERT INTO domain_paths (domain_id, pattern) VALUES (?, ?)", (domain["id"], r"^/discover"))
     conn.commit()
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443", "/discover") is True
-    assert authz_helper.decide(conn, "kid1", "192.168.1.5", "www.crunchyroll.com:443", "/not-configured") is False
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", "/discover") is True
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", "/not-configured") is False

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Shared SQLite access for the parental proxy: schema, connections, seeding.
 
-Every component (basic_auth_helper, sni_helper, authz_helper, dashboard)
-opens the same database file on the shared volume. WAL mode + a busy
-timeout let multiple processes read/write concurrently without needing a
-separate database server.
+Every component (sni_helper, authz_helper, dashboard) opens the same
+database file on the shared volume. WAL mode + a busy timeout let multiple
+processes read/write concurrently without needing a separate database
+server.
 """
 from __future__ import annotations
 

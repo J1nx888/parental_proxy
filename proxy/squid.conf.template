@@ -1,8 +1,26 @@
 # ==========================================================
 # PORT / TLS
 # ==========================================================
+#
+# Intercept mode (RoadMap.md's "Squid: explicit-proxy-with-login ->
+# transparent intercept" section, locked 2026-08-30): nftables NAT-redirects
+# a bump_v4 device's own port 80/443 traffic to the ports below (see
+# phase3/nftables-manager/internal/nft/knftables_adapter.go's baselineRules)
+# -- no device ever configures a proxy address or port itself. Squid
+# recovers the real destination from the redirected socket via
+# SO_ORIGINAL_DST, which `intercept` (plain HTTP) and `intercept ssl-bump`
+# (HTTPS, since it also has to terminate TLS to peek/bump) both require. The
+# CA certificate below is still the one manual step needed on a bump-enabled
+# device -- nothing else changes there.
+#
+# This replaces the old explicit-proxy http_port (see git history, not here)
+# that required each device to be manually pointed at Squid's address --
+# fundamentally incompatible with NAT-redirected traffic anyway, since
+# intercepted connections never send a CONNECT for HTTPS in the first place.
 
-http_port 3128 ssl-bump generate-host-certificates=on \
+http_port 3129 intercept
+
+https_port 3130 intercept ssl-bump generate-host-certificates=on \
 dynamic_cert_mem_cache_size=4MB \
 cert=/config/ssl_cert/ca_cert.pem \
 key=/config/ssl_cert/ca_key.pem \
@@ -14,18 +32,6 @@ sslcrtd_program /usr/lib/squid/security_file_certgen \
 -M 4MB
 
 sslcrtd_children 5 startup=1 idle=1
-
-
-# ==========================================================
-# AUTHENTICATION -- one login per person (Option A)
-# ==========================================================
-
-auth_param basic program /usr/bin/python3 /opt/parental-proxy/basic_auth_helper.py
-auth_param basic children 10
-auth_param basic realm "Parental Proxy"
-auth_param basic credentialsttl 4 hours
-
-acl authenticated proxy_auth REQUIRED
 
 
 # ==========================================================
@@ -53,21 +59,28 @@ acl SSL_ports port 443
 # was off by one, so every single request was rejected as a malformed line
 # and fell through to the terminate-all catch-all -- discovered against a
 # real Squid instance (see docs/review-2026-08-28.md).
+#
+# %LOGIN is gone from every FORMAT below (2026-08-30, intercept mode): an
+# intercepted connection has no CONNECT handshake for Squid to challenge
+# with a 407, so there is no per-request login to pass. %>a (the client's
+# source IP) is now the only identity signal, resolved on the Python side
+# via common/device_identity.py (source IP -> device_bindings ->
+# devices.user_id) -- the same identity data the DNS tier already relies on.
 
 external_acl_type sni_bump_check children-max=10 ttl=0 negative_ttl=0 \
-%LOGIN %>a %ssl::>sni %DATA \
+%>a %ssl::>sni %DATA \
 /usr/bin/python3 /opt/parental-proxy/sni_helper.py bump
 
 external_acl_type sni_trusted_check children-max=10 ttl=0 negative_ttl=0 \
-%LOGIN %>a %ssl::>sni %DATA \
+%>a %ssl::>sni %DATA \
 /usr/bin/python3 /opt/parental-proxy/sni_helper.py trusted
 
 external_acl_type sni_splice_check children-max=10 ttl=0 negative_ttl=0 \
-%LOGIN %>a %ssl::>sni %DATA \
+%>a %ssl::>sni %DATA \
 /usr/bin/python3 /opt/parental-proxy/sni_helper.py splice
 
 external_acl_type sni_block_page_check children-max=10 ttl=0 negative_ttl=0 \
-%LOGIN %>a %ssl::>sni %DATA \
+%>a %ssl::>sni %DATA \
 /usr/bin/python3 /opt/parental-proxy/sni_helper.py block_page
 
 acl sni_bump external sni_bump_check
@@ -82,7 +95,7 @@ acl sni_show_block_page external sni_block_page_check
 # ==========================================================
 
 external_acl_type authz_check children-max=20 ttl=0 negative_ttl=0 \
-%LOGIN %>a %DST %PATH %DATA \
+%>a %DST %PATH %DATA \
 /usr/bin/python3 /opt/parental-proxy/authz_helper.py
 
 acl authz_allowed external authz_check
@@ -94,18 +107,22 @@ acl authz_allowed external authz_check
 
 http_access allow localhost
 
-# Require a valid per-person login for everything else. Squid issues the
-# 407 challenge automatically via the proxy_auth ACL type.
-http_access deny !authenticated
+# No per-request login to check anymore (see the PORT/TLS section above) --
+# identity is resolved from the client's source IP instead, inside
+# sni_helper.py/authz_helper.py themselves. Every device that reaches this
+# proxy at all already got here via nftables' bump_v4 redirect, which only
+# ever applies to an already-authenticated, admin-opted-in device (see
+# RoadMap.md's "two independent axes" section) -- there is deliberately no
+# `http_access deny !authenticated` equivalent left here.
 
 # This is an HTTPS filtering proxy: CONNECT is only ever needed to port 443.
 # Refusing everything else stops the proxy being used as a generic TCP tunnel
-# (SSH-over-CONNECT, SMTP, etc.) by an authenticated user.
+# (SSH-over-CONNECT, SMTP, etc.).
 http_access deny CONNECT !SSL_ports
 
-# Allow the CONNECT tunnel and TLS peek/bump negotiation for authenticated
-# clients -- the actual allow/deny decision happens in the ssl_bump rules
-# below (splice/bump/terminate) and, for bump-mode domains, in authz_allowed.
+# Allow the CONNECT tunnel and TLS peek/bump negotiation -- the actual
+# allow/deny decision happens in the ssl_bump rules below (splice/bump/
+# terminate) and, for bump-mode domains, in authz_allowed.
 #
 # step1/step2 MUST be qualified with CONNECT here, not left bare. Squid's
 # at_step state for a connection does not reset once ssl_bump reaches step2
@@ -131,6 +148,15 @@ http_access allow authz_allowed
 # is configured -- omitted entirely otherwise, since deny_info requires a
 # non-empty argument and envsubst can't conditionally drop a line.
 
+# Deliberately NOT flipped to `allow all` despite RoadMap.md's "AdGuard
+# becomes the authoritative domain-level gate" framing: that framing is only
+# true once the AdGuard hard-deny integration actually exists (RoadMap.md's
+# changes-needed checklist item -- not built yet). Until then, Squid is
+# still the only thing standing between an unconfigured/unassigned domain
+# and a bump-enabled device, for BOTH plain HTTP (falls through to here
+# directly, no ssl_bump involved) and any bump-mode HTTPS request
+# authz_allowed didn't approve. Deny-by-default preserves the exact
+# enforcement this project already had; revisit once the AdGuard item ships.
 http_access deny all
 
 
@@ -162,6 +188,23 @@ ssl_bump bump step2 sni_show_block_page
 
 # True catch-all: terminate rather than bump-and-deny, since there's
 # nothing to gain from decrypting traffic we're not going to explain either.
+#
+# Deliberately kept as `terminate`, NOT flipped to `splice`, despite
+# RoadMap.md's changes-needed checklist listing that flip as part of this
+# item. That checklist entry itself flagged the reason to look closer before
+# doing it: "whether sni_trusted_check/sni_splice_check/sni_block_page_check
+# still each pull their own weight once AdGuard is the domain-level gate
+# needs a closer look... not assumed here." Looking closer: flipping this
+# now, before the AdGuard hard-deny integration exists (a separate,
+# not-yet-started checklist item), would be a real regression, not a
+# no-op -- this exact line is what `block_page_mode = 'terminate'` (the
+# default) relies on to actually deny an unconfigured domain or a
+# splice-mode domain this user isn't assigned. sni_show_block_page's ERR
+# falls through to precisely this line; flipping it to splice would make
+# 'terminate' mode silently splice those domains through unfiltered instead
+# -- worse than doing nothing, since the setting would say one thing and do
+# another. Revisit together with the AdGuard item, once it's actually the
+# authoritative gate this comment would need it to be.
 ssl_bump terminate step2 all
 
 

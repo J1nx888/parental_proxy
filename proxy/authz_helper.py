@@ -2,15 +2,21 @@
 """Squid `external_acl_type` helper for the HTTP-layer decision on bump-mode
 domains (the ones ssl_bump fully decrypts, per sni_helper.py's 'bump' check).
 
-Protocol (format `%LOGIN %>a %DST %PATH %DATA`): one line per request, five
+Protocol (format `%>a %DST %PATH %DATA`): one line per request, four
 percent-encoded fields, respond "OK" or "ERR". The trailing %DATA field is
 always "-" (the `acl authz_allowed external authz_check` line passes no
 static argument) and is otherwise unused -- it must still be declared and
 consumed, because Squid always appends %DATA to an external_acl_type FORMAT
 that doesn't already include it (see squid.conf.template's comment).
 
+Updated 2026-08-30 for Squid's intercept mode (RoadMap.md's "Squid:
+explicit-proxy-with-login -> transparent intercept" section): %LOGIN is
+gone -- identity is now resolved from `%>a` (the client's source IP) via
+common/device_identity.py's device_bindings-based lookup, same as
+sni_helper.py.
+
 Decision order for a bump-mode domain:
-  1. Client must be authenticated and inside the configured LAN.
+  1. Client's device must resolve to a user, and be inside the configured LAN.
   2. Domain must be globally allowed, or explicitly assigned to this user.
   3. If it's the Crunchyroll domain: resolve watch/playback/series requests
      to their parent show via the CMS API (cached) and check the user's
@@ -30,7 +36,7 @@ import sys
 sys.path.insert(0, "/opt/parental-proxy")
 
 import cr_urls
-import db
+import device_identity
 import logging_util
 import matching
 import series_resolve
@@ -43,16 +49,17 @@ def _split_host_port(dst: str) -> str:
     return dst.split(":", 1)[0]
 
 
-def decide(conn, login: str, client_ip: str, dst: str, path: str, _data: str = "-") -> bool:
+def decide(conn, client_ip: str, dst: str, path: str, _data: str = "-") -> bool:
     hostname = _split_host_port(dst)
     path = path or "/"
 
-    if login in ("-", "", None):
+    user = device_identity.resolve_user(conn, client_ip)
+    if user is None:
         return False
 
     if not matching.ip_in_configured_lan(conn, client_ip):
         logging_util.log_access(
-            conn, user_id=None, username=login, domain=hostname,
+            conn, user_id=user["id"], username=user["username"], domain=hostname,
             path=path, allowed=False, reason="outside_lan",
         )
         return False
@@ -63,40 +70,34 @@ def decide(conn, login: str, client_ip: str, dst: str, path: str, _data: str = "
         # splice-mode domain this user isn't permitted -- ssl_bump's
         # block_page rule (see sni_helper.py) deliberately bumps both so a
         # real deny page can be served here instead of a bare connection
-        # failure. Either way: deny. Resolve the user (if there is one) so
-        # this still shows up as approvable from the report.
-        user = matching.get_user_by_username(conn, login)
+        # failure. Either way: deny.
         logging_util.log_access(
-            conn, user_id=user["id"] if user else None, username=login, domain=hostname,
+            conn, user_id=user["id"], username=user["username"], domain=hostname,
             path=path, allowed=False,
             reason="unknown_domain" if domain is None else "not_bump_mode",
         )
         return False
 
-    user = matching.get_user_by_username(conn, login)
-    if user is None:
-        return False
-
     domain_ok = bool(domain["is_global"]) or matching.user_has_domain(conn, user["id"], domain["id"])
     if not domain_ok:
         logging_util.log_access(
-            conn, user_id=user["id"], username=login, domain=hostname,
+            conn, user_id=user["id"], username=user["username"], domain=hostname,
             path=path, allowed=False, reason="domain_not_assigned",
         )
         return False
 
     if domain["kind"] == "crunchyroll":
-        return _decide_crunchyroll(conn, user, login, hostname, path, domain)
+        return _decide_crunchyroll(conn, user, hostname, path, domain)
 
     if not matching.path_allowed(conn, domain["id"], path) and _has_any_path_rules(conn, domain["id"]):
         logging_util.log_access(
-            conn, user_id=user["id"], username=login, domain=hostname,
+            conn, user_id=user["id"], username=user["username"], domain=hostname,
             path=path, allowed=False, reason="path_not_allowed",
         )
         return False
 
     logging_util.log_access(
-        conn, user_id=user["id"], username=login, domain=hostname,
+        conn, user_id=user["id"], username=user["username"], domain=hostname,
         path=path, allowed=True,
         reason="global_domain" if domain["is_global"] else "user_domain",
     )
@@ -110,7 +111,8 @@ def _has_any_path_rules(conn, domain_id: int) -> bool:
     return row is not None
 
 
-def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain) -> bool:
+def _decide_crunchyroll(conn, user, hostname: str, path: str, domain) -> bool:
+    username = user["username"]
     url = f"https://{hostname}{path}"
     request = cr_urls.classify(url)
 
@@ -119,7 +121,7 @@ def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain
 
     if request.kind is cr_urls.RequestKind.BLOCKED_SHAPE:
         logging_util.log_access(
-            conn, user_id=user["id"], username=login, domain=hostname,
+            conn, user_id=user["id"], username=username, domain=hostname,
             path=path, allowed=False, reason="blocked_shape",
         )
         return False
@@ -137,7 +139,7 @@ def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain
         if not _has_any_path_rules(conn, domain["id"]) or matching.path_allowed(conn, domain["id"], path):
             return True
         logging_util.log_access(
-            conn, user_id=user["id"], username=login, domain=hostname,
+            conn, user_id=user["id"], username=username, domain=hostname,
             path=path, allowed=False, reason="path_not_allowed",
         )
         return False
@@ -147,7 +149,7 @@ def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain
         for series_id in request.ids:
             show_ok = matching.user_has_show(conn, user["id"], series_id)
             logging_util.log_access(
-                conn, user_id=user["id"], username=login, domain=hostname,
+                conn, user_id=user["id"], username=username, domain=hostname,
                 path=path, allowed=show_ok,
                 reason="show_approved" if show_ok else "show_not_approved",
                 series_id=series_id,
@@ -160,7 +162,7 @@ def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain
     resolved = series_resolve.resolve_series_ids(conn, request.ids)
     if resolved is None:
         logging_util.log_access(
-            conn, user_id=user["id"], username=login, domain=hostname,
+            conn, user_id=user["id"], username=username, domain=hostname,
             path=path, allowed=False, reason="resolution_failed",
         )
         return False
@@ -170,7 +172,7 @@ def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain
         series_id = resolved.get(object_id)
         show_ok = series_id is not None and matching.user_has_show(conn, user["id"], series_id)
         logging_util.log_access(
-            conn, user_id=user["id"], username=login, domain=hostname,
+            conn, user_id=user["id"], username=username, domain=hostname,
             path=path, allowed=show_ok,
             reason="show_approved" if show_ok else "show_not_approved",
             series_id=series_id,
@@ -181,7 +183,7 @@ def _decide_crunchyroll(conn, user, login: str, hostname: str, path: str, domain
 
 
 def main() -> int:
-    return squid_helper.run("authz_helper", 5, decide)
+    return squid_helper.run("authz_helper", 4, decide)
 
 
 if __name__ == "__main__":
