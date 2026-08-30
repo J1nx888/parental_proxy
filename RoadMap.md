@@ -331,7 +331,22 @@ entirely in the policy-computation and enforcement layers:
       in both `authenticated_v4` and `bump_v4` simultaneously against
       knftables' real in-memory `Fake`) all clean — this is Go logic
       proven against a real build, not written from memory and left
-      unverified.
+      unverified. **Further verified against a real kernel 2026-08-30**
+      (see the new live-verification section below): `EnsureBaseline`
+      called twice in a row against the smoke-test VM's actual nftables
+      produced exactly the intended 6 redirect rules both times (not
+      12), confirming both the `bump_v4` rule syntax and the
+      flush-before-re-add idempotency hold outside `Fake` too. Also
+      found and fixed a real bug in this same pass, in a file this
+      checklist item didn't originally call out:
+      `internal/dbsource/sqlite.go`'s `desiredPolicyWire` never declared
+      a `"bump"` JSON field, so `ReadDesiredPolicy` silently discarded
+      every bump IP `controller/policy_state.py` had actually computed
+      — `pp-nftables-manager` would never have redirected a single
+      device to Squid in production despite the DNS-tier sets working
+      correctly. Fixed with a regression test
+      (`internal/dbsource/sqlite_test.go`, new file — this package had
+      no tests at all before).
 
 - [x] **`proxy/squid.conf.template`** — done 2026-08-30. Replaced the
       explicit `http_port 3128 ssl-bump` + `proxy_auth` block with
@@ -364,7 +379,24 @@ entirely in the policy-computation and enforcement layers:
       `squid.conf.template` updated to match (no more `%LOGIN`, field
       counts down by one each). Full local pytest suite green (339
       passed) after updating `tests/test_helpers_protocol.py` and
-      `tests/test_squid_conf_regressions.py` to match.
+      `tests/test_squid_conf_regressions.py` to match. **Booted against
+      a real Squid binary for the first time 2026-08-30** (see the new
+      live-verification section below) — found and fixed three real
+      bugs no Python unit test could have caught, all now live and
+      staying up: (1) `docker-compose.yml`'s `proxy` service needed
+      `cap_add: NET_ADMIN` for `intercept`'s `IP_TRANSPARENT`/
+      `SO_ORIGINAL_DST` use; (2) that alone wasn't enough, because this
+      Squid build drops root privileges internally
+      (`--with-default-user=proxy`) before opening the intercept
+      listeners, and Linux clears capabilities across that internal
+      `setuid()` — fixed with `setcap cap_net_admin=+ep` on the squid
+      binary itself in `proxy/Dockerfile`, which survives it; (3) an
+      intercept-only Squid (no plain forward-proxy `http_port` at all)
+      FATALs at startup trying to build its own internal icon URLs
+      (`mimeLoadIcon: cannot parse internal URL`, visible only in
+      `/var/log/squid/cache.log`, not stdout) — fixed by adding a
+      loopback-only, non-`intercept` `http_port 127.0.0.1:3128` purely
+      so that URL construction has somewhere valid to point at.
 - [ ] **AdGuard Home integration — not started at all yet** (this repo
       has designed *for* AdGuard, never actually integrated it). When
       built, it needs a per-client rule set that blocks every
@@ -418,11 +450,71 @@ interception layer, exactly matching the "interception scope and
 policy scope are different axes" design decision.
 
 This is the strongest verification available without a real LAN.
-What's still unverified: real Squid/AdGuard behind these redirects
-(as opposed to stand-in HTTP listeners), a real switch's more complex
-behavior (STP, VLANs, actual physical NICs) instead of a Linux bridge,
-and everything the Orbi validation section below calls out (mesh
-roaming, wireless backhaul, satellite-attached clients).
+What's still unverified: real AdGuard behind these redirects (the
+Squid gap this note originally called out is closed below), a real
+switch's more complex behavior (STP, VLANs, actual physical NICs)
+instead of a Linux bridge, and everything the Orbi validation section
+below calls out (mesh roaming, wireless backhaul, satellite-attached
+clients).
+
+### Squid intercept mode + bump_v4, verified live end-to-end (2026-08-30)
+
+Before this pass, every piece of the intercept-mode rewrite (Squid
+config, `device_identity.py`, `bump_v4`'s nftables rules) had only ever
+been exercised by Python/Go unit tests against mocked behavior — it had
+never once been booted for real, the same gap the original v1 proxy
+work had before its own live Squid pass turned up four real bugs (see
+`docs/review-2026-08-28.md`). This pass closed that gap the same way:
+real `pp-nftables-manager` binary against the smoke-test VM's real
+kernel, real Squid in intercept mode, real client containers, real
+external HTTPS traffic (`example.com`), nothing mocked.
+
+**Topology note, since this matters for what the result proves**: the
+first attempt ran Squid as an ordinary Docker Compose service (its own
+bridge-network namespace) with the `bump_v4` NAT-redirect rules
+installed in the *host's* namespace — this is a Docker-testing
+artifact with no equivalent in production (a physical box only has one
+namespace), and it broke `SO_ORIGINAL_DST` recovery: the pre-NAT
+destination conntrack records is per-namespace, so a redirect applied
+in one namespace doesn't carry into a socket listening in another.
+Re-running Squid with `--network host` (so nftables and Squid share
+exactly one namespace, matching the real single-box deployment target)
+fixed it immediately. Worth remembering for any future Docker-based
+test of this specific pair — real deployment doesn't have this
+problem, Docker's default per-container networking does.
+
+With that corrected, the full pipeline was proven live:
+- `pp-nftables-manager`'s `EnsureBaseline` against a real kernel, output
+  inspected directly via `nft list table inet parental_proxy` — matched
+  the intended ruleset exactly, including the two `bump_v4` lines, and
+  stayed at 6 redirect rules (not 12) after being called twice.
+- A client container's IP added to the real `bump_v4` set redirected
+  its own outbound 80/443 into Squid's intercept ports, transparently
+  — no proxy configuration on the client at all.
+- Squid recovered the true pre-NAT destination via `SO_ORIGINAL_DST`
+  (`ORIGINAL_DST/<real-ip>` in `access.log`, not Squid's own address) —
+  bumped it, and served the real page (`TCP_MISS/200`).
+- Identity resolution off the client's source IP alone (no `%LOGIN`)
+  worked both ways: a device with a real `device_bindings` row
+  resolved to its user and was allowed by a `bump`+`is_global` domain;
+  a second device in `bump_v4` with **no** binding at all was correctly
+  denied (403) by the exact same domain — confirming
+  `device_identity.resolve_user()`'s "no identity" fallback actually
+  denies in practice, not just in its unit tests.
+- An unconfigured domain (`wikipedia.org`, never added to `domains`)
+  hit the `ssl_bump terminate step2 all` catch-all and the connection
+  was cleanly terminated (curl: `HTTP_CODE=000`) — confirming the
+  deliberate deny-by-default catch-all discussed in the checklist above
+  still holds against real traffic, not just in config-parsing tests.
+
+Three real bugs were found and fixed along the way (`cap_add:
+NET_ADMIN`, `setcap` on the squid binary, the loopback `http_port` for
+internal icon URLs — see the checklist item above for detail) — none
+of them were reachable by any existing test, Python or Go, because
+none of them exercise a real container boot. All test/seed artifacts
+(client containers, the nftables table, DB rows) were torn down
+afterward; the VM was left at a clean `docker compose down -v` state,
+matching how this pass found it.
 
 ### Fail-open engineering (a correction to an earlier assumption)
 
