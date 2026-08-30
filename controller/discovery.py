@@ -14,18 +14,30 @@ pass rather than being rushed alongside this. AdGuard query-log
 correlation and active rate-limited ARP scanning (the remaining two
 sources in that precedence list) also aren't built.
 
-Nothing wires this into a running process yet -- it's deliberately
-just the observation+recording piece, independently testable and usable
-on its own (e.g. from a cron-style loop, or eventually folded into a
-dedicated discovery daemon alongside the rtnetlink listener).
+**Wired into a running loop as of 2026-08-30** via `run_loop()` below,
+called from `controller/main.py` on its own background thread and its
+own DB connection (see `run_loop`'s own docstring for why a separate
+connection is required, not just a separate thread). This closes the
+gap `docs/security/overview.md` §3 and RoadMap.md Milestone 4 both flag:
+`device_bindings` freshness -- and therefore Squid's
+`common/device_identity.py` identity resolution, and
+`controller/policy_state.py`'s nftables policy computation -- depended
+on *something* calling `snapshot_once()` regularly, and until now
+nothing did. This does not replace the still-unbuilt live rtnetlink
+listener (which would still improve staleness *within* this loop's own
+interval); see the module docstring above.
 """
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 import subprocess
 
 import identity
+from periodic import PeriodicTask
+
+log = logging.getLogger("controller.discovery")
 
 # Matches a line like:
 #   192.168.1.21 dev enp1s0 lladdr aa:bb:cc:dd:ee:01 REACHABLE
@@ -92,3 +104,51 @@ def snapshot_once(conn: sqlite3.Connection) -> int:
     for ip, mac, _state in entries:
         identity.record_binding(conn, mac, ip, source="snapshot")
     return len(entries)
+
+
+def run_loop(interval: float, on_error=None) -> PeriodicTask:
+    """Starts `snapshot_once()` running on a fixed interval, on its own
+    background thread, until the returned `PeriodicTask.stop()` is
+    called. Mirrors `controller/lease.py`'s `HeartbeatPacer` usage in
+    `controller/main.py` -- same "start it, hold onto the handle, stop()
+    it in the shutdown path" shape.
+
+    Deliberately does NOT accept a `conn` parameter -- it opens its OWN
+    connection internally, lazily, the first time the background thread
+    actually runs. This was a real bug in this function's first draft:
+    `sqlite3.Connection` objects are only usable from the thread that
+    *created* them (`check_same_thread=True`, `db.get_conn()`'s own
+    default) -- and that's the thread that called `db.get_conn()`, not
+    whichever thread later happens to execute queries on it. Handing this
+    loop a connection built on the caller's thread (e.g. main.py's own
+    `health_conn`) fails exactly the same way a shared connection would;
+    only a connection built ON this loop's own background thread works,
+    which means this function has to be the one to build it. Callers
+    just need `db.DB_PATH` already set correctly before this starts --
+    true process-wide by the time `main.py`'s `_build_db_backed_provider`
+    has run, the same way every other component in this codebase
+    (dashboard, the Squid helpers) relies on `db.DB_PATH` already being
+    right rather than being told the path directly.
+
+    A failed snapshot (the `ip` command missing, a transient subprocess
+    error, a malformed line) is reported via `on_error` rather than
+    killing the loop -- matching every other periodic task in this
+    codebase (`HeartbeatPacer`, `main.py`'s own reconcile-cycle handling)
+    in treating one bad cycle as a reason to log and retry next
+    interval, not a reason to stop discovering devices entirely.
+    """
+    state: dict[str, sqlite3.Connection] = {}
+
+    def task() -> None:
+        conn = state.get("conn")
+        if conn is None:
+            import db  # local import: mirrors _build_db_backed_provider's own lazy `import db`
+
+            conn = db.get_conn()
+            db.init_db(conn)
+            state["conn"] = conn
+        snapshot_once(conn)
+
+    pt = PeriodicTask(interval, task, on_error=on_error, thread_name="discovery-snapshot")
+    pt.start()
+    return pt

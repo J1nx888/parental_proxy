@@ -126,7 +126,7 @@ def test_unchanged_desired_state_still_writes_policy_and_health_but_skips_the_wo
 
         row = _runtime_row(conn)
         assert json.loads(row["desired_policy_json"]) == {
-            "authenticated": [], "unauthenticated": [], "bypass": [], "quarantine": [],
+            "authenticated": [], "unauthenticated": [], "bypass": [], "quarantine": [], "bump": [],
         }
 
         # Second cycle: identical desired state. reconcile() must return

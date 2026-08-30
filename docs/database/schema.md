@@ -387,11 +387,14 @@ never auto-associated from network data alone (no hostname/vendor
 guessing) -- a brand-new MAC gets a pending (`device_id` NULL) binding
 awaiting a human association via the dashboard. **Freshness caveat**: the
 only thing that calls `record_binding()` today is
-`controller/discovery.py`'s `snapshot_once()` (a periodic `ip neigh show`
-poll), which per its own docstring is **not wired into any running loop
-yet** -- see `docs/security/overview.md` §3 for the concrete consequence
-this has for identity resolution. Indexed on `device_id` and on
-`(ipv4_address, active)`.
+`controller/discovery.py`'s `snapshot_once()`, a periodic `ip neigh show`
+poll -- wired into an actual running loop as of 2026-08-30
+(`discovery.run_loop()`, started from `controller/main.py`), so staleness
+is now bounded by that loop's interval (`--discovery-interval`, default
+30s) rather than unbounded. The higher-precedence live rtnetlink-event
+listener still doesn't exist -- see `docs/security/overview.md` §3 for
+the concrete consequence this still has for identity resolution.
+Indexed on `device_id` and on `(ipv4_address, active)`.
 
 ### `interception_runtime`
 Singleton row (`CHECK (singleton_id = 1)`) tracking Phase 3's own runtime

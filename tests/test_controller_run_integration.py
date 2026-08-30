@@ -23,6 +23,7 @@ import time
 
 import pytest
 
+import discovery
 from ipc_client import Target
 from main import run
 from reconcile import DesiredState
@@ -153,3 +154,91 @@ def test_run_reconnects_after_worker_dies_then_shuts_down_cleanly(tmp_path, conn
     assert row["mode"] == "running", (
         "expected the reconnected cycle to eventually report healthy again"
     )
+
+
+def test_run_with_discovery_interval_populates_device_bindings_on_a_separate_thread(
+    tmp_path, conn, monkeypatch, restore_signal_handlers
+):
+    """Milestone 4's discovery loop, wired into run() (2026-08-30): a real
+    background thread, opening its own sqlite3.Connection internally
+    (see discovery.run_loop's own docstring for why it must build that
+    connection itself rather than being handed health_conn/policy_conn),
+    running concurrently with the main reconcile loop and the heartbeat
+    pacer -- three threads sharing one process, the exact condition this
+    integration test file exists to exercise for real rather than assume.
+    """
+    monkeypatch.setattr(
+        discovery, "run_ip_neigh_show",
+        lambda: "192.168.1.50 dev eth0 lladdr aa:bb:cc:dd:ee:99 REACHABLE\n",
+    )
+
+    sock_path = str(tmp_path / "worker.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(sock_path)
+    server.listen(1)
+    server.settimeout(0.5)
+    stop_server = threading.Event()
+
+    def serve():
+        while not stop_server.is_set():
+            try:
+                conn_sock, _ = server.accept()
+            except socket.timeout:
+                continue
+            conn_sock.settimeout(2)
+            try:
+                while True:
+                    try:
+                        req = _read_line(conn_sock)
+                    except (ConnectionError, socket.timeout):
+                        break
+                    if req["op"] == "replace_targets":
+                        _send_line(conn_sock, {
+                            "v": 1, "op": "generation_applied",
+                            "generation": req["generation"],
+                            "target_count": len(req["targets"]),
+                            "resolution_failures": [],
+                        })
+                    elif req["op"] == "heartbeat":
+                        _send_line(conn_sock, {
+                            "v": 1, "op": "heartbeat_ack",
+                            "sequence": req["sequence"], "sent_counters": {},
+                        })
+                    elif req["op"] == "shutdown":
+                        break
+            except (ConnectionError, OSError, socket.timeout):
+                pass
+            finally:
+                conn_sock.close()
+
+    server_thread = threading.Thread(target=serve)
+    server_thread.start()
+
+    def send_sigterm_after_delay():
+        time.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    timer_thread = threading.Thread(target=send_sigterm_after_delay)
+    timer_thread.start()
+
+    try:
+        run(
+            sock_path,
+            _desired_state_provider,
+            heartbeat_interval=0.05,
+            poll_interval=0.05,
+            health_conn=conn,
+            policy_conn=None,
+            discovery_interval=0.02,
+        )
+    finally:
+        stop_server.set()
+        server_thread.join(timeout=3)
+        timer_thread.join(timeout=3)
+        server.close()
+
+    row = conn.execute(
+        "SELECT mac_address FROM device_bindings WHERE ipv4_address = ?", ("192.168.1.50",)
+    ).fetchone()
+    assert row is not None, "expected the discovery loop to have recorded the mocked binding"
+    assert row["mac_address"] == "aa:bb:cc:dd:ee:99"

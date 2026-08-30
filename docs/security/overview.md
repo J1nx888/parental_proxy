@@ -212,19 +212,24 @@ deactivating the stale `(mac, old_ip)` row and activating a fresh
 `(mac, new_ip)` one, so `resolve_user()`'s `WHERE ... AND active = 1` always
 targets whichever IP is *currently* live for that MAC, not a stale one.
 
-**The gap this depends on**: something has to actually call
-`record_binding()` promptly when a device's IP changes for this to stay
-current. Today, the only piece that does this is
-`controller/discovery.py`'s `snapshot_once()` (a periodic `ip neigh show`
-snapshot) — and per that module's own docstring, **it is not wired into
-any running loop yet**; the higher-precedence live rtnetlink-event listener
-(RoadMap.md Milestone 4) doesn't exist either. Until one of those runs
-continuously, a real DHCP renewal can leave `device_bindings` stale for an
-unbounded window, during which `resolve_user()` for the device's new IP
-returns `None` — the device fails toward *less* access (denied, not
-misattributed to a different user), which is the safe direction, but it is
-a real reliability gap, not a hypothetical one. See RoadMap.md Milestone 4
-and `controller/discovery.py`'s docstring.
+**The gap this depends on -- narrowed, not closed, 2026-08-30**: something
+has to actually call `record_binding()` regularly when a device's IP
+changes for this to stay current. `controller/discovery.py`'s
+`snapshot_once()` (a periodic `ip neigh show` snapshot) is now wired into
+an actual running loop (`discovery.run_loop()`, started from
+`controller/main.py`'s `run()` on its own background thread and its own
+DB connection, interval configurable via `--discovery-interval`) --
+before this, per the module's own docstring, it wasn't wired into
+anything at all, so staleness was unbounded. Now the freshness bound is
+that interval (default 30s), not "forever" -- but the higher-precedence
+live rtnetlink-event listener (RoadMap.md Milestone 4) still doesn't
+exist, so a device's new IP can still take up to one interval to become
+resolvable after a DHCP renewal. During that window `resolve_user()` for
+the new IP returns `None` — the device fails toward *less* access
+(denied, not misattributed to a different user), which is the safe
+direction, but it's still a real, bounded-but-nonzero gap, not a
+hypothetical one. See RoadMap.md Milestone 4 and
+`controller/discovery.py`'s docstring.
 
 ---
 

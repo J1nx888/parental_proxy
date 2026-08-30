@@ -12,12 +12,19 @@ and publishing the DesiredPolicy blob phase3/nftables-manager reads.
 NOT a real deployable yet: --db-path wires in the real Milestone 4
 desired-state source (controller/desired_state.py, devices +
 device_bindings), but there's still no Dockerfile/systemd unit for this
-component, no discovery daemon populating device_bindings from live
-traffic, and the gateway is passed in on the command line rather than
+component, and the gateway is passed in on the command line rather than
 resolved live (that's the ARP worker's own job at startup -- see
 phase3/arp-worker/internal/worker/safety.go's ResolveGateway -- not
 something the controller should do a second time). See
 docs/design/phase3-technical-design.md and RoadMap.md's milestone list.
+
+**Discovery is now wired in (2026-08-30)**: when --db-path is given,
+run() also starts controller/discovery.py's snapshot loop on its own
+background thread and its own DB connection (see discovery.run_loop's
+own docstring for why a separate connection is required). This is still
+only the periodic ip-neigh-show snapshot -- the higher-precedence live
+rtnetlink-event listener remains unbuilt (see discovery.py's module
+docstring).
 """
 from __future__ import annotations
 
@@ -36,6 +43,7 @@ from typing import Callable
 # rely on. Mirrors dashboard/dev_server.py's bootstrap.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 
+import discovery
 import health
 import sdnotify
 from ipc_client import Target, WorkerClient, WorkerConnectionError
@@ -70,6 +78,7 @@ def run(
     poll_interval: float = 5.0,
     health_conn: sqlite3.Connection | None = None,
     policy_conn: sqlite3.Connection | None = None,
+    discovery_interval: float | None = None,
 ) -> None:
     """The main control loop. Runs until SIGTERM/SIGINT.
 
@@ -84,6 +93,16 @@ def run(
     a caller could report health without computing policy, or vice
     versa, and keeping them distinct avoids run() assuming its caller's
     wiring. Either or both may be None.
+
+    discovery_interval, if given (not None), starts discovery.py's
+    periodic `ip neigh show` snapshot on its own background thread and
+    its own DB connection (see discovery.run_loop's own docstring for
+    why it must open that connection itself rather than being handed
+    health_conn/policy_conn) for the duration of this call, stopped in
+    the `finally` block below alongside the heartbeat pacer. None (the
+    default) means no discovery loop runs, matching this parameter's
+    absence before 2026-08-30 -- existing callers that don't pass it see
+    no behavior change.
 
     A single failed reconcile cycle (a worker fault, a transient DB
     error) is logged and reported via health_conn rather than crashing
@@ -136,6 +155,14 @@ def run(
         on_error=lambda exc: log.warning("heartbeat failed: %s", exc),
     )
     pacer.start()
+
+    discovery_task = None
+    if discovery_interval is not None:
+        discovery_task = discovery.run_loop(
+            discovery_interval,
+            on_error=lambda exc: log.warning("discovery snapshot failed: %s", exc),
+        )
+
     sdnotify.ready()
 
     try:
@@ -156,6 +183,8 @@ def run(
             time.sleep(poll_interval)
     finally:
         pacer.stop()
+        if discovery_task is not None:
+            discovery_task.stop()
         try:
             client.shutdown("controller_requested")
         except WorkerConnectionError:
@@ -247,17 +276,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gateway-ip", help="Required if --db-path is set.")
     parser.add_argument("--gateway-mac", help="Required if --db-path is set.")
     parser.add_argument("--full-duplex", action="store_true")
+    parser.add_argument(
+        "--discovery-interval", type=float, default=30.0,
+        help="Seconds between discovery.py periodic ip-neigh-show snapshots "
+        "(only runs at all if --db-path is set). See controller/discovery.py's "
+        "module docstring for what this does and doesn't catch.",
+    )
+    parser.add_argument(
+        "--no-discovery", action="store_true",
+        help="Disable the discovery snapshot loop even when --db-path is set "
+        "-- e.g. for a deployment that already runs the snapshot externally "
+        "(cron, a separate process) and doesn't want it duplicated here.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO)
 
     conn: sqlite3.Connection | None = None
+    discovery_interval: float | None = None
     if args.db_path:
         if not args.gateway_ip or not args.gateway_mac:
             parser.error("--db-path requires --gateway-ip and --gateway-mac")
         provider, conn = _build_db_backed_provider(
             args.db_path, args.gateway_ip, args.gateway_mac, args.full_duplex
         )
+        if not args.no_discovery:
+            # discovery.run_loop() opens its own connection internally
+            # (see its docstring for why) -- db.DB_PATH is already set to
+            # args.db_path by _build_db_backed_provider above, so it just
+            # needs to be told to run at all, and at what interval.
+            discovery_interval = args.discovery_interval
     else:
         provider = placeholder_desired_state
 
@@ -268,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         args.poll_interval,
         health_conn=conn,
         policy_conn=conn,
+        discovery_interval=discovery_interval,
     )
     return 0
 

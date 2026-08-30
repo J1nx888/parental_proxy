@@ -637,17 +637,42 @@ replaces its Redis-based approach.
       `controller/desired_state.py` replaces `main.py`'s placeholder
       with a real query (every non-ignored device with an active
       binding). 27 new tests, full suite verified at 298/298 locally
-      and 305/305 on the smoke-test VM. **Partial discovery source
-      added the same day**: `controller/discovery.py` implements just
-      the periodic `ip neigh show` snapshot (the design doc's
-      "missed-event reconciliation" source) — parses real iproute2
-      output, records trusted entries via `identity.record_binding`,
-      idempotent across repeated runs. Not wired into any running
-      loop yet. Still unbuilt: the higher-precedence live rtnetlink-
-      event listener (needs real netlink socket programming, e.g.
-      `pyroute2` — deliberately not rushed alongside the snapshot
-      piece), AdGuard query-log correlation, and active ARP scanning —
-      the other three sources in the design doc's precedence order.
+      and 305/305 on the smoke-test VM. **Discovery source added
+      2026-08-29, wired into a running loop 2026-08-30**:
+      `controller/discovery.py` implements the periodic `ip neigh show`
+      snapshot (the design doc's "missed-event reconciliation" source)
+      — parses real iproute2 output, records trusted entries via
+      `identity.record_binding`, idempotent across repeated runs. This
+      closed a real, previously-flagged gap (RoadMap.md itself,
+      `docs/security/overview.md` §3): nothing was calling it
+      regularly, so `device_bindings` — and therefore Squid's
+      device-identity resolution and nftables policy computation —
+      could go stale indefinitely after a DHCP renewal. `discovery.run_loop()`
+      now drives `snapshot_once()` on a fixed interval via a new shared
+      `controller/periodic.PeriodicTask` (factored out of
+      `lease.HeartbeatPacer`, which is now a thin subclass of it — same
+      tests, same behavior, no interface change), wired into
+      `controller/main.py`'s `run()`/CLI (`--discovery-interval`,
+      `--no-discovery`). Runs on its own background thread with its own
+      DB connection, opened lazily ON that thread — a real bug in the
+      first draft (a `sqlite3.Connection` built on the caller's thread
+      raised `ProgrammingError` when used from the discovery thread) was
+      caught by actually testing it, not just by inspection. Verified
+      for real on the smoke-test VM: a genuine three-thread integration
+      test (main reconcile loop + heartbeat pacer + discovery, one real
+      `AF_UNIX` socket, one real second SQLite connection) plus the full
+      365-test suite, both clean — this also caught and fixed a stale
+      pre-existing test (`test_controller_run_cycle.py` still asserted
+      the pre-`bump_v4` four-key `DesiredPolicy` dict; missed earlier
+      because it's `AF_UNIX`-marked and silently skips on Windows, where
+      that policy_state.py change had only been verified until now).
+      Still unbuilt: the higher-precedence live rtnetlink-event listener
+      (needs real netlink socket programming, e.g. `pyroute2` —
+      deliberately not rushed alongside this), AdGuard query-log
+      correlation, and active ARP scanning — the other three sources in
+      the design doc's precedence order. The snapshot loop's own
+      interval is the freshness bound now, rather than "never," but it's
+      still not sub-second like a live listener would be.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
       sets, atomic apply/rollback. **Scaffold written AND verified
       against real nftables 2026-08-29**, in `phase3/nftables-manager/`
