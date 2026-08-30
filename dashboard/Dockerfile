@@ -9,6 +9,24 @@ COPY common/*.py /app/
 COPY dashboard/dashboard.py dashboard/block_page_server.py /app/
 COPY dashboard/static /app/static
 
+# Port 80 (block_page_server.py, started only when DASHBOARD_URL is set)
+# needs CAP_NET_BIND_SERVICE -- but docker-compose.yml's own `cap_add`
+# alone isn't enough for the non-root `proxy` user below to actually use
+# it: confirmed live 2026-08-30 ("PermissionError: [Errno 13] Permission
+# denied" on bind(), despite the container capability being present)
+# that a container-level capability only reaches a non-root EXECVE if
+# the exec'd BINARY also carries a matching file capability -- the exact
+# same lesson as proxy/Dockerfile's own `setcap` for Squid, hit again
+# here for a completely different process. Granting this to the whole
+# `python3.12` binary (not just this one script) is broad in general,
+# but this image only ever runs `python3 dashboard.py`, so it's
+# equivalent in practice and is the standard fix for a non-root
+# interpreter needing a privileged port (the same pattern node/python
+# images needing port 80/443 commonly use).
+RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && setcap 'cap_net_bind_service=+ep' "$(readlink -f "$(which python3)")"
+
 # Run as the same user the squid helpers use (Debian's `proxy`, uid 13) so the
 # SQLite database and its -wal/-shm files on the shared /config volume stay
 # writable by both containers. A fresh named volume first mounted here is
@@ -16,10 +34,6 @@ COPY dashboard/static /app/static
 RUN mkdir -p /config && chown -R proxy:proxy /config /app
 USER proxy
 
-# Port 80 (block_page_server.py, started only when DASHBOARD_URL is set)
-# needs CAP_NET_BIND_SERVICE granted at the container level -- this
-# non-root `proxy` user can't bind a privileged port on its own. See
-# docker-compose.yml's own comment.
 EXPOSE 8787 80
 
 CMD ["python3", "dashboard.py"]
