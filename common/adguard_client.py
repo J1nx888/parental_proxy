@@ -41,6 +41,15 @@ import path, three separate Squid startup bugs this same session):
   `doh.routes` -- so letting AdGuard build its own config is both
   simpler and version-correct in a way a template can't be kept in sync
   with automatically).
+- `/control/filtering/status`'s `user_rules` key is `null`, not `[]`,
+  on a freshly-configured instance that has never had a custom rule set
+  -- confirmed live 2026-08-30 running the full interception stack
+  against a brand-new AdGuard container for the first time ever (every
+  earlier live AdGuard test this project ran had already pushed at
+  least one custom rule by the time `get_custom_rules` was exercised,
+  which is exactly why this hadn't surfaced before). `get_custom_rules`
+  below treats `null`/missing as "no rules yet" (empty list), same as
+  `[]` -- NOT as a malformed response.
 
 No third-party dependencies -- matches common/cr_api.py's own
 urllib-based pattern, mirrored here, rather than adding `requests` to a
@@ -125,8 +134,15 @@ def get_custom_rules(
     except ValueError as exc:
         raise AdGuardError(f"malformed JSON from {base_url}/control/filtering/status: {exc}") from exc
     rules = decoded.get("user_rules") if isinstance(decoded, dict) else None
+    if rules is None:
+        # A freshly-configured instance that's never had a custom rule set
+        # reports `null` here, not `[]` -- see this module's docstring.
+        # Treat it the same as an empty list rather than raising, or
+        # sync_once() could never complete its very first cycle against a
+        # brand-new AdGuard instance (it always reads before it writes).
+        rules = []
     if not isinstance(rules, list):
-        raise AdGuardError("AdGuard Home's filtering/status response had no 'user_rules' list")
+        raise AdGuardError("AdGuard Home's filtering/status response had a non-list 'user_rules'")
     return [str(r) for r in rules]
 
 
