@@ -92,25 +92,43 @@ or non-interactive deploys:
 5. Approve shows/sites per user ahead of time, or reactively from the
    **Report** page as blocks show up.
 
-## Two-container architecture
+## Three-container architecture
 
-Two services, defined in `docker-compose.yml` at the project root, sharing
-one named Docker volume:
+Three services, defined in `docker-compose.yml` at the project root:
 
 - **`proxy`** (container name `parental-proxy`, built from
   `proxy/Dockerfile`) — the SSL-bumping Squid proxy, running in native
   intercept mode since 2026-08-30 (`http_port 3129 intercept` /
   `https_port 3130 intercept ssl-bump`; see RoadMap.md's Squid
-  intercept-mode section). Runs `proxy/entrypoint.sh` as its `ENTRYPOINT`.
+  intercept-mode section). Runs `proxy/entrypoint.sh` as its `ENTRYPOINT`,
+  and (since 2026-08-30) `network_mode: host` -- see
+  [Networking notes](#networking-notes).
+- **`adguard`** (container name `parental-proxy-adguard`, built from
+  `adguard/Dockerfile`, added 2026-08-30) — a thin wrapper around the
+  official `adguard/adguardhome:v0.107.79` image, adding only an
+  automated first-run bootstrap (`adguard/entrypoint.sh`, via AdGuard's
+  own `/control/install/configure` API — no manual setup wizard). This is
+  what enforces the hard-deny invariant for `mode='bump'` domains on
+  non-`bump_enabled` devices (see `docs/security/overview.md` §3 and
+  `controller/adguard_sync.py`). Also `network_mode: host`. Has its own
+  two volumes (`pp_adguard_conf`, `pp_adguard_work`) — separate from
+  proxy/dashboard's shared one, since it isn't part of this project's own
+  application data.
 - **`dashboard`** (container name `parental-proxy-dashboard`, built from
   `dashboard/Dockerfile`) — the Flask web UI (`dashboard/dashboard.py`).
-  Listens on port `8787`, run as the `proxy` user (Debian uid 13).
+  Listens on port `8787`, run as the `proxy` user (Debian uid 13). Stays
+  on the default bridge network, published via `DASHBOARD_BIND` — it
+  doesn't participate in traffic interception, so it has no reason to
+  need host networking.
 
-Both mount the same named volume, **`pp_config`**, at **`/config`** in each
-container. That's where the shared SQLite database
+`proxy` and `dashboard` mount the same named volume, **`pp_config`**, at
+**`/config`** in each container. That's where the shared SQLite database
 (`/config/parental_proxy.db`) and the generated CA cert/key
-(`/config/ssl_cert/`) live — there's no other IPC between the two containers;
-they coordinate purely through files on this shared volume.
+(`/config/ssl_cert/`) live — there's no other IPC between them; they
+coordinate purely through files on this shared volume. `adguard` is
+otherwise fully independent — it currently has no coded integration with
+the shared database at all except through `controller/adguard_sync.py`,
+which talks to it purely over its own HTTP API, not the shared volume.
 
 ### Startup order dependency
 
@@ -149,7 +167,8 @@ window, per the ownership-repair logic on both sides.
 
 All variables are optional; defaults apply if a line is missing. Source:
 `.env.example` (LOCAL_NETWORK, DASHBOARD_USER, DASHBOARD_PASSWORD,
-DASHBOARD_BIND, DASHBOARD_URL) and `docker-compose.yml`'s `environment:`
+DASHBOARD_BIND, DASHBOARD_URL, ADGUARD_USERNAME, ADGUARD_PASSWORD,
+ADGUARD_WEB_BIND) and `docker-compose.yml`'s `environment:`
 blocks (which also inject DASHBOARD_HOST, PP_DB_PATH, PP_CA_CERT_PATH into
 the dashboard container).
 
@@ -165,6 +184,9 @@ the dashboard container).
 | `PP_CA_CERT_PATH` | dashboard | Path to the generated CA certificate, used by the dashboard's CA-download endpoint (Users page download link). Hardcoded in `docker-compose.yml`. | `/config/ssl_cert/ca_cert.pem` |
 | `CA_ORG` | proxy (`entrypoint.sh`) | Organization name (`/O=`) baked into the generated CA certificate's subject. Not present in `.env.example`; set it directly in `docker-compose.yml`'s proxy environment block or as a shell-exported var if you want to override it. | `Parental Proxy` |
 | `CA_COMMON_NAME` | proxy (`entrypoint.sh`) | Common name (`/CN=`) baked into the generated CA certificate's subject. Same override mechanism as `CA_ORG`. | `Parental Proxy CA` |
+| `ADGUARD_USERNAME` | adguard (`adguard/entrypoint.sh`, first run only) | AdGuard Home's own admin login username -- a separate account from this project's dashboard. | `admin` |
+| `ADGUARD_PASSWORD` | adguard (`adguard/entrypoint.sh`, first run only) | AdGuard Home's own admin login password. If left blank, a random one is generated and printed to the adguard container's own logs (`docker compose logs adguard`). Must match whatever `controller/main.py --adguard-password` is later run with. | (blank → auto-generated) |
+| `ADGUARD_WEB_BIND` | adguard (`adguard/entrypoint.sh`, first run only) | Which address AdGuard Home's own admin UI binds to. `127.0.0.1` = this machine only; `0.0.0.0` = reachable from any device on the LAN. Independent of `DASHBOARD_BIND` -- this gates a second, separate admin login surface. | `127.0.0.1` |
 
 Notes:
 - `DASHBOARD_HOST`, `PP_DB_PATH`, and `PP_CA_CERT_PATH` are not meant to be
@@ -219,49 +241,61 @@ SSL-bump can't defeat pinning without modifying the app.
 
 ## Networking notes
 
+**As of 2026-08-30, `docker-compose.yml` runs both `proxy` and `adguard`
+with `network_mode: host`** — a change from this project's earlier
+bridge-networked setup, made after a live verification pass found that
+bridge networking doesn't just affect the LAN-IP check below, it
+actually breaks Squid's `SO_ORIGINAL_DST` destination recovery and
+AdGuard's per-client rule matching entirely, since `phase3/nftables-
+manager`'s redirect rules fire in the host's own network namespace and
+a bridge-networked container is a different namespace (see RoadMap.md's
+live-verification section for the full writeup). This is Linux-only —
+Docker Desktop (Windows/Mac) doesn't support `network_mode: host` the
+same way, so local development/testing there still needs the
+`LOCAL_NETWORK`-blank workaround below. `dashboard` is unaffected and
+stays on the default bridge network, since it doesn't participate in
+any traffic interception.
+
 `LOCAL_NETWORK` (the LAN CIDR check) has a platform-dependent caveat,
 documented in `.env.example`:
 
-> This check only works when the proxy sees real client IPs, i.e. with host
-> networking on Linux. Under Docker Desktop (Windows/Mac) or plain bridge
-> networking the proxy sees an internal gateway address instead, and this
-> would reject every request. In that case leave it blank (here or in the
-> dashboard) to disable the check -- see docs/security/overview.md for what's
-> left gating Squid access once this is off.
-
-In other words:
-- **Linux with host networking**: the proxy container can see clients' real
-  LAN IPs, so `LOCAL_NETWORK` correctly restricts proxy use to that CIDR.
-  Since 2026-08-30, there is no per-request login behind it at all (see
-  `docs/security/overview.md` §3/§7) — this CIDR check, alongside nftables
-  only ever redirecting a bump-enabled device's own IP to Squid in the
-  first place (Phase 3, once deployed), is what stands between arbitrary
-  LAN traffic and being treated as a specific user.
-- **Docker Desktop (Windows/Mac) or plain bridge networking**: the proxy
-  only sees an internal Docker gateway address for every connection,
-  regardless of the real client. Leaving `LOCAL_NETWORK` set in this
-  environment would reject *every* request. Set it to blank (via `.env`,
-  or `none`/`off`/`disabled` at the `setup.sh` prompt, or later from the
-  dashboard's Settings page) to disable the CIDR check entirely — at which
-  point nftables' `bump_v4` set membership (Phase 3) is the only thing
-  left gating which traffic reaches Squid at all.
+- **Linux (the supported deployment target, host networking)**: the
+  proxy container sees clients' real LAN IPs, so `LOCAL_NETWORK`
+  correctly restricts proxy use to that CIDR. Since 2026-08-30, there is
+  no per-request login behind it at all (see `docs/security/overview.md`
+  §3/§7) — this CIDR check, alongside nftables only ever redirecting a
+  bump-enabled device's own IP to Squid in the first place (Phase 3,
+  once deployed), is what stands between arbitrary LAN traffic and being
+  treated as a specific user.
+- **Docker Desktop (Windows/Mac), or if `network_mode: host` is ever
+  reverted to bridge networking**: the proxy only sees an internal
+  Docker gateway address for every connection, regardless of the real
+  client, and Squid's own destination recovery breaks too. Leaving
+  `LOCAL_NETWORK` set in this environment would reject *every* request.
+  Set it to blank (via `.env`, or `none`/`off`/`disabled` at the
+  `setup.sh` prompt, or later from the dashboard's Settings page) to
+  disable the CIDR check entirely — at which point nftables' `bump_v4`
+  set membership (Phase 3) is the only thing left gating which traffic
+  reaches Squid at all, and Squid itself won't work correctly regardless
+  (see the security doc's networking caveat).
 - This setting is editable at runtime from the dashboard (Settings page)
   without restarting either container — the `.env` value only seeds it on
   first run (`db.set_setting_if_absent` in `entrypoint.sh`).
 
-`docker-compose.yml` itself does not configure `network_mode: host` for the
-proxy service — it uses default bridge networking with explicit port
-mappings (`3129:3129`, `3130:3130`, updated 2026-08-30 from the old
-`3128:3128`). Host networking, where relevant, would be a Linux-specific
-override to the compose file, not the shipped default.
-
 ## Port mappings
 
-| Port | Service | Compose mapping | Notes |
+With `network_mode: host`, `proxy` and `adguard`'s ports bind directly to
+the host's own interfaces — there's no compose-level port mapping to look
+at for them, only what each service's own config asks for.
+
+| Port | Service | Reachable from | Notes |
 |---|---|---|---|
-| `3129` | proxy | `"3129:3129"` (all interfaces) | Squid's intercept-mode HTTP port (`http_port 3129 intercept`). No device configures a proxy setting for this -- it's a NAT-redirect target for Phase 3's interception layer once deployed. |
-| `3130` | proxy | `"3130:3130"` (all interfaces) | Squid's intercept-mode HTTPS/SSL-Bump port (`https_port 3130 intercept ssl-bump ...`). Same NAT-redirect model as 3129. |
-| `8787` | dashboard | `"${DASHBOARD_BIND:-127.0.0.1}:8787:8787"` | Flask dashboard. Bound only to `127.0.0.1` on the host by default — **not LAN-reachable** unless `DASHBOARD_BIND=0.0.0.0` is set (see the `DASHBOARD_BIND` row above). Remote access to a `127.0.0.1`-bound dashboard requires SSH port-forwarding. |
+| `3128` | proxy | loopback only (`127.0.0.1`) | Plain, non-intercept `http_port` — exists purely so Squid has a "normal" address to build its own internal URLs from (built-in icons); never carries real traffic. Added 2026-08-30 after a live boot found intercept-only Squid FATALs without it. |
+| `3129` | proxy | all host interfaces | Squid's intercept-mode HTTP port (`http_port 3129 intercept`). No device configures a proxy setting for this -- it's a NAT-redirect target for Phase 3's interception layer once deployed. |
+| `3130` | proxy | all host interfaces | Squid's intercept-mode HTTPS/SSL-Bump port (`https_port 3130 intercept ssl-bump ...`). Same NAT-redirect model as 3129. |
+| `3000` | adguard | `ADGUARD_WEB_BIND` (default `127.0.0.1`) | AdGuard Home's own admin UI — a separate login from this project's dashboard. Defaults to loopback-only for the same reason `DASHBOARD_BIND` does; set `ADGUARD_WEB_BIND=0.0.0.0` to expose it on the LAN. |
+| `5353` | adguard | all host interfaces | AdGuard Home's DNS listener — the redirect target for `phase3/nftables-manager`'s `authenticated_v4`/`unauthenticated_v4` DNS rules once deployed. |
+| `8787` | dashboard | `"${DASHBOARD_BIND:-127.0.0.1}:8787:8787"` (bridge network, published) | Flask dashboard. Bound only to `127.0.0.1` on the host by default — **not LAN-reachable** unless `DASHBOARD_BIND=0.0.0.0` is set (see the `DASHBOARD_BIND` row above). Remote access to a `127.0.0.1`-bound dashboard requires SSH port-forwarding. |
 
 ## CI
 

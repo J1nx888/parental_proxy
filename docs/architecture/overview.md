@@ -52,8 +52,32 @@ dashboard/                    Flask container
 defaults/
   seed_defaults.py              idempotent first-run seed data (seed())
 
-docker-compose.yml             two services (proxy, dashboard) sharing the pp_config volume
+adguard/                      AdGuard Home container (Phase 3, added 2026-08-30)
+  Dockerfile                     thin wrapper: FROM adguard/adguardhome:v0.107.79
+  entrypoint.sh                  automated first-run bootstrap via AdGuard's own
+                                  /control/install/configure API -- no manual setup wizard
+
+docker-compose.yml             three services (proxy, adguard, dashboard) -- proxy and adguard
+                                run with network_mode: host (see docker-compose.yml's own comment:
+                                required for nftables' redirect + SO_ORIGINAL_DST/per-client DNS
+                                matching to work at all -- a bridge-networked container is a
+                                different network namespace from where phase3/nftables-manager's
+                                redirect actually fires); dashboard alone stays on the default
+                                bridge network, published via DASHBOARD_BIND. proxy and dashboard
+                                share the pp_config volume; adguard has its own separate
+                                pp_adguard_conf/pp_adguard_work volumes.
 ```
+
+Phase 3's remaining pieces -- `controller/` (Python) and
+`phase3/arp-worker/`, `phase3/nftables-manager/` (Go) -- are not yet in
+this compose file at all (no Dockerfile for any of them yet); see
+RoadMap.md's Milestone list and `docs/design/phase3-technical-design.md`
+for those. `controller/adguard_sync.py` (the process that actually
+computes and pushes AdGuard's per-client hard-deny rules) is one of the
+pieces that isn't containerized yet -- it has to be run by hand for now
+(`python3 controller/main.py --db-path ... --adguard-url ... --adguard-username
+... --adguard-password ...`), with credentials matching whatever this
+compose file's `ADGUARD_USERNAME`/`ADGUARD_PASSWORD` are set to.
 
 Both container images `COPY common/*.py` into their own image root (proxy's
 `/opt/parental-proxy/`, dashboard's `/app/`) and add that directory to
@@ -78,7 +102,13 @@ take effect everywhere.
   `main()`), not Flask's dev server.
 - **SQLite** (stdlib `sqlite3`), WAL mode, as the only datastore -- no
   Postgres/Redis/etc.
-- **Docker / docker-compose** -- two services, one named volume.
+- **Docker / docker-compose** -- three services (proxy, adguard, dashboard);
+  proxy/dashboard share one named volume, adguard has its own two.
+- **AdGuard Home** (`adguard/adguardhome:v0.107.79`, pinned rather than
+  `latest`) -- the DNS tier's filtering engine, and (since 2026-08-30) what
+  enforces the hard-deny invariant for `mode='bump'` domains on non-
+  `bump_enabled` devices via its `$client=`-scoped custom filtering rules
+  (see `controller/adguard_sync.py`).
 
 ---
 

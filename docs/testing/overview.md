@@ -156,9 +156,17 @@ detail, not a full table refresh -- this table predates several later
 additions to `tests/` (Phase 3's `phase3/arp-worker`/`phase3/nftables-manager`
 Go test suites aren't Python and aren't counted here at all; the Python
 `tests/` directory itself has also grown past this table's original per-file
-counts). Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (358 as of 2026-08-30) rather than trusting the sum of
-this table.
+counts, most recently `tests/test_adguard_client.py` and
+`tests/test_controller_adguard_sync.py`, added 2026-08-30 for
+`common/adguard_client.py`'s HTTP client and `controller/adguard_sync.py`'s
+rule-building/merge/run_loop logic -- same mocked-network pattern as
+`tests/test_cr_api.py` and `tests/test_controller_discovery.py`
+respectively). Run `pytest --collect-only -q` against `tests/` for a live,
+authoritative total (389 as of 2026-08-30, run on Linux, where every test
+actually runs -- several files marked `AF_UNIX`-only skip on Windows,
+where `socket.AF_UNIX` doesn't exist; a Windows run of the same suite at
+this commit collects 369 passed, 20 skipped) rather than trusting the sum
+of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

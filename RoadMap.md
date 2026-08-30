@@ -397,14 +397,58 @@ entirely in the policy-computation and enforcement layers:
       `/var/log/squid/cache.log`, not stdout) — fixed by adding a
       loopback-only, non-`intercept` `http_port 127.0.0.1:3128` purely
       so that URL construction has somewhere valid to point at.
-- [ ] **AdGuard Home integration — not started at all yet** (this repo
-      has designed *for* AdGuard, never actually integrated it). When
-      built, it needs a per-client rule set that blocks every
-      `domains.mode = 'bump'` domain outright for devices where
-      `bump_enabled = 0`, and allows normal resolution for
-      `bump_enabled = 1` devices — this is what makes the hard-deny
-      invariant above real. Needs a friendly landing page for the
-      blocked case, mirroring the existing `/blocked` page pattern.
+- [x] **AdGuard Home integration** — done 2026-08-30, and the hard-deny
+      invariant above is now real, not just designed for. `adguard/`
+      wraps the official `adguard/adguardhome:v0.107.79` image with an
+      automated first-run bootstrap (`entrypoint.sh`, via AdGuard's own
+      `/control/install/configure` API — no manual wizard);
+      `common/adguard_client.py` is a thin stdlib-only REST client;
+      `controller/adguard_sync.py` builds one AdGuard regex rule per
+      `mode = 'bump'` domain, scoped via the `$client=ip1,ip2` modifier
+      to every currently non-`bump_enabled` device's active IP, and
+      pushes it as a full-replace via `/control/filtering/set_rules` --
+      same idempotent-full-reconcile shape as everywhere else in this
+      codebase. Wired into `controller/main.py` as a third periodic task
+      alongside the heartbeat pacer and discovery loop
+      (`--adguard-url`/`--adguard-username`/`--adguard-password`/
+      `--adguard-interval`).
+
+      **Verified live end-to-end 2026-08-30**, not just unit-tested:
+      real `docker compose` stack (proxy + adguard + dashboard), a real
+      bump-mode domain, two real client containers with real
+      `device_bindings` rows (one `bump_enabled=1`, one `bump_enabled=0`)
+      — `dig`ging that domain from the non-bump client returned `0.0.0.0`
+      (hard-denied), the identical query from the bump-enabled client
+      resolved normally (so Squid can still refine it), and an unrelated
+      domain resolved fine from the non-bump client too (the deny is
+      scoped, not a blanket block). Also confirmed the merge logic for
+      real: a hand-added "admin's own" AdGuard rule survived untouched
+      across a sync cycle that replaced a stale managed block sitting
+      right next to it.
+
+      Three real bugs found and fixed while first booting this against
+      a real instance (same category as the Squid pass immediately
+      before this one — see the live-verification section below):
+      (1) `/install/configure` and `/install/get_addresses` are NOT the
+      real paths despite what AdGuard's own generated OpenAPI-doc
+      tooling implies — every route lives under `/control`, even before
+      the instance is configured at all; (2) requesting AdGuard's admin
+      UI bind directly onto `127.0.0.1` (this project's own secure
+      default, mirroring `DASHBOARD_BIND`) self-conflicted with
+      `install/configure`'s own bind-validation check against its still-
+      running pre-configure listener on that exact address — fixed by
+      always configuring onto the wildcard address first, then rewriting
+      `AdGuardHome.yaml`'s `http.address` directly and restarting onto
+      it if a non-wildcard bind was actually requested.
+
+      Not yet done: a friendly landing page for the blocked case
+      (mirroring the existing `/blocked` page pattern) — right now a
+      hard-denied bump-mode domain on a non-bump device just gets
+      `0.0.0.0`/a generic browser connection error, no explanation.
+      `controller/main.py` also still has no Dockerfile/compose service
+      of its own (a pre-existing gap, unrelated to this item), so the
+      sync loop currently has to be run by hand with credentials
+      matching whatever's in `ADGUARD_USERNAME`/`ADGUARD_PASSWORD`.
 - [ ] **Captive portal (Phase 4) — not started**, but now has concrete
       shape from this session's discussion: gate any newly-seen MAC
       not already registered as bypass/ignore; a kid-facing login that
@@ -450,12 +494,12 @@ interception layer, exactly matching the "interception scope and
 policy scope are different axes" design decision.
 
 This is the strongest verification available without a real LAN.
-What's still unverified: real AdGuard behind these redirects (the
-Squid gap this note originally called out is closed below), a real
-switch's more complex behavior (STP, VLANs, actual physical NICs)
-instead of a Linux bridge, and everything the Orbi validation section
-below calls out (mesh roaming, wireless backhaul, satellite-attached
-clients).
+What's still unverified: the two gaps this note originally called out
+(real Squid, real AdGuard behind these redirects) are both closed
+below now. What remains is a real switch's more complex behavior (STP,
+VLANs, actual physical NICs) instead of a Linux bridge, and everything
+the Orbi validation section below calls out (mesh roaming, wireless
+backhaul, satellite-attached clients).
 
 ### Squid intercept mode + bump_v4, verified live end-to-end (2026-08-30)
 
@@ -515,6 +559,44 @@ none of them exercise a real container boot. All test/seed artifacts
 (client containers, the nftables table, DB rows) were torn down
 afterward; the VM was left at a clean `docker compose down -v` state,
 matching how this pass found it.
+
+### AdGuard Home hard-deny, verified live end-to-end (2026-08-30)
+
+Immediately following the Squid pass above, closed the last item on
+this checklist the same way: real `docker compose` stack (`proxy` +
+the new `adguard` service + `dashboard`), real AdGuard Home
+`v0.107.79`, real client containers, real DNS queries -- nothing
+mocked. See the checklist item above for the three real bugs found
+getting AdGuard to boot automated at all; this section is the actual
+end-to-end proof once it was up.
+
+Two client containers on the compose network, two real `devices`/
+`device_bindings` rows (one `bump_enabled=1`, one `bump_enabled=0`) and
+one bump-mode domain (`example.com`, plus the always-seeded
+`crunchyroll.com`). Ran the real `controller/adguard_sync.sync_once()`
+against the real shared DB and the real running AdGuard instance --
+confirmed it pushed exactly the two expected rules
+(`/(?i)(?:^|\.)(?:crunchyroll\.com)$/$client=<non-bump-ip>` and the same
+for `example.com`), each scoped to only the non-bump device's IP. Then
+the actual test: `dig`ging `example.com` from the non-bump client
+returned `0.0.0.0` (hard-denied, exactly the invariant this whole item
+exists for); the identical query from the bump-enabled client resolved
+to real IPs (so Squid still gets a chance to refine it); a third,
+unrelated domain (`wikipedia.org`) resolved fine from the *non-bump*
+client too, confirming the deny is scoped to bump-mode domains
+specifically, not a blanket block for that device.
+
+Also verified the merge logic that keeps this from ever touching an
+admin's own AdGuard configuration: manually pushed a fake "admin rule"
+(`||some-admin-added-rule.example^`) sitting right next to a stale,
+already-bracketed managed block, ran `sync_once()` again, and confirmed
+the admin rule survived byte-for-byte in its original position while
+the stale block was replaced with the fresh, correct one.
+
+All test containers, DB rows, and the AdGuard/proxy/dashboard volumes
+were torn down afterward (`docker compose down -v`); the VM was left at
+a clean state, and the full pytest suite re-confirmed 389 passed, 0
+skipped.
 
 ### Fail-open engineering (a correction to an earlier assumption)
 

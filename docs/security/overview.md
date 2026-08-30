@@ -231,6 +231,36 @@ direction, but it's still a real, bounded-but-nonzero gap, not a
 hypothetical one. See RoadMap.md Milestone 4 and
 `controller/discovery.py`'s docstring.
 
+### The hard-deny invariant: what stops a non-bump device from ever seeing a `mode='bump'` domain
+
+Squid's own identity resolution above only ever runs for traffic that
+already reached Squid's intercept ports — which nftables only routes
+there for a `bump_enabled = 1` device (`bump_v4` set membership) in the
+first place. For every OTHER device, the actual enforcement point is
+one layer earlier, at DNS: **`controller/adguard_sync.py`** (added
+2026-08-30, closing the last gap this section used to flag) computes,
+for every `domains.mode = 'bump'` row, a per-client AdGuard Home
+filtering rule (`$client=ip1,ip2,...`) scoped to exactly the devices
+that are currently NOT `bump_enabled`, and pushes the full set as a
+`/control/filtering/set_rules` replace every sync cycle. A non-bump
+device's DNS query for a bump-mode domain (Crunchyroll, or any other
+domain an admin sets to `bump`) never even resolves — confirmed live
+against a real AdGuard Home instance to return `0.0.0.0`, not merely
+designed to. This is what makes the "two independent axes" architecture
+(RoadMap.md, locked 2026-08-30) actually hold in practice: a device
+that's authenticated but not bump-enabled gets normal DNS-tier
+protection for everything else, but is structurally incapable of
+resolving a domain the household has marked as needing Squid's
+refinement, regardless of what app or client makes the request.
+
+Same freshness caveat as the DHCP note above applies here too — a
+device's current IP has to already be in `device_bindings` (via the
+discovery loop) before `adguard_sync` can scope a deny rule to it, and
+the AdGuard sync itself runs on its own interval (`--adguard-interval`,
+default 30s). A brand-new or just-renewed device is briefly unresolved
+by identity, not un-denied by policy — see `controller/adguard_sync.py`'s
+own `build_rules()` docstring.
+
 ---
 
 ## 4. The `external_acl_type` helper protocol — internal trust boundary
@@ -473,22 +503,42 @@ An empty `local_network` setting **disables this check entirely** —
 
 ### The Docker networking caveat
 
-`.env.example` documents why an operator might need to disable this check:
+**As of 2026-08-30, `docker-compose.yml`'s `proxy` service runs with
+`network_mode: host`** — not the plain bridge networking this section
+originally warned about — specifically because bridge networking was
+found (via a live verification pass, see RoadMap.md) to break more than
+just this LAN-IP check: it also breaks Squid's own `SO_ORIGINAL_DST`
+destination recovery entirely, since `phase3/nftables-manager`'s
+redirect fires in the host's own network namespace and a bridge-
+networked container is a different namespace. Host networking fixes
+both at once — the proxy now sees real client IPs, so this check works
+correctly on the intended deployment target (a native Linux Docker
+host; **not** Docker Desktop on Windows/Mac, which doesn't support
+`network_mode: host` the same way).
 
-> NOTE: this check only works when the proxy sees real client IPs, i.e. with
-> host networking on Linux. Under Docker Desktop (Windows/Mac) or plain
-> bridge networking the proxy sees an internal gateway address instead, and
-> this would reject every request. In that case leave it blank (here or in
-> the dashboard) to disable the check.
-
-This is echoed in the Settings page hint text in `dashboard.py`
-(`SETTINGS_BODY`) and in `README.md`. **An agent changing networking mode
-(e.g. adding a bridge-mode Docker Compose profile) should recognize that
-doing so silently makes this defense layer unable to distinguish LAN clients
-from anything else**, and that the documented mitigation — disabling the
-check outright — now leaves nftables' bump_v4 IP-set membership (RoadMap.md)
-as the only thing gating which traffic reaches Squid's intercept ports at
+`.env.example` still documents the fallback for testing under Docker
+Desktop or another environment where real client IPs genuinely aren't
+visible: leave `LOCAL_NETWORK` blank (here or in the dashboard's
+Settings page) to disable the check. **An agent reintroducing bridge
+networking for this service should recognize that doing so silently
+makes this defense layer unable to distinguish LAN clients from
+anything else, AND breaks Squid's own interception mechanism** — see
+RoadMap.md's live-verification section for exactly how that failure
+looks in practice. The documented mitigation (disabling the check
+outright) leaves nftables' `bump_v4` IP-set membership (RoadMap.md) as
+the only thing gating which traffic reaches Squid's intercept ports at
 all, with no LAN-range check or credential behind it.
+
+The new `adguard` service (2026-08-30, see §3's hard-deny note below)
+runs with `network_mode: host` for the same underlying reason —
+`phase3/nftables-manager`'s DNS-tier redirect (`udp/tcp dport 53
+redirect to :5353`) also fires in the host's own namespace, and
+AdGuard's own per-client `$client=` rules need to see devices' real LAN
+IPs to mean anything at all. Its own admin UI (separate from this
+project's dashboard) defaults to `127.0.0.1`-only via `ADGUARD_WEB_BIND`,
+mirroring `DASHBOARD_BIND`'s reasoning exactly — with host networking,
+container-level port publishing no longer applies, so the app's own
+listen address is what actually gates LAN exposure.
 
 ### Current LAN-only assumptions worth revisiting before any internet-facing deployment
 
