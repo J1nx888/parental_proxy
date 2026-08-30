@@ -187,6 +187,7 @@ the dashboard container).
 | `ADGUARD_USERNAME` | adguard (`adguard/entrypoint.sh`, first run only) | AdGuard Home's own admin login username -- a separate account from this project's dashboard. | `admin` |
 | `ADGUARD_PASSWORD` | adguard (`adguard/entrypoint.sh`, first run only) | AdGuard Home's own admin login password. If left blank, a random one is generated and printed to the adguard container's own logs (`docker compose logs adguard`). Must match whatever `controller/main.py --adguard-password` is later run with. | (blank → auto-generated) |
 | `ADGUARD_WEB_BIND` | adguard (`adguard/entrypoint.sh`, first run only) | Which address AdGuard Home's own admin UI binds to. `127.0.0.1` = this machine only; `0.0.0.0` = reachable from any device on the LAN. Independent of `DASHBOARD_BIND` -- this gates a second, separate admin login surface. | `127.0.0.1` |
+| `ADGUARD_SKIP_EXTRA_BLOCKLISTS` | adguard (`adguard/entrypoint.sh`, first run only) | Set to `1` to skip subscribing to the curated uBlockOrigin/uAssets domain-blocking lists (added 2026-08-30) and keep only AdGuard Home's own default filter (enabled automatically, no action needed for that part). See RoadMap.md's live-verification section for exactly which lists and why. | (blank -> lists added) |
 
 Notes:
 - `DASHBOARD_HOST`, `PP_DB_PATH`, and `PP_CA_CERT_PATH` are not meant to be

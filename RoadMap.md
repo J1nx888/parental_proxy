@@ -598,6 +598,59 @@ were torn down afterward (`docker compose down -v`); the VM was left at
 a clean state, and the full pytest suite re-confirmed 389 passed, 0
 skipped.
 
+### Network-wide ad blocking via curated uBlockOrigin/uAssets lists (2026-08-30)
+
+Added immediately after the hard-deny work above, at the user's
+request ("pull in the list of assets from uBlockOrigin"). Corrected a
+wrong assumption along the way, worth remembering: **AdGuard Home's own
+`/control/install/configure` already registers and enables "AdGuard DNS
+filter" automatically**, with real rules populated within seconds of
+configuring (confirmed live: 179,158 rules) — checking the raw
+`AdGuardHome.yaml` file too early (as an earlier point in this same
+session did) makes it look like zero filters are active, which isn't
+true once the live `/control/filtering/status` API is checked instead.
+This isn't filling an empty void, then — it's a genuine complementary
+layer on an already-functioning baseline, and the user's own follow-up
+question ("or does AdBlock natively perform this function already")
+was the right question to ask.
+
+uBlock Origin's own lists are written for a browser extension (cosmetic
+element-hiding, JS scriptlet injection) that a DNS server fundamentally
+cannot apply — pulling in the whole `uAssets` repo blindly would mostly
+be wasted bytes. Instead of guessing, each candidate list was actually
+subscribed to on a throwaway AdGuard instance and its resulting
+`rules_count` (the DOMAIN-blocking subset AdGuard's DNS engine can
+actually use) checked before committing to it: `filters.txt` (uBO's
+main list, 6,076 usable rules despite being mostly cosmetic overall),
+`badware.txt` (4,290), `privacy.txt` (1,743), `resource-abuse.txt`
+(77), and `unbreak.txt` (2,543 — the matching exceptions list for the
+other four, included specifically to counteract their false
+positives). Explicitly left out: `annoyances*.txt` (cookie-banner/
+cosmetic-heavy, real over-blocking risk for low DNS-blocking value),
+`experimental.txt` (opt-in even within uBO itself), the per-year
+`filters-20XX.txt` archives, and `ubol-filters.txt`/`lan-block.txt`/
+`ubo-link-shorteners.txt` (niche, not obviously a sane household
+default).
+
+Wired into `adguard/entrypoint.sh`'s existing first-run bootstrap (right
+after `/control/install/configure` succeeds) via
+`/control/filtering/add_url` for each list — `ADGUARD_SKIP_EXTRA_BLOCKLISTS=1`
+opts out and keeps only AdGuard's own default filter. One more small
+real finding: this Alpine-based image's busybox `wget` has no
+`--user`/`--password` flags at all, so the `Authorization: Basic` header
+for these (post-configuration, login-protected) calls has to be built
+by hand -- using busybox's own `base64` applet, confirmed present in
+this image.
+
+**Verified live end-to-end** through the real `docker compose` bootstrap
+flow (not just the throwaway probe used to pick the lists): all 5 lists
+plus AdGuard's own default filter came up enabled with the same rule
+counts as the probe, and real ad/tracker domains
+(`doubleclick.net`, `pagead2.googlesyndication.com`) resolved to
+`0.0.0.0` from a client container on the compose network. Full pytest
+suite re-confirmed clean (389 passed) afterward; VM left at a clean
+`docker compose down -v` state.
+
 ### Fail-open engineering (a correction to an earlier assumption)
 
 Linux neighbor-cache entries are a state machine, not a fixed TTL — a

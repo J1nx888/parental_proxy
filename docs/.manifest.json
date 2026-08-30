@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "last_run": "2026-08-30T18:00:00Z",
+  "last_run": "2026-08-30T19:00:00Z",
   "sections": {
     "architecture": {
       "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "adguard/", "defaults/", "dashboard/dashboard.py"],
-      "fingerprint": "72fb095fc4d063b1eb3f4823744f290ad238dd67284af130d9ff637e74ae5ddf",
+      "fingerprint": "cca3367f60b0b3c357243f8f226bb84b94ffed9894b1d28813b8c8386b81320a",
       "doc_path": "docs/architecture/overview.md",
-      "last_updated": "2026-08-30T18:00:00Z"
+      "last_updated": "2026-08-30T19:00:00Z"
     },
     "dashboard": {
       "source_paths": ["dashboard/", "common/db.py", "common/matching.py"],
@@ -22,15 +22,15 @@
     },
     "deployment": {
       "source_paths": ["docker-compose.yml", "proxy/Dockerfile", "adguard/Dockerfile", "adguard/entrypoint.sh", "dashboard/Dockerfile", "proxy/entrypoint.sh", "setup.sh", ".env.example", ".github/workflows/tests.yml", "README.md"],
-      "fingerprint": "48d4ac8cf59a373b1ab42ada9cf6596deec898286b7edce63ead1d7610ee8d04",
+      "fingerprint": "f0f072415edaaeacd60c8ccedee7c7d2d4b11e439c2e76198ea327e184171336",
       "doc_path": "docs/deployment/setup.md",
-      "last_updated": "2026-08-30T18:00:00Z"
+      "last_updated": "2026-08-30T19:00:00Z"
     },
     "security": {
       "source_paths": ["common/auth.py", "proxy/authz_helper.py", "proxy/sni_helper.py", "common/squid_helper.py", "proxy/entrypoint.sh", "proxy/squid.conf.template", "dashboard/dashboard.py", "common/device_identity.py", "common/adguard_client.py", "controller/adguard_sync.py", "adguard/entrypoint.sh"],
-      "fingerprint": "595d61432fa3e6dfd27f7682caca0988f2294568192e56c4b1e09e2d7b5fd3ed",
+      "fingerprint": "cb69b901b8f5ef7f58b0065a3376b1afab57724989303a37012b4b47ed2de730",
       "doc_path": "docs/security/overview.md",
-      "last_updated": "2026-08-30T18:00:00Z"
+      "last_updated": "2026-08-30T19:00:00Z"
     },
     "testing": {
       "source_paths": ["tests/", "pytest.ini", "requirements-dev.txt", ".github/workflows/tests.yml"],

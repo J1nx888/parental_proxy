@@ -108,7 +108,14 @@ take effect everywhere.
   `latest`) -- the DNS tier's filtering engine, and (since 2026-08-30) what
   enforces the hard-deny invariant for `mode='bump'` domains on non-
   `bump_enabled` devices via its `$client=`-scoped custom filtering rules
-  (see `controller/adguard_sync.py`).
+  (see `controller/adguard_sync.py`). Also provides network-wide ad/
+  tracker blocking for every device: its own default filter is enabled
+  automatically on first configure, plus (2026-08-30) a curated set of
+  uBlockOrigin/uAssets domain-blocking lists added by
+  `adguard/entrypoint.sh` -- see RoadMap.md's live-verification section
+  for which lists and why (not the whole uAssets repo -- most of it is
+  browser-extension-only cosmetic/scriptlet rules a DNS server can't
+  apply).
 
 ---
 
