@@ -441,14 +441,15 @@ entirely in the policy-computation and enforcement layers:
       `AdGuardHome.yaml`'s `http.address` directly and restarting onto
       it if a non-wildcard bind was actually requested.
 
-      Not yet done: a friendly landing page for the blocked case
-      (mirroring the existing `/blocked` page pattern) — right now a
-      hard-denied bump-mode domain on a non-bump device just gets
-      `0.0.0.0`/a generic browser connection error, no explanation.
-      `controller/main.py` also still has no Dockerfile/compose service
-      of its own (a pre-existing gap, unrelated to this item), so the
-      sync loop currently has to be run by hand with credentials
-      matching whatever's in `ADGUARD_USERNAME`/`ADGUARD_PASSWORD`.
+      **Both remaining items closed 2026-08-30**: `controller/`,
+      `phase3/nftables-manager/`, and `phase3/arp-worker/` all have
+      Dockerfiles now and are wired into `docker-compose.yml` as real
+      services (see the Milestones list's own updated status below for
+      the full writeup and live verification); and
+      `dashboard/block_page_server.py` gives plain-HTTP hard-deny
+      requests a real friendly page via AdGuard's `$dnsrewrite` modifier
+      (HTTPS deliberately excluded — see that module's own docstring;
+      the live-verification section below has the full writeup).
 - [ ] **Captive portal (Phase 4) — not started**, but now has concrete
       shape from this session's discussion: gate any newly-seen MAC
       not already registered as bypass/ignore; a kid-facing login that
@@ -704,6 +705,139 @@ fetched everything); confirmed `/control/filtering/status` reports
 counts. Full pytest suite re-confirmed clean (400 passed) afterward; VM
 left at a clean `docker compose down -v` state.
 
+### Full interception stack containerized and verified live end-to-end (2026-08-30)
+
+Picking up the "what are next steps" discussion from the previous
+session, moved forward on all three recommendations without further
+check-ins, as asked, surfacing decisions only where one genuinely had
+to be made (none did, this time). This is the single biggest structural
+change of the day: `phase3/arp-worker/`, `phase3/nftables-manager/`, and
+`controller/` all gained real Dockerfiles and real `docker-compose.yml`
+service definitions, gated behind a `profiles: ["interception"]` compose
+profile so plain `docker compose up` stays exactly as it was (proxy +
+adguard + dashboard only) -- starting the profile for real is a
+separate, explicit, deliberately un-defaulted decision
+(`ARP_WORKER_IFACE`/`GATEWAY_IP`/`GATEWAY_MAC` have no sensible
+defaults; each binary's own existing argument validation refuses to
+start without them, rather than a compose-level hard requirement that
+would break the default profile's own parseability). `controller/`
+gained a `requirements.txt` (its first, `pyroute2` for the rtnetlink
+listener above) and its `sys.path` bootstrap was updated to handle both
+a flat Docker layout and a real repo checkout.
+
+**Verified live end-to-end** via the same safe Docker-bridge pattern
+used throughout this project (a disposable, isolated test network --
+never the real production Beelink or an actual household LAN): all six
+services (`proxy`, `adguard`, `dashboard`, `arp-worker`,
+`nftables-manager`, `controller`) came up together via
+`docker compose --profile interception up -d`; seeding one real device
+into the shared DB was picked up by the controller, sent to the real
+`arp-worker` binary over their shared Unix socket, and independently
+computed into the real kernel's `authenticated_v4` nftables set by
+`nftables-manager` -- confirmed by reading the real ruleset directly
+(`nft list table inet parental_proxy`), not just trusting log output.
+The victim container's own ARP cache was confirmed genuinely poisoned
+(pointing the gateway's IP at the interception box's own bridge-
+interface MAC, not the real gateway's), and confirmed genuinely
+restored to the real gateway's MAC the moment
+`docker compose --profile interception stop` sent SIGTERM -- the exact
+fail-open guarantee this whole architecture exists to provide, proven
+for the first time through a real container lifecycle rather than a
+bare Go process.
+
+**Three more real bugs found and fixed along the way**, all in code
+that pre-dates this session but had simply never been exercised as an
+actual running deployment before:
+1. `internal/worker/worker.go`'s `sendGratuitousReply` had discarded
+   every `ARPSender.Reply()` error since it was written (`_ = err`,
+   with its own TODO comment saying so) -- the controller reported
+   "generation applied," `nftables-manager` correctly updated
+   `authenticated_v4`, and the victim's ARP cache never changed at all,
+   with nothing anywhere logging a single failure. Added
+   `Config.OnSendError` (optional, nil-safe) so `main.go` can actually
+   log send failures -- turned out the underlying sends were fine once
+   this was in place (the earlier silent failure was itself the actual
+   diagnostic obstacle, not a symptom of a second bug), but the
+   observability gap was real and is now closed regardless.
+2. A dead worker connection was previously only ever noticed if
+   desired state happened to change across the outage: `reconcile()`
+   correctly returns `None` when nothing has changed, so `run_cycle()`
+   never touches the connection at all once a generation is applied --
+   meaning the heartbeat pacer's own repeated failures, only ever
+   logged and never acted on, were the sole signal available, and
+   nothing was listening to them. Fixed with a `threading.Event` the
+   heartbeat's error callback sets specifically for
+   `WorkerConnectionError`, checked at the top of the main loop and
+   routed through the exact same reconnect path `run_cycle()`'s own
+   failures already used.
+3. `controller/Dockerfile`'s `python:3.12-slim` base doesn't ship
+   `iproute2` -- `discovery.py`'s snapshot loop failed every single
+   cycle with `[Errno 2] No such file or directory: 'ip'`, silently
+   (logged as a warning, retried forever, never crashed the container).
+   Fixed by installing `iproute2` in the image.
+
+Full pytest suite re-confirmed clean at every step (419, then 435 passed
+on the VM as new tests were added); all test containers, networks,
+volumes, and the one-off `.env` file used for this pass were torn down
+afterward, VM left at a clean `docker compose down -v` state matching
+how it was found.
+
+### Friendly landing page for AdGuard-blocked domains, HTTP only (2026-08-30)
+
+The third recommendation, tackled last. `dashboard/block_page_server.py`
+is a tiny stdlib-only HTTP server (no Flask) that
+`dashboard/dashboard.py`'s `main()` starts on port 80, only when
+`DASHBOARD_URL` is set -- the exact same gating condition
+`proxy/entrypoint.sh` already uses for Squid's own `deny_info` line, and
+the exact same env var, reused rather than duplicated.
+`controller/adguard_sync.py`'s hard-deny rules can now carry AdGuard's
+`$dnsrewrite` modifier alongside `$client`, pointing a blocked domain's
+DNS answer at the dashboard's LAN IP -- confirmed live combinable with
+`$client` on one rule (a shell-escaping artifact in this session's own
+testing briefly looked exactly like an AdGuard parser bug -- `$client`
+and the modifier name itself were vanishing from the echoed rule text
+-- until a clean script-file invocation, no shell involved, proved the
+feature works exactly as documented and the corruption was entirely on
+this session's own testing side).
+
+**Deliberately HTTP-only, a design constraint stated plainly rather than
+worked around**: there is no HTTPS equivalent and there will not be one
+here. Terminating TLS for an arbitrary blocked domain needs either that
+domain's real certificate or a device that already trusts this
+project's own SSL-Bump CA -- and non-bump devices are, by the entire
+point of the "two independent axes" design, never asked to trust it.
+Showing a "your connection is not private" warning on every hard-denied
+HTTPS domain would be strictly worse than today's plain connection
+failure, by this project's own already-established reasoning
+(`dashboard.py`'s `SETTINGS_BODY` defaults Squid's equivalent choice,
+`block_page_mode`, to "just fail the connection" for exactly this
+reason). Confirmed live that the port-80-only design doesn't regress
+the HTTPS case either: the dashboard has no TLS listener anywhere, so a
+redirected HTTPS attempt gets a clean `Connection refused` -- no worse
+than the pre-existing `0.0.0.0` behavior, just arriving at a real IP
+instead of a null one.
+
+**Found and fixed one more real bug of the exact same shape as the
+Squid `CAP_NET_ADMIN` fix from an earlier pass**: `docker-compose.yml`'s
+`cap_add: NET_BIND_SERVICE` alone wasn't enough for the dashboard's
+non-root `proxy` user to actually bind port 80 (`PermissionError:
+[Errno 13] Permission denied`, confirmed live) -- a container-level
+capability only reaches a non-root `execve()` if the exec'd binary
+itself also carries a matching file capability. Fixed with
+`setcap cap_net_bind_service=+ep` on the real `python3.12` binary in
+`dashboard/Dockerfile`, resolved past the `python3` symlink, mirroring
+`proxy/Dockerfile`'s own `setcap` fix for Squid exactly.
+
+**Verified live end-to-end**: seeded a real hard-deny domain and a real
+non-bump device, ran the real `adguard_sync.sync_once()` with a real
+`block_page_ip`, and confirmed from a real client container that the
+domain resolved to the dashboard's IP and that an HTTP request with
+that `Host` header got back the real friendly page naming the specific
+blocked domain -- and separately confirmed the HTTPS case's clean
+`Connection refused`, per the paragraph above. 23 new tests. Full
+pytest suite: 435 passed on the VM. All test containers/networks/the
+`.env` file torn down afterward.
+
 ### Fail-open engineering (a correction to an earlier assumption)
 
 Linux neighbor-cache entries are a state machine, not a fixed TTL — a
@@ -857,6 +991,21 @@ replaces its Redis-based approach.
 
 ### Milestones
 
+**2026-08-30: `arp-worker`, `nftables-manager`, and `controller` are all
+containerized now** — until this date, every milestone below that says
+"verified" meant "run by hand during a verification pass," never
+actually deployable. All three now have Dockerfiles and are wired into
+`docker-compose.yml`, gated behind a `profiles: ["interception"]`
+compose profile so a plain `docker compose up` is completely unchanged
+(proxy/adguard/dashboard only) — starting real interception is a
+separate, explicit `docker compose --profile interception up -d`,
+requiring real `ARP_WORKER_IFACE`/`GATEWAY_IP`/`GATEWAY_MAC` values with
+no sensible default. See the new live-verification section after this
+list for the full writeup, including three more real bugs found (a
+silently-swallowed ARP send failure, a dead-worker-connection case only
+a heartbeat could ever detect, a missing `iproute2` dependency) and the
+fixes for each.
+
 - [ ] **1. Topology probe** — passive discovery, full Orbi attachment
       matrix, PCAP corpus.
 - [ ] **2. ARP worker MVP** — static targets, half-duplex, corrective
@@ -946,13 +1095,36 @@ replaces its Redis-based approach.
       the pre-`bump_v4` four-key `DesiredPolicy` dict; missed earlier
       because it's `AF_UNIX`-marked and silently skips on Windows, where
       that policy_state.py change had only been verified until now).
-      Still unbuilt: the higher-precedence live rtnetlink-event listener
-      (needs real netlink socket programming, e.g. `pyroute2` —
-      deliberately not rushed alongside this), AdGuard query-log
-      correlation, and active ARP scanning — the other three sources in
-      the design doc's precedence order. The snapshot loop's own
-      interval is the freshness bound now, rather than "never," but it's
-      still not sub-second like a live listener would be.
+      **The higher-precedence live rtnetlink-event listener is built and
+      verified now too (2026-08-30)**: `controller/rtnetlink_listener.py`
+      uses `pyroute2` (pure Python, no C extension, the one deliberate
+      exception to this package's stdlib-only convention --
+      `controller/requirements.txt`) to react to real `RTM_NEWNEIGH`
+      events within however long the kernel takes to deliver them,
+      instead of waiting up to a full `--discovery-interval`. The real
+      message shape (which address family is a genuine IPv4 ARP
+      neighbor versus `AF_BRIDGE` FDB-learning noise or an IPv6 entry,
+      and the integer `NUD_*` state bitmask instead of `ip neigh show`'s
+      text names) was confirmed live against a real kernel before
+      writing the filtering logic, not assumed -- `AF_BRIDGE` noise in
+      particular dominates raw event volume on any Docker host and had
+      to be filtered out. Deliberately reacts to `RTM_NEWNEIGH` only,
+      never `RTM_DELNEIGH`, mirroring the snapshot loop's own "a binding
+      goes stale by being replaced, never by absence" philosophy. Wired
+      into `controller/main.py` as a fourth background task
+      (`--no-rtnetlink` to opt out), on by default alongside
+      `--db-path`. 28 new tests, 17 of them for the pure filtering logic
+      and threading/retry wiring (faking `pyroute2` via `sys.modules`
+      injection so they run on this project's Windows dev machine
+      without it installed at all -- `pyroute2` is Linux-only, no
+      `AF_NETLINK` on Windows).
+
+      Still unbuilt: AdGuard query-log correlation and active ARP
+      scanning — the remaining two sources in the design doc's
+      precedence order. With both the snapshot and the live listener now
+      running, staleness is bounded by whichever is faster for a given
+      device (usually the live listener, sub-second) rather than by the
+      snapshot's interval alone.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
       sets, atomic apply/rollback. **Scaffold written AND verified
       against real nftables 2026-08-29**, in `phase3/nftables-manager/`

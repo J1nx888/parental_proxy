@@ -92,9 +92,15 @@ or non-interactive deploys:
 5. Approve shows/sites per user ahead of time, or reactively from the
    **Report** page as blocks show up.
 
-## Three-container architecture
+## Six-service architecture
 
-Three services, defined in `docker-compose.yml` at the project root:
+Six services, defined in `docker-compose.yml` at the project root.
+Three run by default; three more (the Phase 3 interception layer,
+added 2026-08-30) are gated behind the `interception` compose profile
+and never start unless explicitly asked for -- see the second list
+below.
+
+**Default (`docker compose up`):**
 
 - **`proxy`** (container name `parental-proxy`, built from
   `proxy/Dockerfile`) — the SSL-bumping Squid proxy, running in native
@@ -133,6 +139,36 @@ coordinate purely through files on this shared volume. `adguard` is
 otherwise fully independent — it currently has no coded integration with
 the shared database at all except through `controller/adguard_sync.py`,
 which talks to it purely over its own HTTP API, not the shared volume.
+
+**Behind the `interception` profile (`docker compose --profile
+interception up -d`):**
+
+- **`arp-worker`** (built from `phase3/arp-worker/Dockerfile`) — the
+  privileged ARP poisoning/corrective-restore process (Go). Needs
+  `cap_add: [NET_RAW]` and `network_mode: host` to see the real LAN
+  interface. Refuses to start without `-iface`/`-controller-uid`
+  (`ARP_WORKER_IFACE`/`CONTROLLER_UID` in `.env`) — no default.
+- **`nftables-manager`** (built from
+  `phase3/nftables-manager/Dockerfile`) — reconciles the real kernel's
+  `parental_proxy` nftables table against the DB-computed
+  `DesiredPolicy` blob. Needs `cap_add: [NET_ADMIN]` and
+  `network_mode: host`; the image also installs the real `nft` CLI,
+  since `knftables` shells out to it.
+- **`controller`** (built from `controller/Dockerfile`) — Milestone 3's
+  control loop: talks to `arp-worker` over a Unix socket on the shared
+  `pp_run` volume, reads/writes the shared `pp_config` database, and
+  calls AdGuard's admin API (`network_mode: host`, same reachability
+  reason as `dashboard`). Refuses to start without `--gateway-ip`/
+  `--gateway-mac` (`GATEWAY_IP`/`GATEWAY_MAC` in `.env`) — no default.
+
+None of `ARP_WORKER_IFACE`/`GATEWAY_IP`/`GATEWAY_MAC`/`CONTROLLER_UID`
+have a sensible default on purpose — each binary's own argument
+validation refuses to start without them, so an unconfigured attempt to
+enable this profile fails loudly and immediately rather than guessing.
+Actually enabling the `interception` profile is the real "start
+intercepting this LAN" decision; see RoadMap.md's live-verification
+section for how this was proven end-to-end on a disposable Docker-bridge
+test network, never the real production box.
 
 ### Startup order dependency
 
@@ -182,7 +218,7 @@ the dashboard container).
 | `DASHBOARD_USER` | dashboard | Admin login username. Only read on first run to seed the account; editable from Settings afterward. | `admin` |
 | `DASHBOARD_PASSWORD` | dashboard | Admin login password. Only read on first run. If left blank, the dashboard generates a random password on first start and prints it to its own container logs. | (blank → auto-generated) |
 | `DASHBOARD_BIND` | `docker-compose.yml`, feeds directly into `DASHBOARD_HOST` below | Which address the dashboard's own Flask app listens on. `127.0.0.1` = this machine only (use SSH port-forwarding for remote access); `0.0.0.0` = reachable from any device on the LAN. Since 2026-08-30 (`dashboard` runs `network_mode: host`, see [Two/Three-container architecture](#three-container-architecture)) this is the app's own bind address, not a Docker port-publish mapping. | `127.0.0.1` |
-| `DASHBOARD_URL` | proxy (`entrypoint.sh` appends a `deny_info` line to `squid.conf` when set) | If set (e.g. `http://192.168.1.50:8787`), blocked bump-mode requests redirect to a friendly explanation page (`${DASHBOARD_URL}/blocked`) instead of a bare connection error. Only applies to bump-mode domains — splice-mode blocks never show a page. Leave blank to skip. | (blank) |
+| `DASHBOARD_URL` | proxy (`entrypoint.sh` appends a `deny_info` line to `squid.conf` when set), dashboard (starts `block_page_server.py` on port 80 when set, added 2026-08-30), controller (`--dashboard-url`, `interception` profile only) | If set (e.g. `http://192.168.1.50:8787`), blocked bump-mode Squid requests redirect to a friendly page (`${DASHBOARD_URL}/blocked`); separately, `adguard_sync.py` points hard-denied domains' plain-HTTP DNS answers at this same IP's port 80 for a friendly AdGuard-side page too (HTTPS deliberately excluded -- see `dashboard/block_page_server.py`'s own docstring). Leave blank to skip both. | (blank) |
 | `DASHBOARD_HOST` | dashboard | Bind address the dashboard container's Flask app actually listens on. Set in `docker-compose.yml` to `${DASHBOARD_BIND:-127.0.0.1}` (see that row above) -- prior to 2026-08-30 this was hardcoded to `0.0.0.0` and a separate port-publish mapping controlled reachability instead. | `${DASHBOARD_BIND:-127.0.0.1}` |
 | `PP_DB_PATH` | dashboard (and set internally by `proxy/entrypoint.sh` for its own process) | Path to the shared SQLite database file inside the container. Hardcoded in `docker-compose.yml`'s dashboard environment block to the shared-volume path. | `/config/parental_proxy.db` |
 | `PP_CA_CERT_PATH` | dashboard | Path to the generated CA certificate, used by the dashboard's CA-download endpoint (Users page download link). Hardcoded in `docker-compose.yml`. | `/config/ssl_cert/ca_cert.pem` |
@@ -193,6 +229,9 @@ the dashboard container).
 | `ADGUARD_WEB_BIND` | adguard (`adguard/entrypoint.sh`, first run only) | Which address AdGuard Home's own admin UI binds to. `127.0.0.1` = this machine only; `0.0.0.0` = reachable from any device on the LAN. Independent of `DASHBOARD_BIND` -- this gates a second, separate admin login surface. | `127.0.0.1` |
 | `ADGUARD_SKIP_EXTRA_BLOCKLISTS` | adguard (`adguard/entrypoint.sh`, first run only) | Set to `1` to skip subscribing to the curated uBlockOrigin/uAssets domain-blocking lists (added 2026-08-30) and keep only AdGuard Home's own default filter (enabled automatically, no action needed for that part). See RoadMap.md's live-verification section for exactly which lists and why. | (blank -> lists added) |
 | `ADGUARD_FILTERS_UPDATE_INTERVAL_HOURS` | adguard (`adguard/entrypoint.sh`, first run only) | How often AdGuard itself re-checks every subscribed filter list, in hours -- `168` = once a week (AdGuard's own "Once a week" UI preset). Independent of the dashboard's "Check for filter updates now" button, which works on demand regardless. | `168` |
+| `ARP_WORKER_IFACE` | arp-worker (`interception` profile only) | The real LAN-facing network interface name (e.g. `eth0`) to send/receive ARP packets on. No default -- `pp-arp-worker` refuses to start without it. | (none -- required to enable the profile) |
+| `GATEWAY_IP` / `GATEWAY_MAC` | controller (`interception` profile only) | The real router's IP and MAC address on this LAN. No default -- `controller/main.py` refuses `--db-path` without both. | (none -- required to enable the profile) |
+| `CONTROLLER_UID` | arp-worker (`interception` profile only) | The UID the `controller` container's process runs as, checked by `arp-worker` via `SO_PEERCRED` before accepting IPC commands. `controller/Dockerfile` doesn't set a `USER`, so this is `0` (root) by default, matching the container's actual default UID. | `0` |
 | `ADGUARD_URL` | dashboard, only consumed once to seed the same-named DB setting | Where the dashboard reaches AdGuard Home's control API for its "Check for filter updates now" button. Both run `network_mode: host`, so this is just the loopback address unless AdGuard is ever moved elsewhere. Editable afterward from the dashboard's own Settings page. | `http://127.0.0.1:3000` |
 
 Notes:

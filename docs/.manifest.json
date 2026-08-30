@@ -1,18 +1,18 @@
 {
   "version": 1,
-  "last_run": "2026-08-30T20:30:00Z",
+  "last_run": "2026-08-30T23:00:00Z",
   "sections": {
     "architecture": {
-      "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "adguard/", "defaults/", "dashboard/dashboard.py"],
-      "fingerprint": "877d0d82fd3bf32b2d5ce25aa915342d59b0d07942b0103fc3b2b99cbfcdce34",
+      "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "adguard/", "defaults/", "dashboard/", "controller/", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile"],
+      "fingerprint": "f1ba41a712ca0795edcd0d25e6e1915b2b1003eb335e308c8226923342f57dae",
       "doc_path": "docs/architecture/overview.md",
-      "last_updated": "2026-08-30T20:30:00Z"
+      "last_updated": "2026-08-30T23:00:00Z"
     },
     "dashboard": {
       "source_paths": ["dashboard/", "common/db.py", "common/matching.py"],
-      "fingerprint": "7a0ac52403ae0ad675da68cdeace7bf511ec793c5fcd8c10d4f45785a73d5e9b",
+      "fingerprint": "40466216ce0c3ad3a0d322afaa286f47d212e2e1204835260731db7d96d76f55",
       "doc_path": "docs/dashboard/routes.md",
-      "last_updated": "2026-08-30T20:30:00Z"
+      "last_updated": "2026-08-30T23:00:00Z"
     },
     "database": {
       "source_paths": ["common/db.py", "defaults/seed_defaults.py"],
@@ -21,22 +21,22 @@
       "last_updated": "2026-08-30T00:00:00Z"
     },
     "deployment": {
-      "source_paths": ["docker-compose.yml", "proxy/Dockerfile", "adguard/Dockerfile", "adguard/entrypoint.sh", "dashboard/Dockerfile", "proxy/entrypoint.sh", "setup.sh", ".env.example", ".github/workflows/tests.yml", "README.md"],
-      "fingerprint": "25bcae5dc40f7acd437acb48accfd7b3c2d24106203b95d35bfb9cac4733a145",
+      "source_paths": ["docker-compose.yml", "proxy/Dockerfile", "adguard/Dockerfile", "adguard/entrypoint.sh", "dashboard/Dockerfile", "controller/Dockerfile", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile", "proxy/entrypoint.sh", "setup.sh", ".env.example", ".github/workflows/tests.yml", "README.md"],
+      "fingerprint": "cc0c656e11d04f7ac8a243b9c6a807b14f6e0a5304f7322b8cae7b9b04f80bdb",
       "doc_path": "docs/deployment/setup.md",
-      "last_updated": "2026-08-30T20:30:00Z"
+      "last_updated": "2026-08-30T23:00:00Z"
     },
     "security": {
-      "source_paths": ["common/auth.py", "proxy/authz_helper.py", "proxy/sni_helper.py", "common/squid_helper.py", "proxy/entrypoint.sh", "proxy/squid.conf.template", "dashboard/dashboard.py", "common/device_identity.py", "common/adguard_client.py", "controller/adguard_sync.py", "adguard/entrypoint.sh"],
-      "fingerprint": "5d2c0ec5097182552a5501e2b922837930bb1b350326488a714311654f9a79d7",
+      "source_paths": ["common/auth.py", "proxy/authz_helper.py", "proxy/sni_helper.py", "common/squid_helper.py", "proxy/entrypoint.sh", "proxy/squid.conf.template", "dashboard/dashboard.py", "dashboard/block_page_server.py", "common/device_identity.py", "common/adguard_client.py", "controller/adguard_sync.py", "controller/main.py", "adguard/entrypoint.sh"],
+      "fingerprint": "1a0d9e7556a97200240c152c24af22c6238630a51d1e99c0fefbff8afa87afe1",
       "doc_path": "docs/security/overview.md",
-      "last_updated": "2026-08-30T20:30:00Z"
+      "last_updated": "2026-08-30T23:00:00Z"
     },
     "testing": {
       "source_paths": ["tests/", "pytest.ini", "requirements-dev.txt", ".github/workflows/tests.yml"],
-      "fingerprint": "ce01449b49af1d9b1b55e9811bd68a5795e14e470af4be183fb7457d5e7710d9",
+      "fingerprint": "eef66d177ffe55afcfa86b37cb60a1825ce19d7c5f7c8d7b2f17fa4b8080d979",
       "doc_path": "docs/testing/overview.md",
-      "last_updated": "2026-08-30T20:30:00Z"
+      "last_updated": "2026-08-30T23:00:00Z"
     }
   }
 }

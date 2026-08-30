@@ -164,13 +164,18 @@ rule-building/merge/run_loop logic (same mocked-network pattern as
 respectively), plus more cases added to both `test_adguard_client.py` and
 `tests/test_dashboard.py` the same day for the filter-update-checking
 feature (`set_filters_update_interval()`/`refresh_filters()`, and the
-dashboard's new `/settings/adguard`/`/settings/adguard/refresh` routes).
-Run `pytest --collect-only -q` against `tests/` for a live, authoritative
-total (400 as of 2026-08-30, run on Linux, where every test actually runs
--- several files marked `AF_UNIX`-only skip on Windows, where
-`socket.AF_UNIX` doesn't exist; a Windows run of the same suite at this
-commit collects 380 passed, 20 skipped) rather than trusting the sum of
-this table.
+dashboard's new `/settings/adguard`/`/settings/adguard/refresh` routes),
+and later the same day again `tests/test_controller_rtnetlink_listener.py`
+(new file, pure filtering logic plus threading/retry wiring against a
+faked `pyroute2`), `tests/test_block_page_server.py` (new file, real
+HTTP behavior of `dashboard/block_page_server.py`), and
+`tests/test_controller_block_page_ip.py` (new file, `main.py`'s
+`_parse_block_page_ip`). Run `pytest --collect-only -q` against `tests/`
+for a live, authoritative total (435 as of 2026-08-30, run on Linux,
+where every test actually runs -- several files marked `AF_UNIX`-only
+skip on Windows, where `socket.AF_UNIX` doesn't exist; a Windows run of
+the same suite at this commit collects 413 passed, 22 skipped) rather
+than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

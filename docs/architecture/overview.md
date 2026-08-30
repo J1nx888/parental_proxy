@@ -57,30 +57,36 @@ adguard/                      AdGuard Home container (Phase 3, added 2026-08-30)
   entrypoint.sh                  automated first-run bootstrap via AdGuard's own
                                   /control/install/configure API -- no manual setup wizard
 
-docker-compose.yml             three services (proxy, adguard, dashboard), ALL THREE run with
-                                network_mode: host (see docker-compose.yml's own comments) --
-                                proxy/adguard need it so nftables' redirect + SO_ORIGINAL_DST/
-                                per-client DNS matching work at all (a bridge-networked container
-                                is a different network namespace from where phase3/nftables-
-                                manager's redirect actually fires); dashboard needs it (added
-                                2026-08-30) to reach AdGuard's loopback-bound admin API for its
-                                filter-refresh button. Each service's own app-level bind address
-                                (DASHBOARD_BIND/ADGUARD_WEB_BIND) is what gates LAN exposure now,
-                                not a Docker port-publish mapping. proxy and dashboard share the
-                                pp_config volume; adguard has its own separate
-                                pp_adguard_conf/pp_adguard_work volumes.
+docker-compose.yml             six services total. proxy/adguard/dashboard run by default;
+                                arp-worker/nftables-manager/controller (added 2026-08-30) are
+                                gated behind the "interception" compose profile -- `docker compose
+                                up` alone never starts them, `docker compose --profile
+                                interception up -d` does. ALL SIX run with network_mode: host (see
+                                docker-compose.yml's own comments on each) -- proxy/adguard/
+                                nftables-manager/arp-worker need it to see real host interfaces
+                                and share nftables' own redirect namespace; dashboard/controller
+                                need it to reach AdGuard's loopback-bound admin API. Each service's
+                                own app-level bind address (DASHBOARD_BIND/ADGUARD_WEB_BIND) is
+                                what gates LAN exposure now, not a Docker port-publish mapping.
+                                proxy/dashboard/nftables-manager/controller share the pp_config
+                                volume; adguard has its own pp_adguard_conf/pp_adguard_work;
+                                arp-worker and controller share pp_run (just their Unix socket).
 ```
 
-Phase 3's remaining pieces -- `controller/` (Python) and
-`phase3/arp-worker/`, `phase3/nftables-manager/` (Go) -- are not yet in
-this compose file at all (no Dockerfile for any of them yet); see
-RoadMap.md's Milestone list and `docs/design/phase3-technical-design.md`
-for those. `controller/adguard_sync.py` (the process that actually
-computes and pushes AdGuard's per-client hard-deny rules) is one of the
-pieces that isn't containerized yet -- it has to be run by hand for now
-(`python3 controller/main.py --db-path ... --adguard-url ... --adguard-username
-... --adguard-password ...`), with credentials matching whatever this
-compose file's `ADGUARD_USERNAME`/`ADGUARD_PASSWORD` are set to.
+`phase3/arp-worker/Dockerfile` and `phase3/nftables-manager/Dockerfile`
+are plain multi-stage Go builds (compile static, run in a minimal
+runtime image -- nftables-manager's also installs the real `nft` CLI,
+since `knftables` shells out to it rather than using netlink directly).
+`controller/Dockerfile` flat-copies `common/*.py` alongside
+`controller/*.py`, same pattern as proxy/dashboard use for `common/`.
+Starting the interception profile for real requires
+`ARP_WORKER_IFACE`/`GATEWAY_IP`/`GATEWAY_MAC` in `.env` with no sensible
+default -- deliberately: this project's own testing discipline treats
+"deploy real ARP-spoofing to a real LAN" as a decision that needs a
+human, not something a default `docker compose up` should ever do
+silently. See RoadMap.md's live-verification section for how this was
+proven end-to-end (Docker-bridge test network, never the real
+production box).
 
 Both container images `COPY common/*.py` into their own image root (proxy's
 `/opt/parental-proxy/`, dashboard's `/app/`) and add that directory to
@@ -105,8 +111,15 @@ take effect everywhere.
   `main()`), not Flask's dev server.
 - **SQLite** (stdlib `sqlite3`), WAL mode, as the only datastore -- no
   Postgres/Redis/etc.
-- **Docker / docker-compose** -- three services (proxy, adguard, dashboard);
-  proxy/dashboard share one named volume, adguard has its own two.
+- **Docker / docker-compose** -- six services total (three by default:
+  proxy, adguard, dashboard; three more behind the "interception" profile:
+  arp-worker, nftables-manager, controller, added 2026-08-30).
+- **Go 1.25** -- `phase3/arp-worker/` and `phase3/nftables-manager/`, each
+  its own module, built via multi-stage Dockerfiles into static binaries.
+- **pyroute2** (`controller/requirements.txt`, added 2026-08-30) -- the
+  one third-party dependency in this otherwise stdlib-only package,
+  needed for `controller/rtnetlink_listener.py`'s live netlink socket
+  handling (pure Python itself, no C extension).
 - **AdGuard Home** (`adguard/adguardhome:v0.107.79`, pinned rather than
   `latest`) -- the DNS tier's filtering engine, and (since 2026-08-30) what
   enforces the hard-deny invariant for `mode='bump'` domains on non-
