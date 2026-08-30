@@ -2192,7 +2192,7 @@ SETTINGS_BODY = """
 <details {{ 'open' if not adguard_configured }}>
 <summary>Connection settings</summary>
 <form class="add-form" method="post" action="{{ url_for('update_adguard_settings') }}">
-  <input type="text" name="adguard_url" value="{{ adguard_url }}" placeholder="http://host.docker.internal:3000" style="flex:1; min-width:280px;">
+  <input type="text" name="adguard_url" value="{{ adguard_url }}" placeholder="http://127.0.0.1:3000" style="flex:1; min-width:280px;">
   <input type="text" name="adguard_username" value="{{ adguard_username }}" placeholder="Username">
   <input type="password" name="adguard_password" placeholder="Password (leave blank to keep current)">
   <button class="add" type="submit">Save</button>
