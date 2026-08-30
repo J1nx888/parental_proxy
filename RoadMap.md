@@ -208,6 +208,44 @@ home network, not added afterward:
   resolve the real gateway MAC → remove/empty redirect rules atomically
   → leave the forwarding chain policy as `accept`.
 
+**New finding (2026-08-30), from a real live test — a switch-level gap
+corrective ARP alone doesn't close:** ran the actual `internal/worker`
+packet-sending code against a real container on a Docker bridge network
+(a genuine Linux L2 segment — see the ARP-worker README for why this,
+not a cloud VNet, is the right free substitute for validating this
+mechanism before touching a real LAN). Poisoning worked exactly as
+designed: the victim's ARP cache flipped to the worker's MAC, and the
+corrective shutdown sequence correctly restored the real gateway's MAC
+in the victim's cache. But real connectivity to the gateway stayed
+broken afterward. Root cause, traced to the byte level: `mdlayher/arp`'s
+`Client.WriteTo` sets the **Ethernet frame's own source address** to
+the ARP payload's claimed sender, not the worker's real interface MAC —
+so a corrective reply (payload: "gateway is at gateway's real MAC")
+is transmitted with that MAC as the literal L2 source too, teaching the
+**switch's own MAC-forwarding table** that the real gateway now lives
+on the worker's port. That's a different, lower-layer thing than a
+victim's ARP cache, and corrective ARP alone doesn't fix it — confirmed
+by inspecting the bridge's FDB directly (`bridge fdb show`) and seeing
+the gateway's real MAC mis-pointed at the worker's port after "correct"
+shutdown.
+
+**Real-world blast radius, also confirmed empirically**: the instant
+the real gateway container sent *any* frame of its own, the switch
+immediately relearned the correct port and connectivity was restored —
+switches relearn on every observed frame, not just ARP. A real home
+router is constantly transmitting (routing all LAN traffic), so this
+self-heals in about one packet's worth of time in practice, not the
+"stuck" appearance an idle test container gave at first. Still a real,
+previously-undocumented gap in what "corrective ARP" actually restores
+— it fixes ARP caches, not switch forwarding tables, and the fix for
+the latter is "wait for the real device to talk," not the worker's own
+doing. Open call, not yet decided: whether it's worth making the
+corrective phase use the worker's own real MAC as the Ethernet-layer
+source (bypassing `mdlayher/arp`'s `WriteTo` for a hand-built frame)
+so the switch relearns correctly immediately rather than relying on the
+gateway's own traffic — given the confirmed sub-second self-healing on
+an active gateway, this may not be worth the added complexity.
+
 ### Mesh (Orbi) validation — required before production use
 
 No public documentation confirms whether the RBR850 filters unsolicited

@@ -12,10 +12,31 @@ now converts at that one boundary; the rest of the codebase still uses
 project already follows. `peercred_unix.go`'s `SO_PEERCRED` handling
 built and vetted clean on the first try.
 
-Not yet done: running this against a real interface (needs
-`CAP_NET_RAW`, deliberately never granted to this scaffold — see below),
-and wiring it into an actual controller process, which doesn't exist
-yet (Milestone 3).
+**Update 2026-08-30 — the core mechanism verified for real**: ran
+`internal/worker` + `internal/arpio` (via a small scratch program, not
+checked in) against real containers on a Docker bridge network — a
+genuine Linux L2 segment, unlike a cloud VNet, which enforces
+anti-ARP-spoofing IP/MAC binding at the SDN layer and would silently
+prevent this from working at all. Confirmed real: poisoning a victim's
+ARP cache, and corrective restoration on shutdown putting the real
+MAC back in that cache. Also found a genuine, previously-unknown gap
+while doing this: `mdlayher/arp`'s `WriteTo` sets the Ethernet frame's
+own source address to the ARP payload's claimed sender, so corrective
+ARP replies also mislead the *switch's* own MAC-forwarding table (not
+just the victim's ARP cache) into pointing the real gateway's MAC at
+the worker's port — confirmed by inspecting the bridge's FDB directly.
+Also confirmed the real-world fix is basically free: the moment the
+real gateway sends any frame of its own, the switch relearns instantly
+and connectivity recovers — a real router's constant traffic means
+this self-heals in about one packet's worth of time. See RoadMap.md's
+fail-open section for the full writeup and the still-open call on
+whether it's worth fixing in code anyway.
+
+Still not done: wiring this into an actual controller process (which
+exists now, see `controller/`, but the two have never been run
+together against a real interface), and this scaffold has still never
+been given `CAP_NET_RAW` on anything but a disposable container/VM —
+correctly, per the project's own testing discipline.
 
 See [`../../docs/design/phase3-technical-design.md`](../../docs/design/phase3-technical-design.md)
 for the design this implements, and
