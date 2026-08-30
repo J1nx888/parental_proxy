@@ -43,6 +43,7 @@ from typing import Callable
 # rely on. Mirrors dashboard/dev_server.py's bootstrap.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 
+import adguard_sync
 import discovery
 import health
 import sdnotify
@@ -79,6 +80,10 @@ def run(
     health_conn: sqlite3.Connection | None = None,
     policy_conn: sqlite3.Connection | None = None,
     discovery_interval: float | None = None,
+    adguard_interval: float | None = None,
+    adguard_url: str | None = None,
+    adguard_username: str | None = None,
+    adguard_password: str | None = None,
 ) -> None:
     """The main control loop. Runs until SIGTERM/SIGINT.
 
@@ -103,6 +108,14 @@ def run(
     default) means no discovery loop runs, matching this parameter's
     absence before 2026-08-30 -- existing callers that don't pass it see
     no behavior change.
+
+    adguard_interval, if given (not None), starts
+    controller/adguard_sync.py's periodic hard-deny sync on its own
+    background thread and its own DB connection (same reasoning as
+    discovery_interval above) for the duration of this call, stopped in
+    the `finally` block alongside the heartbeat pacer and discovery
+    task. adguard_url/adguard_username/adguard_password are required
+    together with it -- see main()'s own argument validation.
 
     A single failed reconcile cycle (a worker fault, a transient DB
     error) is logged and reported via health_conn rather than crashing
@@ -163,6 +176,16 @@ def run(
             on_error=lambda exc: log.warning("discovery snapshot failed: %s", exc),
         )
 
+    adguard_task = None
+    if adguard_interval is not None:
+        adguard_task = adguard_sync.run_loop(
+            adguard_interval,
+            adguard_url,
+            adguard_username,
+            adguard_password,
+            on_error=lambda exc: log.warning("adguard sync failed: %s", exc),
+        )
+
     sdnotify.ready()
 
     try:
@@ -185,6 +208,8 @@ def run(
         pacer.stop()
         if discovery_task is not None:
             discovery_task.stop()
+        if adguard_task is not None:
+            adguard_task.stop()
         try:
             client.shutdown("controller_requested")
         except WorkerConnectionError:
@@ -288,12 +313,32 @@ def main(argv: list[str] | None = None) -> int:
         "-- e.g. for a deployment that already runs the snapshot externally "
         "(cron, a separate process) and doesn't want it duplicated here.",
     )
+    parser.add_argument(
+        "--adguard-url",
+        help="Base URL of AdGuard Home's control API, e.g. http://127.0.0.1:3000 "
+        "(or http://adguard:3000 once this process runs in the same compose "
+        "network as the adguard service). Enables the hard-deny sync loop "
+        "(controller/adguard_sync.py) when set, together with "
+        "--adguard-username/--adguard-password. Only runs at all if --db-path "
+        "is also set.",
+    )
+    parser.add_argument("--adguard-username", help="Required if --adguard-url is set.")
+    parser.add_argument("--adguard-password", help="Required if --adguard-url is set.")
+    parser.add_argument(
+        "--adguard-interval", type=float, default=30.0,
+        help="Seconds between adguard_sync.py hard-deny rule pushes (only runs "
+        "at all if --adguard-url is set).",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO)
 
+    if args.adguard_url and not (args.adguard_username and args.adguard_password):
+        parser.error("--adguard-url requires --adguard-username and --adguard-password")
+
     conn: sqlite3.Connection | None = None
     discovery_interval: float | None = None
+    adguard_interval: float | None = None
     if args.db_path:
         if not args.gateway_ip or not args.gateway_mac:
             parser.error("--db-path requires --gateway-ip and --gateway-mac")
@@ -306,6 +351,11 @@ def main(argv: list[str] | None = None) -> int:
             # args.db_path by _build_db_backed_provider above, so it just
             # needs to be told to run at all, and at what interval.
             discovery_interval = args.discovery_interval
+        if args.adguard_url:
+            # Same reasoning as discovery_interval above -- adguard_sync
+            # opens its own connection internally, reading the DB
+            # policy-state discovery already keeps current.
+            adguard_interval = args.adguard_interval
     else:
         provider = placeholder_desired_state
 
@@ -317,6 +367,10 @@ def main(argv: list[str] | None = None) -> int:
         health_conn=conn,
         policy_conn=conn,
         discovery_interval=discovery_interval,
+        adguard_interval=adguard_interval,
+        adguard_url=args.adguard_url,
+        adguard_username=args.adguard_username,
+        adguard_password=args.adguard_password,
     )
     return 0
 

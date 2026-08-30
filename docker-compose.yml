@@ -5,26 +5,75 @@ services:
       dockerfile: proxy/Dockerfile
     container_name: parental-proxy
     restart: unless-stopped
+    # network_mode: host (added 2026-08-30, correcting the bridge-network
+    # setup this service originally shipped with): phase3/nftables-manager
+    # redirects intercepted LAN traffic to Squid's intercept ports via
+    # nftables running natively on THIS box's own host network namespace
+    # (not yet in this compose file -- see RoadMap.md's Milestone
+    # list) -- SO_ORIGINAL_DST recovery only works when the socket that
+    # calls it lives in the SAME namespace as the redirect that fired, and
+    # a bridge-networked container is a DIFFERENT namespace from the
+    # host's. Confirmed live 2026-08-30 while preparing this stack's first
+    # real intercept-mode verification pass: bridge networking silently
+    # broke destination recovery (Squid saw its own container address
+    # instead of the real destination); switching to host networking
+    # fixed it immediately, and is also just correct for how this
+    # single-box deployment actually looks in production (nftables and
+    # Squid on the same box, not split across container network
+    # namespaces the way Docker defaults to). See RoadMap.md's live-
+    # verification section for the full writeup.
+    #
     # Squid's intercept-mode ports (both http_port and https_port below,
-    # see proxy/squid.conf.template) bind with the IP_TRANSPARENT socket
-    # option and recover the pre-NAT destination via SO_ORIGINAL_DST --
-    # both require CAP_NET_ADMIN. Without this, Squid fails during
-    # comm_open_listener and exits silently (exit code 1, no stdout/stderr
-    # at the default log level) -- confirmed live 2026-08-30 while
-    # preparing this stack's first real intercept-mode verification pass;
-    # see RoadMap.md.
+    # see proxy/squid.conf.template) also bind with the IP_TRANSPARENT
+    # socket option and recover the pre-NAT destination via
+    # SO_ORIGINAL_DST -- both require CAP_NET_ADMIN regardless of network
+    # mode. Without this, Squid fails during comm_open_listener and exits
+    # silently (exit code 1, no stdout/stderr at the default log level).
+    network_mode: host
     cap_add:
       - NET_ADMIN
-    ports:
-      # Intercept-mode ports (RoadMap.md's Squid intercept-mode section,
-      # locked 2026-08-30), replacing the old explicit-proxy 3128:3128.
-      - "3129:3129"
-      - "3130:3130"
     environment:
       - LOCAL_NETWORK=${LOCAL_NETWORK:-192.168.1.0/24}
       - DASHBOARD_URL=${DASHBOARD_URL:-}
     volumes:
       - pp_config:/config
+
+  adguard:
+    build:
+      context: .
+      dockerfile: adguard/Dockerfile
+    container_name: parental-proxy-adguard
+    restart: unless-stopped
+    # Same reasoning as proxy's network_mode: host above -- AdGuard Home
+    # is the DNS-tier target of phase3/nftables-manager's
+    # `redirect to :5353` rule (see baselineRules), which fires in the
+    # host's own network namespace; AdGuard has to share that namespace
+    # to receive that traffic at all, and to see devices' real LAN
+    # source IPs rather than a Docker-bridge address -- its own
+    # per-client hard-deny rules (controller/adguard_sync.py) are keyed
+    # on exactly those real IPs.
+    network_mode: host
+    environment:
+      # Same pattern as DASHBOARD_USER/PASSWORD below: only consumed by
+      # adguard/entrypoint.sh's one-time bootstrap on first run. If
+      # ADGUARD_PASSWORD is left blank, a random one is generated and
+      # printed to this container's own logs
+      # (`docker compose logs adguard`) -- change it from AdGuard Home's
+      # own Settings page afterward. Whatever value ends up in effect
+      # here must also be passed to controller/main.py's
+      # --adguard-username/--adguard-password once that process is
+      # wired up (not yet in this compose file -- see RoadMap.md).
+      - ADGUARD_USERNAME=${ADGUARD_USERNAME:-admin}
+      - ADGUARD_PASSWORD=${ADGUARD_PASSWORD:-}
+      - ADGUARD_DNS_PORT=5353
+      # 127.0.0.1 = AdGuard Home's OWN admin UI (separate from this
+      # project's dashboard) only reachable from this machine. 0.0.0.0 =
+      # reachable from any device on the LAN -- see adguard/entrypoint.sh's
+      # own comment on why 127.0.0.1 is the default here.
+      - ADGUARD_WEB_BIND=${ADGUARD_WEB_BIND:-127.0.0.1}
+    volumes:
+      - pp_adguard_conf:/opt/adguardhome/conf
+      - pp_adguard_work:/opt/adguardhome/work
 
   dashboard:
     build:
@@ -53,3 +102,5 @@ services:
 
 volumes:
   pp_config:
+  pp_adguard_conf:
+  pp_adguard_work:
