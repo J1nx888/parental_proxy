@@ -30,11 +30,17 @@ import (
 func main() {
 	ifaceName := flag.String("iface", "", "LAN interface to bind to (required)")
 	socketPath := flag.String("socket", "/run/parental_proxy/arp-worker.sock", "controller IPC socket path")
-	controllerUID := flag.Uint("controller-uid", 0, "UID the interception-controller process runs as (required, checked via SO_PEERCRED)")
+	// -1 default (not 0) deliberately: 0 is root's real, legitimate UID, so
+	// using it as the "not provided" sentinel would make this flag
+	// silently un-settable to 0 -- found via a real integration test where
+	// the controller happened to run as root in a container. flag.Uint
+	// can't represent -1, hence Int here with an explicit range check
+	// instead of Uint's implicit zero-value trap.
+	controllerUID := flag.Int("controller-uid", -1, "UID the interception-controller process runs as (required, checked via SO_PEERCRED)")
 	leaseMissedCycles := flag.Int("lease-missed-cycles", 5, "missed heartbeat cycles before entering repair-only mode")
 	flag.Parse()
 
-	if *ifaceName == "" || *controllerUID == 0 {
+	if *ifaceName == "" || *controllerUID < 0 {
 		log.Fatal("-iface and -controller-uid are both required")
 	}
 
