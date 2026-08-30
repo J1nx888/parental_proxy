@@ -406,10 +406,8 @@ dashboard control exists to trigger it).
   already-stated "one shared database, live reads, no separate sync"
   principle (`docs/project.md`'s Key technical decisions) rather than
   inventing something new, and was verified working end-to-end (see
-  `RoadMap.md`'s Milestone 7 entry) — but it was an autonomous
-  engineering call made without the project owner's direct sign-off,
-  so treat it as a strong default worth a quick second look, not a
-  fully locked decision the way the Go-for-the-worker choice is.
+  `RoadMap.md`'s Milestone 7 entry). Made autonomously, then reviewed
+  and confirmed by the project owner on 2026-08-30 — locked.
 - Final interval/threshold constants (spoof interval, lease cycle count,
   corrective repeat count/spacing) — these need real numbers from the
   soak-test milestone, not guessed up front.
