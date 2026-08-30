@@ -40,7 +40,7 @@ _MARKER_BEGIN = "! === parental_proxy managed rules -- do not edit below this li
 _MARKER_END = "! === end parental_proxy managed rules ==="
 
 
-def _domain_rule(pattern: str, client_ips: list[str]) -> str:
+def _domain_rule(pattern: str, client_ips: list[str], block_page_ip: str | None = None) -> str:
     """One AdGuard regex rule, scoped to client_ips via the `$client`
     modifier (confirmed live against a real AdGuard Home instance --
     see common/adguard_client.py's docstring). The regex body mirrors
@@ -53,12 +53,24 @@ def _domain_rule(pattern: str, client_ips: list[str]) -> str:
     never contains an embedded newline; `(?i)` is RE2's inline
     case-insensitivity flag, replacing Python's separate
     `re.IGNORECASE` argument.
+
+    If block_page_ip is given, the rule ALSO carries a `$dnsrewrite`
+    modifier pointing the DNS answer at that IP instead of the plain
+    default deny (confirmed live combinable with `$client` on one rule).
+    That IP is expected to be running dashboard/block_page_server.py,
+    which only ever answers on port 80 -- deliberately no HTTPS
+    equivalent, see that module's own docstring for why showing a page
+    over HTTPS to a device that was never asked to trust this project's
+    CA would be worse than today's plain failure, not better.
     """
     body = f"(?i)(?:^|\\.)(?:{pattern})$"
-    return f"/{body}/$client={','.join(client_ips)}"
+    rule = f"/{body}/$client={','.join(client_ips)}"
+    if block_page_ip:
+        rule += f",dnsrewrite=NOERROR;A;{block_page_ip}"
+    return rule
 
 
-def build_rules(conn: sqlite3.Connection) -> list[str]:
+def build_rules(conn: sqlite3.Connection, block_page_ip: str | None = None) -> list[str]:
     """The complete list of managed hard-deny rules for right now: one
     rule per `mode = 'bump'` domain, each scoped to every device that
     is currently NOT `bump_enabled`.
@@ -99,7 +111,7 @@ def build_rules(conn: sqlite3.Connection) -> list[str]:
     if not non_bump_ips:
         return []
 
-    return [_domain_rule(row["pattern"], non_bump_ips) for row in domains]
+    return [_domain_rule(row["pattern"], non_bump_ips, block_page_ip) for row in domains]
 
 
 def _strip_managed_block(rules: list[str]) -> list[str]:
@@ -120,10 +132,12 @@ def _strip_managed_block(rules: list[str]) -> list[str]:
         return rules[:start]
 
 
-def sync_once(conn: sqlite3.Connection, base_url: str, username: str, password: str) -> int:
+def sync_once(
+    conn: sqlite3.Connection, base_url: str, username: str, password: str, block_page_ip: str | None = None
+) -> int:
     """One full sync cycle. Returns the number of managed rules pushed
     (0 is a normal, healthy state -- see build_rules' own docstring)."""
-    managed = build_rules(conn)
+    managed = build_rules(conn, block_page_ip)
     current = adguard_client.get_custom_rules(base_url, username, password)
     preserved = _strip_managed_block(current)
 
@@ -132,7 +146,14 @@ def sync_once(conn: sqlite3.Connection, base_url: str, username: str, password: 
     return len(managed)
 
 
-def run_loop(interval: float, base_url: str, username: str, password: str, on_error=None) -> PeriodicTask:
+def run_loop(
+    interval: float,
+    base_url: str,
+    username: str,
+    password: str,
+    block_page_ip: str | None = None,
+    on_error=None,
+) -> PeriodicTask:
     """Starts `sync_once()` running on a fixed interval, on its own
     background thread, until the returned `PeriodicTask.stop()` is
     called -- same shape as `controller/discovery.py`'s `run_loop()`,
@@ -158,7 +179,7 @@ def run_loop(interval: float, base_url: str, username: str, password: str, on_er
             conn = db.get_conn()
             db.init_db(conn)
             state["conn"] = conn
-        sync_once(conn, base_url, username, password)
+        sync_once(conn, base_url, username, password, block_page_ip)
 
     pt = PeriodicTask(interval, task, on_error=on_error, thread_name="adguard-sync")
     pt.start()

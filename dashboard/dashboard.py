@@ -2414,6 +2414,19 @@ def main() -> None:
     port = int(os.environ.get("DASHBOARD_PORT", "8787"))
     from waitress import serve
 
+    # Only started when DASHBOARD_URL is actually set -- same gating
+    # condition proxy/entrypoint.sh already uses for Squid's own
+    # deny_info line, and for the same reason: with nothing configured
+    # to point traffic here, this would just be an idle listener. See
+    # block_page_server.py's own module docstring for why this is a
+    # separate tiny server on port 80, not a Flask route, and why there's
+    # deliberately no HTTPS (port 443) equivalent.
+    if os.environ.get("DASHBOARD_URL"):
+        import block_page_server
+
+        block_page_server.start(host="0.0.0.0", port=80)
+        print("block page server listening on http://0.0.0.0:80", file=sys.stderr, flush=True)
+
     print(f"dashboard listening on http://{host}:{port}", file=sys.stderr, flush=True)
     serve(app, host=host, port=port, threads=8)
 

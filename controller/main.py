@@ -93,6 +93,7 @@ def run(
     adguard_url: str | None = None,
     adguard_username: str | None = None,
     adguard_password: str | None = None,
+    block_page_ip: str | None = None,
 ) -> None:
     """The main control loop. Runs until SIGTERM/SIGINT.
 
@@ -135,6 +136,12 @@ def run(
     the `finally` block alongside the heartbeat pacer and discovery
     task. adguard_url/adguard_username/adguard_password are required
     together with it -- see main()'s own argument validation.
+    block_page_ip, if given, is threaded through to
+    adguard_sync.build_rules() so hard-deny rules also carry a
+    $dnsrewrite pointing at that IP's port 80 (see
+    dashboard/block_page_server.py) instead of a bare deny -- optional
+    even when adguard_interval is set, and silently ignored (see
+    main()'s own _parse_block_page_ip) if not a plain IPv4 address.
 
     A single failed reconcile cycle (a worker fault, a transient DB
     error) is logged and reported via health_conn rather than crashing
@@ -252,6 +259,7 @@ def run(
             adguard_url,
             adguard_username,
             adguard_password,
+            block_page_ip=block_page_ip,
             on_error=lambda exc: log.warning("adguard sync failed: %s", exc),
         )
 
@@ -365,6 +373,33 @@ def _build_db_backed_provider(
     return provider, conn
 
 
+def _parse_block_page_ip(dashboard_url: str | None) -> str | None:
+    """Extracts a plain IPv4 host from a DASHBOARD_URL-shaped value
+    (e.g. "http://192.168.1.50:8787" -> "192.168.1.50") for
+    adguard_sync.py's $dnsrewrite target -- which needs a literal IP,
+    not a hostname (a hostname would itself need DNS resolution,
+    circular for a rule that exists to REPLACE DNS resolution). Returns
+    None for anything that isn't a plain IPv4 address (including a
+    genuine hostname, or an unset/malformed URL) -- this is a cosmetic
+    enhancement (see dashboard/block_page_server.py's own docstring),
+    not something worth failing loudly over if misconfigured; a device
+    just keeps getting the plain default deny instead of a friendly page.
+    """
+    if not dashboard_url:
+        return None
+    import ipaddress
+    from urllib.parse import urlparse
+
+    host = urlparse(dashboard_url).hostname
+    if not host:
+        return None
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        return None
+    return host
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", default="/run/parental_proxy/arp-worker.sock")
@@ -416,6 +451,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Seconds between adguard_sync.py hard-deny rule pushes (only runs "
         "at all if --adguard-url is set).",
     )
+    parser.add_argument(
+        "--dashboard-url",
+        help="Same value as the dashboard's own DASHBOARD_URL env var, e.g. "
+        "http://192.168.1.50:8787 -- if set (and its host is a plain IPv4 "
+        "address), adguard_sync.py points hard-denied domains' DNS answers at "
+        "that IP's port 80 (dashboard/block_page_server.py) instead of the "
+        "bare default deny, showing a friendly page for plain-HTTP requests. "
+        "Silently has no effect if unset or if the host isn't a plain IPv4 "
+        "address (AdGuard's $dnsrewrite modifier needs a literal IP, not a "
+        "hostname) -- this is a cosmetic enhancement, not something worth "
+        "failing loudly over.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO)
@@ -466,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
         adguard_url=args.adguard_url,
         adguard_username=args.adguard_username,
         adguard_password=args.adguard_password,
+        block_page_ip=_parse_block_page_ip(args.dashboard_url),
     )
     return 0
 

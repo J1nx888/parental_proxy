@@ -109,6 +109,15 @@ services:
     # port-publish remapping once host-networked, so the app's own
     # listen address is what gates LAN exposure now.
     network_mode: host
+    # CAP_NET_BIND_SERVICE: block_page_server.py (added 2026-08-30, only
+    # actually started when DASHBOARD_URL is set) binds port 80 for the
+    # AdGuard-side friendly block page -- the dashboard runs as a
+    # non-root user (see dashboard/Dockerfile's own `USER proxy`), which
+    # can't bind a privileged port without this. Much narrower than
+    # NET_ADMIN/NET_RAW granted elsewhere in this file -- this
+    # capability ONLY allows binding low-numbered ports, nothing else.
+    cap_add:
+      - NET_BIND_SERVICE
     # Start after the proxy: its entrypoint fixes /config ownership on the
     # shared volume (and generates the CA cert) before the dashboard, which
     # runs as the same `proxy` user, opens the database.
@@ -125,6 +134,13 @@ services:
       - LOCAL_NETWORK=${LOCAL_NETWORK:-192.168.1.0/24}
       - PP_DB_PATH=/config/parental_proxy.db
       - PP_CA_CERT_PATH=/config/ssl_cert/ca_cert.pem
+      # If set, also starts block_page_server.py on port 80 (see above)
+      # and tells controller/adguard_sync.py (via the controller
+      # service's own --dashboard-url below) to point hard-denied
+      # domains' DNS answers here via AdGuard's $dnsrewrite modifier,
+      # instead of the bare default deny. Same variable Squid's own
+      # deny_info already uses -- one setting for both paths.
+      - DASHBOARD_URL=${DASHBOARD_URL:-}
       # AdGuard connection settings for the Settings page's "Check for
       # filter updates now" button (common/adguard_client.py) -- only
       # consumed once, to seed the same-named DB settings on first run;
@@ -240,6 +256,7 @@ services:
       - --adguard-url=${ADGUARD_URL:-http://127.0.0.1:3000}
       - --adguard-username=${ADGUARD_USERNAME:-admin}
       - --adguard-password=${ADGUARD_PASSWORD:-}
+      - --dashboard-url=${DASHBOARD_URL:-}
     # No default for GATEWAY_IP/GATEWAY_MAC on purpose -- main.py's own
     # argparse refuses to start without both ("--db-path requires
     # --gateway-ip and --gateway-mac"), same fail-loudly reasoning as

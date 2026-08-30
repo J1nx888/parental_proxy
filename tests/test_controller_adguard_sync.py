@@ -51,6 +51,16 @@ def test_domain_rule_joins_multiple_client_ips_with_commas():
     assert rule.endswith("$client=10.0.0.1,10.0.0.2")
 
 
+def test_domain_rule_without_block_page_ip_has_no_dnsrewrite():
+    rule = adguard_sync._domain_rule("example\\.com", ["10.0.0.1"])
+    assert "dnsrewrite" not in rule
+
+
+def test_domain_rule_with_block_page_ip_adds_dnsrewrite():
+    rule = adguard_sync._domain_rule("example\\.com", ["10.0.0.1"], block_page_ip="192.168.1.50")
+    assert rule == "/(?i)(?:^|\\.)(?:example\\.com)$/$client=10.0.0.1,dnsrewrite=NOERROR;A;192.168.1.50"
+
+
 # ============================================================
 # build_rules
 # ============================================================
@@ -79,6 +89,17 @@ def test_build_rules_covers_every_non_bump_device(conn):
     assert "192.168.1.10" in rules[0]
     assert "192.168.1.11" in rules[0]
     assert "192.168.1.12" not in rules[0], "a bump_enabled device must never be added to the deny list"
+
+
+def test_build_rules_threads_block_page_ip_into_every_rule(conn):
+    _insert_domain(conn, "crunchyroll\\.com")
+    _insert_domain(conn, "example\\.com")
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=False)
+
+    rules = adguard_sync.build_rules(conn, block_page_ip="192.168.1.50")
+
+    assert len(rules) == 2
+    assert all("dnsrewrite=NOERROR;A;192.168.1.50" in r for r in rules)
 
 
 def test_build_rules_ignores_inactive_bindings(conn):
