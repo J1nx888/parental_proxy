@@ -11,7 +11,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssl \
         python3 \
         ca-certificates \
+        libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
+
+# Intercept mode's IP_TRANSPARENT bind + SO_ORIGINAL_DST lookup need
+# CAP_NET_ADMIN -- but this Debian build of Squid is compiled
+# --with-default-user=proxy, so it always calls setuid() down to the
+# unprivileged `proxy` user during startup (see tools.cc's leave_suid,
+# visible in a `squid -X` trace as "giving up root, becoming 'proxy'")
+# *before* it gets to opening those listener sockets. Linux drops a
+# process's capabilities on setuid() unless they're preserved another
+# way, so cap_add: NET_ADMIN on the container alone isn't enough --
+# confirmed live 2026-08-30, where this crashed Squid silently
+# (RegisteredRunner::finalizeConfig never completing, no message at
+# the default log level) despite the container capability being
+# present the whole time. A file capability survives setuid() because
+# it's granted to the binary itself, not the process's inherited set --
+# this is Squid's own documented fix for TPROXY/intercept deployments
+# that don't run as root.
+RUN setcap 'cap_net_admin=+ep' /usr/sbin/squid
 
 # Pre-create /config owned by the `proxy` user (uid 13 on Debian). If a fresh
 # named volume is first initialised by this container, Docker seeds it with
