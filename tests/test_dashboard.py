@@ -784,6 +784,92 @@ def test_update_admin_blank_password_keeps_current_password(client, db_conn):
 
 
 # ============================================================
+# /settings/adguard: connection settings + "check for updates now"
+# ============================================================
+
+def test_update_adguard_settings_saves_url_username_password(client, db_conn):
+    resp = client.post(
+        "/settings/adguard",
+        data={"adguard_url": "http://127.0.0.1:3000", "adguard_username": "admin", "adguard_password": "hunter2"},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    import db as db_mod
+    assert db_mod.get_setting(db_conn, "adguard_url") == "http://127.0.0.1:3000"
+    assert db_mod.get_setting(db_conn, "adguard_username") == "admin"
+    assert db_mod.get_setting(db_conn, "adguard_password") == "hunter2"
+
+
+def test_update_adguard_settings_blank_password_keeps_current(client, db_conn):
+    client.post(
+        "/settings/adguard",
+        data={"adguard_url": "http://127.0.0.1:3000", "adguard_username": "admin", "adguard_password": "hunter2"},
+        headers=_auth_header(),
+    )
+    client.post(
+        "/settings/adguard",
+        data={"adguard_url": "http://127.0.0.1:3000", "adguard_username": "admin", "adguard_password": ""},
+        headers=_auth_header(),
+    )
+    import db as db_mod
+    assert db_mod.get_setting(db_conn, "adguard_password") == "hunter2"
+
+
+def test_update_adguard_settings_blank_username_rejected(client, db_conn):
+    resp = client.post(
+        "/settings/adguard",
+        data={"adguard_url": "http://127.0.0.1:3000", "adguard_username": "", "adguard_password": "x"},
+        headers=_auth_header(),
+    )
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_refresh_adguard_filters_without_connection_details_shows_error(client, db_conn):
+    resp = client.post("/settings/adguard/refresh", headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_refresh_adguard_filters_calls_the_real_client_and_reports_the_count(client, db_conn, monkeypatch):
+    client.post(
+        "/settings/adguard",
+        data={"adguard_url": "http://127.0.0.1:3000", "adguard_username": "admin", "adguard_password": "hunter2"},
+        headers=_auth_header(),
+    )
+
+    captured = {}
+
+    def fake_refresh(base_url, username, password, timeout=None):
+        captured["args"] = (base_url, username, password)
+        return 2
+
+    import dashboard
+    monkeypatch.setattr(dashboard.adguard_client, "refresh_filters", fake_refresh)
+
+    resp = client.post("/settings/adguard/refresh", headers=_auth_header())
+
+    assert "error=1" not in resp.headers["Location"]
+    assert captured["args"] == ("http://127.0.0.1:3000", "admin", "hunter2")
+
+
+def test_refresh_adguard_filters_reports_adguard_errors_without_crashing(client, db_conn, monkeypatch):
+    client.post(
+        "/settings/adguard",
+        data={"adguard_url": "http://127.0.0.1:3000", "adguard_username": "admin", "adguard_password": "hunter2"},
+        headers=_auth_header(),
+    )
+
+    import dashboard
+
+    def fake_refresh(base_url, username, password, timeout=None):
+        raise dashboard.adguard_client.AdGuardError("could not reach http://127.0.0.1:3000: connection refused")
+
+    monkeypatch.setattr(dashboard.adguard_client, "refresh_filters", fake_refresh)
+
+    resp = client.post("/settings/adguard/refresh", headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+
+
+# ============================================================
 # /blocked: "Request approval" + admin Dismiss/Approve
 # ============================================================
 

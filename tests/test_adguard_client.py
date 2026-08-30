@@ -140,3 +140,53 @@ def test_timeout_is_wrapped(monkeypatch):
     monkeypatch.setattr(adguard_client._OPENER, "open", fake_open)
     with pytest.raises(adguard_client.AdGuardError, match="timed out"):
         adguard_client.get_custom_rules("http://127.0.0.1:3000", "admin", "x")
+
+
+def test_set_filters_update_interval_posts_the_right_body(monkeypatch):
+    captured = {}
+
+    def fake_open(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode())
+        return FakeResponse(b"")
+
+    monkeypatch.setattr(adguard_client._OPENER, "open", fake_open)
+    adguard_client.set_filters_update_interval("http://127.0.0.1:3000", "admin", "x", 168)
+
+    assert captured["url"] == "http://127.0.0.1:3000/control/filtering/config"
+    assert captured["body"] == {"enabled": True, "interval": 168}
+
+
+def test_refresh_filters_returns_the_updated_count(monkeypatch):
+    monkeypatch.setattr(
+        adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({"updated": 3})
+    )
+    assert adguard_client.refresh_filters("http://127.0.0.1:3000", "admin", "x") == 3
+
+
+def test_refresh_filters_zero_updated_is_a_valid_result(monkeypatch):
+    monkeypatch.setattr(
+        adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({"updated": 0})
+    )
+    assert adguard_client.refresh_filters("http://127.0.0.1:3000", "admin", "x") == 0
+
+
+def test_refresh_filters_posts_to_the_right_url_with_whitelist_false(monkeypatch):
+    captured = {}
+
+    def fake_open(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode())
+        return _json_response({"updated": 0})
+
+    monkeypatch.setattr(adguard_client._OPENER, "open", fake_open)
+    adguard_client.refresh_filters("http://127.0.0.1:3000", "admin", "x")
+
+    assert captured["url"] == "http://127.0.0.1:3000/control/filtering/refresh"
+    assert captured["body"] == {"whitelist": False}
+
+
+def test_refresh_filters_rejects_a_response_with_no_updated_count(monkeypatch):
+    monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({}))
+    with pytest.raises(adguard_client.AdGuardError, match="updated"):
+        adguard_client.refresh_filters("http://127.0.0.1:3000", "admin", "x")

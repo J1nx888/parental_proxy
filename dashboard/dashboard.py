@@ -27,6 +27,7 @@ from flask import Flask, Response, redirect, render_template_string, request, se
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import adguard_client
 import auth
 import cr_api
 import db
@@ -92,6 +93,19 @@ def bootstrap_admin() -> None:
                 )
         db.set_setting_if_absent(conn, "local_network", os.environ.get("LOCAL_NETWORK", "192.168.1.0/24"))
         db.set_setting_if_absent(conn, "secret_key", secrets.token_hex(32))
+        # AdGuard connection settings, for the Settings page's "Check for
+        # filter updates now" button (common/adguard_client.py) -- seeded
+        # from the same env vars docker-compose.yml passes to the adguard
+        # service itself, so a matching ADGUARD_PASSWORD in .env "just
+        # works" without a second manual entry. If ADGUARD_PASSWORD was
+        # left blank there (adguard/entrypoint.sh auto-generates one in
+        # that case, printed only to that container's own logs), this
+        # stays blank too -- the Settings page below explains that and
+        # lets an admin paste that generated password in by hand, same
+        # as the dashboard's own admin login is editable after the fact.
+        db.set_setting_if_absent(conn, "adguard_url", os.environ.get("ADGUARD_URL", ""))
+        db.set_setting_if_absent(conn, "adguard_username", os.environ.get("ADGUARD_USERNAME", "admin"))
+        db.set_setting_if_absent(conn, "adguard_password", os.environ.get("ADGUARD_PASSWORD", ""))
         conn.commit()
     finally:
         conn.close()
@@ -2161,6 +2175,32 @@ SETTINGS_BODY = """
 </div>
 
 <div class="card">
+<h2>Ad-block filter lists (AdGuard Home)</h2>
+<p class="hint">
+  AdGuard Home checks its subscribed filter lists (its own default list,
+  plus the curated uBlockOrigin/uAssets lists added on first run) on its
+  own schedule -- once a week by default
+  (<code>ADGUARD_FILTERS_UPDATE_INTERVAL_HOURS</code> in <code>.env</code>).
+  Use this to check right now instead of waiting.
+</p>
+<form method="post" action="{{ url_for('refresh_adguard_filters') }}">
+  <button class="add" type="submit" {{ 'disabled' if not adguard_configured }}>Check for filter updates now</button>
+</form>
+{% if not adguard_configured %}
+<p class="hint"><strong>Not configured yet</strong> -- set the connection details below (matching whatever ADGUARD_USERNAME/ADGUARD_PASSWORD is set to in <code>.env</code> for the <code>adguard</code> container; if ADGUARD_PASSWORD was left blank there, copy the auto-generated password from <code>docker compose logs adguard</code>).</p>
+{% endif %}
+<details {{ 'open' if not adguard_configured }}>
+<summary>Connection settings</summary>
+<form class="add-form" method="post" action="{{ url_for('update_adguard_settings') }}">
+  <input type="text" name="adguard_url" value="{{ adguard_url }}" placeholder="http://host.docker.internal:3000" style="flex:1; min-width:280px;">
+  <input type="text" name="adguard_username" value="{{ adguard_username }}" placeholder="Username">
+  <input type="password" name="adguard_password" placeholder="Password (leave blank to keep current)">
+  <button class="add" type="submit">Save</button>
+</form>
+</details>
+</div>
+
+<div class="card">
 <h2>Local network</h2>
 <form class="add-form" method="post" action="{{ url_for('update_local_network') }}">
   <input type="text" name="local_network" value="{{ local_network }}" style="flex:1; min-width:280px;">
@@ -2237,12 +2277,52 @@ def settings_page():
             "SELECT COUNT(*) c FROM devices WHERE last_seen_at IS NOT NULL AND last_seen_at < ?",
             (db.iso_secs_ago(int(device_stale_days) * 86400),),
         ).fetchone()["c"]
+    adguard_url = db.get_setting(conn, "adguard_url", "")
+    adguard_username = db.get_setting(conn, "adguard_username", "admin")
+    adguard_password = db.get_setting(conn, "adguard_password", "")
     body = render_template_string(
         SETTINGS_BODY, local_network=local_network, admin_username=admin_username,
         block_page_mode=block_page_mode, device_stale_days=device_stale_days,
-        stale_device_count=stale_device_count,
+        stale_device_count=stale_device_count, adguard_url=adguard_url,
+        adguard_username=adguard_username,
+        adguard_configured=bool(adguard_url and adguard_password),
     )
     return render("settings", body)
+
+
+@app.route("/settings/adguard", methods=["POST"])
+@require_admin
+def update_adguard_settings():
+    url = request.form.get("adguard_url", "").strip()
+    username = request.form.get("adguard_username", "").strip()
+    password = request.form.get("adguard_password", "")
+    if not username:
+        return flash_redirect("settings_page", "AdGuard username can't be empty.", error=True)
+    conn = get_db()
+    db.set_setting(conn, "adguard_url", url)
+    db.set_setting(conn, "adguard_username", username)
+    if password:
+        db.set_setting(conn, "adguard_password", password)
+    conn.commit()
+    return flash_redirect("settings_page", "Saved.")
+
+
+@app.route("/settings/adguard/refresh", methods=["POST"])
+@require_admin
+def refresh_adguard_filters():
+    conn = get_db()
+    url = db.get_setting(conn, "adguard_url", "")
+    username = db.get_setting(conn, "adguard_username", "admin")
+    password = db.get_setting(conn, "adguard_password", "")
+    if not url or not password:
+        return flash_redirect("settings_page", "Set AdGuard's connection details below first.", error=True)
+    try:
+        updated = adguard_client.refresh_filters(url, username, password)
+    except adguard_client.AdGuardError as exc:
+        return flash_redirect("settings_page", f"Couldn't reach AdGuard: {exc}", error=True)
+    if updated:
+        return flash_redirect("settings_page", f"Checked now -- {updated} list(s) had new content.")
+    return flash_redirect("settings_page", "Checked now -- everything was already up to date.")
 
 
 @app.route("/settings/device-stale-days", methods=["POST"])

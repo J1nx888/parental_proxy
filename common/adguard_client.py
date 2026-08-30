@@ -145,3 +145,52 @@ def set_custom_rules(
         json_body={"rules": rules},
         timeout=timeout,
     )
+
+
+def set_filters_update_interval(
+    base_url: str, username: str, password: str, interval_hours: int, timeout: float = DEFAULT_TIMEOUT
+) -> None:
+    """Sets how often AdGuard Home ITSELF re-checks every subscribed
+    filter list (its own built-in background schedule -- this project
+    doesn't reimplement update-checking, just configures AdGuard's real
+    one). `adguard/entrypoint.sh` calls this once during first-run
+    bootstrap with `interval_hours=168` (one week, matching AdGuard's
+    own "Once a week" UI preset) -- confirmed live 2026-08-30 that 168
+    is accepted and echoed back exactly by `/control/filtering/status`.
+    """
+    _request(
+        f"{base_url.rstrip('/')}/control/filtering/config",
+        method="POST",
+        username=username,
+        password=password,
+        json_body={"enabled": True, "interval": interval_hours},
+        timeout=timeout,
+    )
+
+
+def refresh_filters(base_url: str, username: str, password: str, timeout: float = DEFAULT_TIMEOUT) -> int:
+    """Forces AdGuard Home to check every subscribed filter list right
+    now, instead of waiting for its own update interval -- this is what
+    the dashboard's "Check for filter updates now" button calls.
+    Confirmed live 2026-08-30 this is safe to call as often as wanted
+    (AdGuard's own docs: "ratelimited, so you can call it freely").
+    Returns how many lists actually had new content -- 0 is a normal,
+    healthy result when nothing has changed upstream since the last
+    check, not a failure.
+    """
+    body = _request(
+        f"{base_url.rstrip('/')}/control/filtering/refresh",
+        method="POST",
+        username=username,
+        password=password,
+        json_body={"whitelist": False},
+        timeout=timeout,
+    )
+    try:
+        decoded = json.loads(body)
+    except ValueError as exc:
+        raise AdGuardError(f"malformed JSON from {base_url}/control/filtering/refresh: {exc}") from exc
+    updated = decoded.get("updated") if isinstance(decoded, dict) else None
+    if not isinstance(updated, int):
+        raise AdGuardError("AdGuard Home's filtering/refresh response had no 'updated' count")
+    return updated

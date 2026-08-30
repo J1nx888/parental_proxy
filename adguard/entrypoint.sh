@@ -156,6 +156,21 @@ if [ "${ADGUARD_SKIP_EXTRA_BLOCKLISTS:-}" != "1" ]; then
       http://127.0.0.1:3000/control/filtering/add_url \
       || echo "  warning: failed to add blocklist '$list_name' -- continuing anyway" >&2
   done
+
+  # AdGuard already re-checks every subscribed list on its own --
+  # ADGUARD_FILTERS_UPDATE_INTERVAL_HOURS just tells it how often
+  # (confirmed live 2026-08-30: 168 = one week is accepted and echoed
+  # back exactly, matching AdGuard's own "Once a week" UI preset). The
+  # dashboard's "Check for filter updates now" button
+  # (common/adguard_client.refresh_filters) covers the "whenever the
+  # admin wants" half of this independently of whatever interval is set
+  # here -- it doesn't wait for this schedule.
+  wget -q -O /dev/null \
+    --header "Authorization: Basic $AUTH_B64" \
+    --header 'Content-Type: application/json' \
+    --post-data "{\"enabled\":true,\"interval\":${ADGUARD_FILTERS_UPDATE_INTERVAL_HOURS:-168}}" \
+    http://127.0.0.1:3000/control/filtering/config \
+    || echo "  warning: failed to set the filter update interval -- continuing anyway" >&2
 fi
 
 # Same reasoning as dashboard/dashboard.py's DASHBOARD_BIND default:

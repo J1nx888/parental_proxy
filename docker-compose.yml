@@ -73,6 +73,11 @@ services:
       # AdGuard's own default filter -- see adguard/entrypoint.sh's own
       # comment for exactly which lists and why.
       - ADGUARD_SKIP_EXTRA_BLOCKLISTS=${ADGUARD_SKIP_EXTRA_BLOCKLISTS:-}
+      # First-run only: how often AdGuard itself re-checks every subscribed
+      # filter list, in hours -- 168 = once a week. The dashboard's "Check
+      # for filter updates now" button works independently of this and
+      # doesn't wait for it.
+      - ADGUARD_FILTERS_UPDATE_INTERVAL_HOURS=${ADGUARD_FILTERS_UPDATE_INTERVAL_HOURS:-168}
       # 127.0.0.1 = AdGuard Home's OWN admin UI (separate from this
       # project's dashboard) only reachable from this machine. 0.0.0.0 =
       # reachable from any device on the LAN -- see adguard/entrypoint.sh's
@@ -88,8 +93,22 @@ services:
       dockerfile: dashboard/Dockerfile
     container_name: parental-proxy-dashboard
     restart: unless-stopped
-    ports:
-      - "${DASHBOARD_BIND:-127.0.0.1}:8787:8787"
+    # network_mode: host (added 2026-08-30, same day as the AdGuard
+    # "check now" button below): AdGuard's own admin UI defaults to
+    # 127.0.0.1-only (ADGUARD_WEB_BIND, a deliberate secure default --
+    # see adguard's own comment above) -- a loopback-bound socket only
+    # accepts connections from within the SAME network namespace, so a
+    # bridge-networked dashboard container could never reach it at all
+    # (not even via host.docker.internal/extra_hosts -- that reaches the
+    # host through a bridge-facing address, a different source than
+    # 127.0.0.1 as far as a strict loopback bind is concerned). Sharing
+    # the host namespace, like proxy/adguard already do, is what
+    # actually fixes this. DASHBOARD_HOST below takes over what the old
+    # port-mapping's bind address used to control, for the same reason
+    # ADGUARD_WEB_BIND does for adguard -- there's no more docker-level
+    # port-publish remapping once host-networked, so the app's own
+    # listen address is what gates LAN exposure now.
+    network_mode: host
     # Start after the proxy: its entrypoint fixes /config ownership on the
     # shared volume (and generates the CA cert) before the dashboard, which
     # runs as the same `proxy` user, opens the database.
@@ -100,10 +119,22 @@ services:
       # the dashboard generates a random password and prints it to its logs.
       - DASHBOARD_USER=${DASHBOARD_USER:-}
       - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:-}
-      - DASHBOARD_HOST=0.0.0.0
+      # 127.0.0.1 = this machine only (use SSH port-forwarding for remote
+      # access); 0.0.0.0 = reachable from any device on the LAN.
+      - DASHBOARD_HOST=${DASHBOARD_BIND:-127.0.0.1}
       - LOCAL_NETWORK=${LOCAL_NETWORK:-192.168.1.0/24}
       - PP_DB_PATH=/config/parental_proxy.db
       - PP_CA_CERT_PATH=/config/ssl_cert/ca_cert.pem
+      # AdGuard connection settings for the Settings page's "Check for
+      # filter updates now" button (common/adguard_client.py) -- only
+      # consumed once, to seed the same-named DB settings on first run;
+      # editable from the Settings page afterward (e.g. to paste in a
+      # password AdGuard auto-generated because ADGUARD_PASSWORD was left
+      # blank -- see adguard's own environment block above). Must match
+      # whatever the adguard service is actually configured with.
+      - ADGUARD_URL=${ADGUARD_URL:-http://127.0.0.1:3000}
+      - ADGUARD_USERNAME=${ADGUARD_USERNAME:-admin}
+      - ADGUARD_PASSWORD=${ADGUARD_PASSWORD:-}
     volumes:
       - pp_config:/config
 
