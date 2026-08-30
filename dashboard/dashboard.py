@@ -433,15 +433,19 @@ def render(active: str, body: str) -> str:
         "SELECT COUNT(*) c FROM access_log WHERE approval_requested_at IS NOT NULL"
     ).fetchone()["c"]
     # Sidebar alarm badge: only for an interception layer that's actually
-    # enabled (a row exists) and currently fail-open -- a missing row just
+    # enabled (a row exists) and either explicitly fail-open or stale (see
+    # health_page()'s _is_stale -- a crashed process can't self-report, so
+    # a frozen last_healthy_at is its own signal) -- a missing row just
     # means the optional `interception` compose profile isn't running at
     # all, which is a normal, unremarkable deployment shape and shouldn't
     # nag every page with a "!" badge.
     runtime_row = conn.execute(
-        "SELECT mode, nft_mode FROM interception_runtime WHERE singleton_id = 1"
+        "SELECT mode, nft_mode, last_healthy_at, nft_last_healthy_at "
+        "FROM interception_runtime WHERE singleton_id = 1"
     ).fetchone()
-    interception_down = bool(
-        runtime_row and (runtime_row["mode"] == "fail_open" or runtime_row["nft_mode"] == "fail_open")
+    interception_down = bool(runtime_row) and (
+        runtime_row["mode"] == "fail_open" or runtime_row["nft_mode"] == "fail_open"
+        or _is_stale(runtime_row["last_healthy_at"]) or _is_stale(runtime_row["nft_last_healthy_at"])
     )
     return render_template_string(
         BASE, active=active, body=body, pending_count=pending_count,
@@ -2206,11 +2210,13 @@ HEALTH_BODY = """
 <div class="card">
 <h2>Device tracking &amp; blocking <span class="hint" style="font-weight:normal;">(controller &amp; arp-worker)</span></h2>
 <p>
-  <span class="badge {{ mode_badge_class }}">{{ runtime_row.mode }}</span>
+  <span class="badge {{ 'pending' if mode_stale else mode_badge_class }}">{{ 'stale' if mode_stale else runtime_row.mode }}</span>
   {% if runtime_row.last_healthy_at %}&mdash; last healthy {{ runtime_row.last_healthy_at }}{% endif %}
 </p>
 {% if runtime_row.mode == 'fail_open' %}
 <p class="hint"><strong>Fail-open: devices are NOT being tracked or blocked right now.</strong> Reason: {{ runtime_row.fail_open_reason or 'unknown' }}. Traffic is passed through unrestricted rather than silently dropped -- see RoadMap.md's "Fail-open engineering" section for why this is the deliberate choice on this failure path.</p>
+{% elif mode_stale %}
+<p class="hint"><strong>Stale: last reported healthy over {{ stale_after_seconds }}s ago, but its status is still "{{ runtime_row.mode }}".</strong> A crashed or crash-looping controller can't self-report its own failure -- the reporting call lives in the same process that died -- so a status frozen well past its normal reconciliation interval is itself the signal something's wrong. Check <code>docker compose ps controller</code> and <code>docker compose logs controller</code>.</p>
 {% elif not runtime_row.last_healthy_at %}
 <p class="hint">Never reported healthy yet -- the controller container may still be starting, or hasn't completed a reconciliation cycle.</p>
 {% else %}
@@ -2221,11 +2227,13 @@ HEALTH_BODY = """
 <div class="card">
 <h2>Traffic redirection <span class="hint" style="font-weight:normal;">(nftables-manager)</span></h2>
 <p>
-  <span class="badge {{ nft_mode_badge_class }}">{{ runtime_row.nft_mode }}</span>
+  <span class="badge {{ 'pending' if nft_mode_stale else nft_mode_badge_class }}">{{ 'stale' if nft_mode_stale else runtime_row.nft_mode }}</span>
   {% if runtime_row.nft_last_healthy_at %}&mdash; last healthy {{ runtime_row.nft_last_healthy_at }}{% endif %}
 </p>
 {% if runtime_row.nft_mode == 'fail_open' %}
 <p class="hint"><strong>Fail-open: nftables policy sets are NOT being kept in sync right now.</strong> Reason: {{ runtime_row.nft_fail_reason or 'unknown' }}. Whatever sets were last applied stay in place; devices' access won't reflect changes made since.</p>
+{% elif nft_mode_stale %}
+<p class="hint"><strong>Stale: last reported healthy over {{ stale_after_seconds }}s ago, but its status is still "{{ runtime_row.nft_mode }}".</strong> Same reasoning as the controller card above -- a crashed nftables-manager can't self-report its own failure.</p>
 {% elif not runtime_row.nft_last_healthy_at %}
 <p class="hint">Never reported healthy yet -- the nftables-manager container may still be starting.</p>
 {% endif %}
@@ -2237,6 +2245,22 @@ HEALTH_BODY = """
 </div>
 {% endif %}
 """
+
+
+# Both the controller's reconcile loop and nftables-manager's poll loop
+# default to a 5s interval (controller/main.py's --poll-interval,
+# phase3/nftables-manager's -poll-interval); 30s is 6x that -- generous
+# enough to absorb normal jitter/startup without false-flagging, tight
+# enough to surface a genuinely dead process well within one dashboard
+# reload. See health_page()'s docstring-equivalent comment below for why
+# staleness needs its own check at all (a dead process can't self-report).
+HEALTH_STALE_AFTER_SECONDS = 30
+
+
+def _is_stale(last_healthy_at: str | None) -> bool:
+    if not last_healthy_at:
+        return False  # "never reported" has its own, separate message
+    return last_healthy_at < db.iso_secs_ago(HEALTH_STALE_AFTER_SECONDS)
 
 
 @app.route("/health")
@@ -2256,12 +2280,25 @@ def health_page():
         "repair_only": "pending", "stopped": "mode-trusted",
     }
     nft_mode_badge_class = mode_badge_class = "mode-trusted"
+    mode_stale = nft_mode_stale = False
     if runtime_row:
+        # A crashed or crash-looping process (e.g. sustained OOM-kill,
+        # confirmed live 2026-08-30 -- see RoadMap.md's fault-campaign
+        # notes) can't write its own fail_open row: the reporting call
+        # lives in the same process that died, so `mode`/`nft_mode` stay
+        # frozen at whatever they were the moment it went down, with an
+        # ever-more-outdated last_healthy_at. Only wall-clock staleness on
+        # last_healthy_at itself can catch this -- the mode column alone
+        # cannot, by construction.
+        mode_stale = runtime_row["mode"] != "fail_open" and _is_stale(runtime_row["last_healthy_at"])
+        nft_mode_stale = runtime_row["nft_mode"] != "fail_open" and _is_stale(runtime_row["nft_last_healthy_at"])
         mode_badge_class = mode_badge.get(runtime_row["mode"], "mode-trusted")
         nft_mode_badge_class = mode_badge.get(runtime_row["nft_mode"], "mode-trusted")
     body = render_template_string(
         HEALTH_BODY, runtime_row=runtime_row,
         mode_badge_class=mode_badge_class, nft_mode_badge_class=nft_mode_badge_class,
+        mode_stale=mode_stale, nft_mode_stale=nft_mode_stale,
+        stale_after_seconds=HEALTH_STALE_AFTER_SECONDS,
     )
     return render("health", body)
 

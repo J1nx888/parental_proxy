@@ -791,6 +791,51 @@ def test_health_page_shows_fail_open_reason(client, db_conn):
     assert b"NOT being tracked" in resp.data
 
 
+def test_health_page_flags_stale_mode_despite_running_status(client, db_conn):
+    # Simulates a crash-looping controller (e.g. OOM-killed, confirmed live
+    # 2026-08-30): the DB row is frozen at whatever it said the moment the
+    # process died, since the process that would report fail_open is the
+    # same one that's dead.
+    import db
+    old_ts = db.iso_secs_ago(60)
+    db_conn.execute(
+        "INSERT INTO interception_runtime (singleton_id, mode, last_healthy_at, nft_mode) "
+        "VALUES (1, 'running', ?, 'running')",
+        (old_ts,),
+    )
+    db_conn.commit()
+    resp = client.get("/health", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"stale" in resp.data.lower()
+    assert b"but its status is still" in resp.data
+
+
+def test_health_page_does_not_flag_recent_running_status_as_stale(client, db_conn):
+    import db
+    db_conn.execute(
+        "INSERT INTO interception_runtime (singleton_id, mode, last_healthy_at, nft_mode, nft_last_healthy_at) "
+        "VALUES (1, 'running', ?, 'running', ?)",
+        (db.now_iso(), db.now_iso()),
+    )
+    db_conn.commit()
+    resp = client.get("/health", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"stale" not in resp.data.lower()
+
+
+def test_sidebar_shows_alarm_badge_for_stale_status_too(client, db_conn):
+    import db
+    old_ts = db.iso_secs_ago(60)
+    db_conn.execute(
+        "INSERT INTO interception_runtime (singleton_id, mode, last_healthy_at, nft_mode) "
+        "VALUES (1, 'running', ?, 'running')",
+        (old_ts,),
+    )
+    db_conn.commit()
+    resp = client.get("/settings", headers=_auth_header())
+    assert b'class="badge blocked">!' in resp.data
+
+
 def test_health_page_shows_nft_fail_open_reason(client, db_conn):
     db_conn.execute(
         "INSERT INTO interception_runtime (singleton_id, mode, nft_mode, nft_fail_reason) "
