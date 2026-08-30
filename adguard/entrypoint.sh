@@ -90,16 +90,19 @@ _json_escape() {
 USERNAME_JSON=$(_json_escape "${ADGUARD_USERNAME:-admin}")
 PASSWORD_JSON=$(_json_escape "$ADGUARD_PASSWORD")
 
-# ADGUARD_WEB_BIND defaults to 127.0.0.1 -- same reasoning as
-# dashboard/dashboard.py's DASHBOARD_BIND default: with
-# `network_mode: host` (required for DNS interception, see
-# docker-compose.yml's own comment), "0.0.0.0" here would put AdGuard
-# Home's own admin UI -- a second login surface this project didn't
-# build, separate from our dashboard -- directly on the LAN. Set
-# ADGUARD_WEB_BIND=0.0.0.0 to deliberately expose it instead.
+# Web is ALWAYS configured onto the wildcard address here, regardless
+# of ADGUARD_WEB_BIND -- confirmed live 2026-08-30 that
+# /control/install/configure validates the NEW address by test-binding
+# it before releasing the current pre-configure listener, and asking
+# for exactly the same specific address that listener already holds
+# (e.g. 127.0.0.1:3000) fails with "address already in use" against
+# itself; the wildcard doesn't conflict the same way (standard Linux
+# bind() behavior: a wildcard bind coexists with an already-bound
+# specific address, where repeating that exact specific address does
+# not). ADGUARD_WEB_BIND is applied as a second step below instead.
 wget -q -O /dev/null \
   --header 'Content-Type: application/json' \
-  --post-data "{\"web\":{\"ip\":\"${ADGUARD_WEB_BIND:-127.0.0.1}\",\"port\":3000},\"dns\":{\"ip\":\"0.0.0.0\",\"port\":${ADGUARD_DNS_PORT:-5353}},\"username\":\"$USERNAME_JSON\",\"password\":\"$PASSWORD_JSON\"}" \
+  --post-data "{\"web\":{\"ip\":\"0.0.0.0\",\"port\":3000},\"dns\":{\"ip\":\"0.0.0.0\",\"port\":${ADGUARD_DNS_PORT:-5353}},\"username\":\"$USERNAME_JSON\",\"password\":\"$PASSWORD_JSON\"}" \
   http://127.0.0.1:3000/control/install/configure
 
 if [ ! -f "$CONF" ]; then
@@ -109,5 +112,26 @@ if [ ! -f "$CONF" ]; then
   exit 1
 fi
 
-echo "AdGuard Home configured (DNS on :${ADGUARD_DNS_PORT:-5353}, admin UI on ${ADGUARD_WEB_BIND:-127.0.0.1}:3000)." >&2
+# Same reasoning as dashboard/dashboard.py's DASHBOARD_BIND default:
+# with `network_mode: host` (required for DNS interception, see
+# docker-compose.yml's own comment), the wildcard bind above would put
+# AdGuard Home's own admin UI -- a second login surface this project
+# didn't build, separate from our dashboard -- directly on the LAN. If
+# a non-wildcard bind was actually requested, rewrite the now-written
+# config's http.address directly and restart onto it: AdGuardHome.yaml
+# only takes effect while the process isn't running (AdGuard's own
+# documented behavior), which this restart satisfies, and there's no
+# more self-conflict once the wildcard listener above is torn down
+# first. Set ADGUARD_WEB_BIND=0.0.0.0 to skip this step and deliberately
+# expose it on the LAN instead.
+WEB_BIND="${ADGUARD_WEB_BIND:-127.0.0.1}"
+if [ "$WEB_BIND" != "0.0.0.0" ]; then
+  kill -TERM "$PID" 2>/dev/null
+  wait "$PID" 2>/dev/null
+  trap - TERM INT
+  sed -i "s/^  address: 0\.0\.0\.0:3000\$/  address: ${WEB_BIND}:3000/" "$CONF"
+  exec "$BIN" --no-check-update -c "$CONF" -w "$WORK"
+fi
+
+echo "AdGuard Home configured (DNS on :${ADGUARD_DNS_PORT:-5353}, admin UI on 0.0.0.0:3000)." >&2
 wait "$PID"
