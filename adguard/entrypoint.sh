@@ -61,7 +61,7 @@ PID=$!
 trap 'kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null' TERM INT
 
 i=0
-while ! wget -q --spider http://127.0.0.1:3000/install/get_addresses 2>/dev/null; do
+while ! wget -q -O /dev/null http://127.0.0.1:3000/control/install/get_addresses 2>/dev/null; do
   i=$((i + 1))
   if [ "$i" -ge 30 ]; then
     echo "AdGuard Home did not come up for setup within 30s" >&2
