@@ -750,6 +750,71 @@ def test_update_block_page_mode_invalid_value_rejected(client, db_conn):
     assert "error=1" in resp.headers["Location"]
 
 
+# ============================================================
+# HEALTH (interception_runtime)
+# ============================================================
+
+def test_health_page_requires_admin_auth(client):
+    resp = client.get("/health")
+    assert resp.status_code == 401
+
+
+def test_health_page_shows_not_running_when_no_runtime_row(client):
+    resp = client.get("/health", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"Not running" in resp.data
+    assert b"interception" in resp.data.lower()
+
+
+def test_health_page_shows_running_mode_and_generation(client, db_conn):
+    db_conn.execute(
+        "INSERT INTO interception_runtime (singleton_id, mode, last_healthy_at, applied_generation, nft_mode) "
+        "VALUES (1, 'running', '2026-08-30T12:00:00Z', 7, 'running')"
+    )
+    db_conn.commit()
+    resp = client.get("/health", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"running" in resp.data
+    assert b"2026-08-30T12:00:00Z" in resp.data
+    assert b"7" in resp.data
+
+
+def test_health_page_shows_fail_open_reason(client, db_conn):
+    db_conn.execute(
+        "INSERT INTO interception_runtime (singleton_id, mode, fail_open_reason, nft_mode) "
+        "VALUES (1, 'fail_open', 'worker connection lost', 'running')"
+    )
+    db_conn.commit()
+    resp = client.get("/health", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"worker connection lost" in resp.data
+    assert b"NOT being tracked" in resp.data
+
+
+def test_health_page_shows_nft_fail_open_reason(client, db_conn):
+    db_conn.execute(
+        "INSERT INTO interception_runtime (singleton_id, mode, nft_mode, nft_fail_reason) "
+        "VALUES (1, 'running', 'fail_open', 'nft command failed')"
+    )
+    db_conn.commit()
+    resp = client.get("/health", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"nft command failed" in resp.data
+    assert b"NOT being kept in sync" in resp.data
+
+
+def test_sidebar_shows_alarm_badge_only_when_fail_open(client, db_conn):
+    resp = client.get("/settings", headers=_auth_header())
+    assert b'class="badge blocked">!' not in resp.data
+
+    db_conn.execute(
+        "INSERT INTO interception_runtime (singleton_id, mode, nft_mode) VALUES (1, 'fail_open', 'running')"
+    )
+    db_conn.commit()
+    resp = client.get("/settings", headers=_auth_header())
+    assert b'class="badge blocked">!' in resp.data
+
+
 def test_update_admin_changes_username_and_password(client, db_conn):
     resp = client.post(
         "/settings/admin",

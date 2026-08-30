@@ -176,7 +176,7 @@ try { if (localStorage.getItem("pp_sidebar_collapsed") === "1") document.documen
 </script>
 </head>
 <body>
-{% set page_titles = {'report': 'Report', 'users': 'Users', 'domains': 'Domains', 'devices': 'Devices', 'settings': 'Settings'} %}
+{% set page_titles = {'report': 'Report', 'users': 'Users', 'domains': 'Domains', 'devices': 'Devices', 'health': 'Health', 'settings': 'Settings'} %}
 <div class="app-shell">
   <nav class="sidebar">
     <a class="sidebar-brand" href="{{ url_for('report') }}">
@@ -199,6 +199,10 @@ try { if (localStorage.getItem("pp_sidebar_collapsed") === "1") document.documen
       <a class="sidebar-item {{ 'active' if active=='devices' else '' }}" href="{{ url_for('devices') }}" title="Devices">
         <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
         <span class="sidebar-label">Devices</span>
+      </a>
+      <a class="sidebar-item {{ 'active' if active=='health' else '' }}" href="{{ url_for('health_page') }}" title="Health">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        <span class="sidebar-label">Health{% if interception_down %} <span class="badge blocked">!</span>{% endif %}</span>
       </a>
       <a class="sidebar-item {{ 'active' if active=='settings' else '' }}" href="{{ url_for('settings_page') }}" title="Settings">
         <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -428,8 +432,20 @@ def render(active: str, body: str) -> str:
     pending_count = conn.execute(
         "SELECT COUNT(*) c FROM access_log WHERE approval_requested_at IS NOT NULL"
     ).fetchone()["c"]
+    # Sidebar alarm badge: only for an interception layer that's actually
+    # enabled (a row exists) and currently fail-open -- a missing row just
+    # means the optional `interception` compose profile isn't running at
+    # all, which is a normal, unremarkable deployment shape and shouldn't
+    # nag every page with a "!" badge.
+    runtime_row = conn.execute(
+        "SELECT mode, nft_mode FROM interception_runtime WHERE singleton_id = 1"
+    ).fetchone()
+    interception_down = bool(
+        runtime_row and (runtime_row["mode"] == "fail_open" or runtime_row["nft_mode"] == "fail_open")
+    )
     return render_template_string(
         BASE, active=active, body=body, pending_count=pending_count,
+        interception_down=interception_down,
         message=request.args.get("message"), error=request.args.get("error"),
     )
 
@@ -2166,6 +2182,89 @@ def dismiss_request():
 # ==========================================================
 # SETTINGS
 # ==========================================================
+
+# ==========================================================
+# HEALTH (interception_runtime -- see common/db.py's schema comment)
+# ==========================================================
+
+HEALTH_BODY = """
+{% if not runtime_row %}
+<div class="card">
+<h2>Interception layer</h2>
+<p class="hint">
+  Not running. This dashboard's device-classification enforcement (ARP-based
+  traffic redirection and nftables policy sets) is an optional layer on top
+  of the proxy -- it's brought up with
+  <code>docker compose --profile interception up -d</code> and is deliberately
+  a separate opt-in, since it changes how traffic on the LAN is routed. If
+  you meant to have it running, check <code>docker compose ps</code> for the
+  <code>arp-worker</code>, <code>nftables-manager</code>, and
+  <code>controller</code> containers.
+</p>
+</div>
+{% else %}
+<div class="card">
+<h2>Device tracking &amp; blocking <span class="hint" style="font-weight:normal;">(controller &amp; arp-worker)</span></h2>
+<p>
+  <span class="badge {{ mode_badge_class }}">{{ runtime_row.mode }}</span>
+  {% if runtime_row.last_healthy_at %}&mdash; last healthy {{ runtime_row.last_healthy_at }}{% endif %}
+</p>
+{% if runtime_row.mode == 'fail_open' %}
+<p class="hint"><strong>Fail-open: devices are NOT being tracked or blocked right now.</strong> Reason: {{ runtime_row.fail_open_reason or 'unknown' }}. Traffic is passed through unrestricted rather than silently dropped -- see RoadMap.md's "Fail-open engineering" section for why this is the deliberate choice on this failure path.</p>
+{% elif not runtime_row.last_healthy_at %}
+<p class="hint">Never reported healthy yet -- the controller container may still be starting, or hasn't completed a reconciliation cycle.</p>
+{% else %}
+<p class="hint">Applied ARP-worker generation: {{ runtime_row.applied_generation }}.</p>
+{% endif %}
+</div>
+
+<div class="card">
+<h2>Traffic redirection <span class="hint" style="font-weight:normal;">(nftables-manager)</span></h2>
+<p>
+  <span class="badge {{ nft_mode_badge_class }}">{{ runtime_row.nft_mode }}</span>
+  {% if runtime_row.nft_last_healthy_at %}&mdash; last healthy {{ runtime_row.nft_last_healthy_at }}{% endif %}
+</p>
+{% if runtime_row.nft_mode == 'fail_open' %}
+<p class="hint"><strong>Fail-open: nftables policy sets are NOT being kept in sync right now.</strong> Reason: {{ runtime_row.nft_fail_reason or 'unknown' }}. Whatever sets were last applied stay in place; devices' access won't reflect changes made since.</p>
+{% elif not runtime_row.nft_last_healthy_at %}
+<p class="hint">Never reported healthy yet -- the nftables-manager container may still be starting.</p>
+{% endif %}
+</div>
+
+<div class="card">
+<h2>Auto-refresh</h2>
+<p class="hint">This page doesn't poll live -- reload to see the latest status.</p>
+</div>
+{% endif %}
+"""
+
+
+@app.route("/health")
+@require_admin
+def health_page():
+    conn = get_db()
+    runtime_row = conn.execute(
+        "SELECT mode, last_healthy_at, fail_open_reason, applied_generation, "
+        "nft_mode, nft_last_healthy_at, nft_fail_reason "
+        "FROM interception_runtime WHERE singleton_id = 1"
+    ).fetchone()
+    # Badge classes reuse the report page's allowed/blocked/pending palette --
+    # green for healthy, red for fail-open, amber for repair-only (ARP side
+    # only; nft_mode has no repair_only state), gray for not-yet-started.
+    mode_badge = {
+        "running": "allowed", "fail_open": "blocked",
+        "repair_only": "pending", "stopped": "mode-trusted",
+    }
+    nft_mode_badge_class = mode_badge_class = "mode-trusted"
+    if runtime_row:
+        mode_badge_class = mode_badge.get(runtime_row["mode"], "mode-trusted")
+        nft_mode_badge_class = mode_badge.get(runtime_row["nft_mode"], "mode-trusted")
+    body = render_template_string(
+        HEALTH_BODY, runtime_row=runtime_row,
+        mode_badge_class=mode_badge_class, nft_mode_badge_class=nft_mode_badge_class,
+    )
+    return render("health", body)
+
 
 SETTINGS_BODY = """
 <div class="card">
