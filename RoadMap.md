@@ -191,10 +191,27 @@ once intercepted:
 
 Linux neighbor-cache entries are a state machine, not a fixed TTL — a
 stale mapping to a dead interception box can blackhole a client's
-traffic for a real, bounded period after an *ungraceful* crash, even
-though a *graceful* shutdown can proactively send corrective ARP
-replies. This must be engineered before any testing against the real
-home network, not added afterward:
+traffic for a real, bounded period after an *ungraceful* crash. A
+*graceful* shutdown can proactively send corrective ARP replies; an
+ungraceful one (SIGKILL, OOM, power loss) runs no shutdown code at all,
+so corrective ARP is never in play for that case — recovery there
+depends entirely on the client's own neighbor-cache retry logic, which
+is exactly what the lease/heartbeat + supervisor-driven repair below
+exists to bound. Worth being precise about since it's easy to
+misread the switch-FDB finding two sections down as a crash-case
+concern: it isn't, it's graceful-shutdown-only, since that's the only
+path where corrective ARP code runs. The crash case is arguably a
+touch worse than "just a stale ARP cache," though: active poisoning
+itself (not just correctives) carries the same spoofed-L2-source
+behavior, so a crash leaves the switch's own forwarding table pointing
+at the dead worker too, alongside the client's ARP cache. Both get
+fixed together by the same recovery event regardless — once the
+client's neighbor-cache state machine gives up on the dead mapping and
+sends a fresh broadcast ARP request, the real gateway's reply corrects
+both the client's cache and the switch's table in one shot, since a
+device's own transmission always carries its own honest MAC as the
+wire-level source. This must be engineered before any testing against
+the real home network, not added afterward:
 
 - A lease/heartbeat between controller and worker — the worker stops
   forged refreshes and enters best-effort repair if the controller goes
