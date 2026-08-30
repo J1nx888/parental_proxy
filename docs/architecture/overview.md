@@ -1,14 +1,22 @@
 # Architecture Overview
 
 Reference for navigating and modifying this codebase. Written against the
-tree as of 2026-08-28 (see `docs/review-2026-08-28.md` for the live-testing
-bugfix history referenced throughout this doc).
+tree as of 2026-08-28, **updated 2026-08-30 for Squid's move to intercept
+mode** (see `docs/review-2026-08-28.md` for the earlier live-testing
+bugfix history referenced throughout this doc, and RoadMap.md's "Squid:
+explicit-proxy-with-login -> transparent intercept" section for the
+architecture change itself).
 
-This is a parental-control **forward proxy**: a single Squid instance with
-SSL-Bump enabled, sitting between LAN clients and the internet, making
-per-person allow/deny decisions by calling out to small Python scripts that
-read/write one shared SQLite database. A Flask dashboard is the only way an
-admin edits that database's contents.
+This is a parental-control **transparent, intercepting proxy**: a single
+Squid instance with SSL-Bump enabled, sitting between LAN clients and the
+internet, making per-device allow/deny decisions by calling out to small
+Python scripts that read/write one shared SQLite database. Traffic reaches
+Squid via NAT redirection (Phase 3's `phase3/nftables-manager`, not part of
+this Phase 1/2 codebase) rather than any per-device proxy configuration --
+no device points its proxy settings at Squid at all; the only per-device
+step is trusting the CA certificate. A Flask dashboard is the only way an
+admin edits the shared database's contents, including which devices are
+assigned to which user and which are SSL-Bump-enabled.
 
 ---
 
@@ -19,6 +27,8 @@ common/                      shared Python modules, imported by both containers
   db.py                        SQLite schema (SCHEMA string) + get_conn()/init_db()
   auth.py                      PBKDF2-SHA256 password hashing (hash_password/verify_password)
   matching.py                  domain/path regex matching, LAN CIDR check
+  device_identity.py           resolve_user(conn, client_ip) -- source IP -> device_bindings ->
+                                devices.user_id -> users row (Squid's identity source since 2026-08-30)
   logging_util.py              log_access() -- deduped access-log writer
   squid_helper.py              shared stdin/stdout protocol loop (run())
   series_resolve.py            Crunchyroll object-id -> series-id cache (resolve_series_ids())
@@ -28,8 +38,8 @@ common/                      shared Python modules, imported by both containers
 proxy/                        Squid container
   Dockerfile                    debian:bookworm-slim + squid-openssl
   entrypoint.sh                 first-run seeding, CA cert generation, squid.conf render
-  squid.conf.template           the actual Squid config (http_port, acls, http_access, ssl_bump)
-  basic_auth_helper.py          auth_param basic program -- per-person login (check())
+  squid.conf.template           the actual Squid config (intercept-mode http_port/https_port,
+                                 acls, http_access, ssl_bump -- see RoadMap.md's intercept-mode section)
   sni_helper.py                 external_acl_type for ssl_bump step2 (handle_bump/handle_trusted/
                                  handle_splice/handle_block_page)
   authz_helper.py               external_acl_type for the HTTP-layer decision (decide())
@@ -75,24 +85,30 @@ take effect everywhere.
 ## 3. Component diagram (text form)
 
 ```
-                         LAN client (kid's device)
+                         LAN client (bump-enabled device)
                                    |
-                    TLS ClientHello / CONNECT + per-person
-                    Basic-Auth login (device proxy settings)
+                    Port 80/443 traffic, NAT-redirected here
+                    by Phase 3's nftables (phase3/nftables-manager,
+                    not part of this repo's proxy/dashboard tree) --
+                    no per-device proxy config, only a trusted CA cert
                                    v
                  +--------------------------------------+
                  |         proxy container (Squid)       |
                  |  squid.conf (rendered from            |
                  |  squid.conf.template by entrypoint.sh)|
+                 |  http_port 3129 intercept /            |
+                 |  https_port 3130 intercept ssl-bump    |
                  |                                        |
-                 |  auth_param basic -> basic_auth_helper.py
+                 |  identity: %>a -> device_identity.py -> |
+                 |    device_bindings -> devices.user_id  |
                  |  ssl_bump step1/step2 -> sni_helper.py |
                  |  http_access (post-bump) -> authz_helper.py
                  +--------------------+-------------------+
                                       |
                      reads/writes    (import db, matching,
-                                      logging_util, series_resolve,
-                                      cr_urls -- all from common/)
+                                      device_identity, logging_util,
+                                      series_resolve, cr_urls -- all
+                                      from common/)
                                       |
                                       v
                  +--------------------------------------+
@@ -222,21 +238,25 @@ read by `sni_helper.py handle_block_page()`:
 
 ### 6a. TLS/SNI layer (every HTTPS connection)
 
-1. Client's device is configured with the proxy IP:3128 and a per-person
-   Basic-Auth login. Squid issues the 407 challenge
-   (`acl authenticated proxy_auth REQUIRED` / `http_access deny !authenticated`
-   in `squid.conf.template`), which invokes
-   `auth_param basic program /usr/bin/python3 /opt/parental-proxy/basic_auth_helper.py`.
-   `basic_auth_helper.py check(conn, username, password)` looks up
-   `users.password_hash` and calls `common/auth.py verify_password()`
-   (PBKDF2-SHA256, `hmac.compare_digest`). Note: this helper is invoked with
-   `unquote=True, keep_trailing_spaces=True` in `squid_helper.run()` --
-   confirmed against a real Squid 5.7 that it *does* percent-encode both
-   username and password fields, unlike older Basic-auth folklore (see the
-   docstring in `basic_auth_helper.py` and `docs/review-2026-08-28.md` item
-   2.8).
-2. Client sends `CONNECT host:443`. `http_access allow CONNECT` (qualified
-   with `SSL_ports`) lets the tunnel open.
+1. The client sends nothing special at all -- no `CONNECT`, no proxy
+   configuration, no login. Phase 3's nftables (outside this repo's
+   proxy/dashboard tree; see RoadMap.md) NAT-redirects a bump-enabled
+   device's own port 443 traffic straight to `https_port 3130 intercept
+   ssl-bump ...`, and Squid recovers the real destination via
+   `SO_ORIGINAL_DST`. This replaced the pre-2026-08-30 explicit-proxy model
+   (`http_port 3128 ssl-bump` + `auth_param basic` + a per-request `CONNECT`
+   and 407 Basic-Auth challenge, driven by the now-deleted
+   `proxy/basic_auth_helper.py`) -- an intercepted connection never sends a
+   `CONNECT` for HTTPS, so there is no handshake step left to challenge with
+   a 407 in the first place. Identity is resolved later, per-decision, from
+   the client's source IP (`%>a`) via `common/device_identity.py`'s
+   `resolve_user(conn, client_ip)` (source IP -> `device_bindings` ->
+   `devices.user_id` -> `users` row) -- see `docs/security/overview.md` §3
+   for the full model and its DHCP/staleness caveat.
+2. `http_access deny CONNECT !SSL_ports` / `allow CONNECT` /
+   `allow CONNECT step1`/`step2` still gate the (now purely internal, since
+   there's no client-sent `CONNECT`) tunnel/negotiation phase Squid itself
+   uses to peek and bump.
 3. `ssl_bump peek step1` -- Squid peeks at the ClientHello without
    decrypting, extracting the SNI hostname.
 4. At step2, four `external_acl_type` ACLs (all backed by
@@ -247,7 +267,8 @@ read by `sni_helper.py handle_block_page()`:
    - `sni_trusted` -> `handle_trusted()` -> splice if `mode == 'trusted'`
    - `sni_bump` -> `handle_bump()` -> bump if `mode == 'bump'`
    - `sni_splice_allowed` -> `handle_splice()` -> splice if `mode == 'splice'`
-     AND the user is authenticated, inside the configured LAN
+     AND `device_identity.resolve_user()` resolves an identity for the
+     client IP, that IP is inside the configured LAN
      (`matching.ip_in_configured_lan()`), and either the domain `is_global`
      or `matching.user_has_domain()` returns true
    - `sni_show_block_page` -> `handle_block_page()` -> bump-for-denial only if
@@ -271,8 +292,10 @@ read by `sni_helper.py handle_block_page()`:
    `docs/review-2026-08-28.md`). The actual decrypted HTTP request instead
    falls through to `http_access allow authz_allowed`, backed by
    `external_acl_type authz_check` -> `proxy/authz_helper.py decide()`.
-6. `decide(conn, login, client_ip, dst, path, _data)`:
-   - fails closed if not authenticated or outside the configured LAN
+6. `decide(conn, client_ip, dst, path, _data)`:
+   - resolves identity via `device_identity.resolve_user(conn, client_ip)`;
+     fails closed (silently, no log) if unresolved, or logged
+     `reason="outside_lan"` if outside the configured LAN
      (`matching.ip_in_configured_lan()`)
    - `matching.find_domain()` on the decrypted `Host` (`%DST`, host:port
      split via `_split_host_port()`); denies as `unknown_domain` or
@@ -294,7 +317,7 @@ read by `sni_helper.py handle_block_page()`:
 
 ### 6c. Crunchyroll-specific show resolution
 
-`authz_helper._decide_crunchyroll(conn, user, login, hostname, path, domain)`:
+`authz_helper._decide_crunchyroll(conn, user, hostname, path, domain)`:
 1. Builds the full URL and calls `common/cr_urls.py classify(url)`, which
    pattern-matches (no network I/O, no state) against
    `SERIES_URL_RE`/`WATCH_URL_RE`/`PLAYBACK_URL_RE`/`CMS_OBJECTS_URL_RE` and

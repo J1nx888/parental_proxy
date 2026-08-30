@@ -1,11 +1,11 @@
 # Database schema
 
 Single shared SQLite database file used by every component: the Squid-side
-Python helpers (`proxy/basic_auth_helper.py`, `proxy/sni_helper.py`,
-`proxy/authz_helper.py`), the caching layer (`common/series_resolve.py`),
-and the Flask dashboard (`dashboard/dashboard.py`). All of them open the
-same file via `common/db.py`; there is no ORM and no ID-generation scheme
-beyond SQLite's own `INTEGER PRIMARY KEY` rowid aliasing.
+Python helpers (`proxy/sni_helper.py`, `proxy/authz_helper.py`), the
+caching layer (`common/series_resolve.py`), and the Flask dashboard
+(`dashboard/dashboard.py`). All of them open the same file via
+`common/db.py`; there is no ORM and no ID-generation scheme beyond
+SQLite's own `INTEGER PRIMARY KEY` rowid aliasing.
 
 ## Where the schema lives
 
@@ -84,10 +84,14 @@ admin login (which lives in `settings`, not here).
 | `password_hash` | TEXT | NOT NULL |
 | `created_at`    | TEXT | NOT NULL (ISO-8601 UTC, see `db.now_iso()`) |
 
-`username` is what's configured in a device's proxy auth settings and is
-checked by `proxy/basic_auth_helper.py:check()` against `password_hash`
-(via `common/auth.py`'s `verify_password`). Usernames are restricted by the
-dashboard's `add_user()` to `[A-Za-z0-9_.-]+`. Deleting a user
+`username` identifies a person for domain/show assignment and (via
+`devices.user_id`) device ownership. `password_hash` is set by `add_user()`/
+`reset_password()` but, as of 2026-08-30, has no active consumer: Squid
+resolves identity from the client's device instead of a per-request login
+(see `common/device_identity.py` and `docs/security/overview.md` §3) --
+`password_hash` is reserved for the future Phase 4 captive-portal login
+(RoadMap.md), not checked by anything today. Usernames are restricted by
+the dashboard's `add_user()` to `[A-Za-z0-9_.-]+`. Deleting a user
 (`dashboard.delete_user()`) cascades to `user_domains` and `user_shows` via
 `ON DELETE CASCADE` (enforced because `PRAGMA foreign_keys=ON` is set on
 every connection).
@@ -242,8 +246,8 @@ and its one-click "approve" action.
 |---|---|---|
 | `id`          | INTEGER | PRIMARY KEY |
 | `ts`          | TEXT    | NOT NULL (ISO-8601 UTC, `db.now_iso()`) |
-| `user_id`     | INTEGER | nullable -- NULL when the request has no resolvable user (e.g. `not_authenticated`, or a login string that didn't match any `users` row) |
-| `username`    | TEXT    | NOT NULL -- the raw login string, even when `user_id` is NULL (e.g. `"(unauthenticated)"` for the never-logged-in case, see `sni_helper._log_denial()`) |
+| `user_id`     | INTEGER | nullable -- NULL when `device_identity.resolve_user()` couldn't resolve an identity for the client IP (e.g. `not_authenticated`) |
+| `username`    | TEXT    | NOT NULL -- the resolved user's username, or a placeholder (`"(unauthenticated)"`) when `user_id` is NULL, see `sni_helper._log_denial()` |
 | `domain`      | TEXT    | NOT NULL -- the hostname actually observed (SNI or `%DST`), not the `domains.pattern` regex that matched it |
 | `path`        | TEXT    | nullable -- always NULL for SNI-layer (splice) entries, since nothing is decrypted at that layer to reveal a path |
 | `series_id`   | TEXT    | nullable -- set only for Crunchyroll show-level decisions |
@@ -284,6 +288,152 @@ worth knowing when touching this table:
   ELSE path END`, so `?cachebust=123` variants of the same page collapse
   into one dedupe entry while genuinely different pages on the same domain
   each still get their own row.
+
+## Phase 2/3 tables (groups, devices, identity model)
+
+These tables support device-level assignment and Phase 3's interception
+layer (`phase3/nftables-manager`, `phase3/arp-worker`, `controller/` --
+none of that code lives in this repo's proxy/dashboard tree; see
+RoadMap.md). They predate this doc's last full pass and were missing from
+it entirely; added 2026-08-30 alongside the Squid intercept-mode update.
+
+### `groups`
+A named category of shared devices (e.g. "TVs", "IoT") that gets its own
+domain allow-list, for devices that don't belong to any one person.
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id`         | INTEGER | PRIMARY KEY |
+| `name`       | TEXT | UNIQUE NOT NULL |
+| `created_at` | TEXT | NOT NULL |
+
+### `group_domains`
+The group-level equivalent of `user_domains` -- a row grants every device
+in `group_id` access to `domain_id`, independent of that domain's own
+`is_global` flag. `UNIQUE(group_id, domain_id)`, both FKs `ON DELETE
+CASCADE`. Not consulted by any proxy enforcement path yet (`common/matching.py`'s
+`group_has_domain()` exists but has no caller in `sni_helper.py`/
+`authz_helper.py` -- groups aren't identifiable at Squid request time until
+Phase 3's interception layer exists to establish device identity at the
+network level).
+
+### `devices`
+One physical device, identified by MAC address, managed from the
+dashboard's `/devices` page (`dashboard.py`'s `add_device()`/
+`update_device()`).
+
+| Column             | Type    | Constraints |
+|---|---|---|
+| `id`                | INTEGER | PRIMARY KEY |
+| `mac_address`       | TEXT    | UNIQUE NOT NULL |
+| `label`             | TEXT    | nullable |
+| `user_id`           | INTEGER | REFERENCES `users(id)` ON DELETE SET NULL |
+| `group_id`          | INTEGER | REFERENCES `groups(id)` ON DELETE SET NULL |
+| `ignored`           | INTEGER | NOT NULL DEFAULT 0 |
+| `last_known_ip`     | TEXT    | nullable |
+| `last_seen_at`      | TEXT    | nullable -- NULL means never observed; nothing populates this yet |
+| `bump_enabled`      | INTEGER | NOT NULL DEFAULT 0 |
+| `bypass_login`      | INTEGER | NOT NULL DEFAULT 0 |
+| `is_authenticated`  | INTEGER | NOT NULL DEFAULT 1 |
+| `quarantined_at`    | TEXT    | nullable -- NULL means not quarantined |
+| `created_at`        | TEXT    | NOT NULL |
+|                     |         | `CHECK (user_id IS NULL OR group_id IS NULL)` -- at most one assignment |
+
+Semantics (see `common/db.py`'s own schema comment for the full reasoning):
+`ignored` = permanently outside the whole system (stronger than
+unassigned); `bump_enabled` = this device is one of the curated set that
+gets Squid/SSL-Bump refinement on top of DNS-tier protection, independent
+of (and layered on top of) `is_authenticated` -- see
+`common/policy_class.py`'s `bump_eligible()` and RoadMap.md's "two
+independent axes" section, locked 2026-08-30; `bypass_login` = exempted
+from the future captive-portal gate (Phase 4, not built); `is_authenticated`
+= the eventual captive-portal gate's flag, defaulting to 1 since there's no
+login gate yet to fail; `quarantined_at` = Milestone 8's operator-triggered
+isolation state, nothing sets it yet (no dashboard control exists).
+Indexed on `user_id` and `group_id`.
+
+### `device_domains`
+A single device's own domain allow-list, independent of (and additive to)
+its `user_id`/`group_id` assignment. `UNIQUE(device_id, domain_id)`, both
+FKs `ON DELETE CASCADE`. Same not-yet-consulted-by-enforcement status as
+`group_domains` above (`matching.device_has_domain()` has no caller yet).
+
+### `device_bindings`
+Every observed MAC↔IPv4 pairing, feeding `controller/desired_state.py`'s
+and `controller/policy_state.py`'s desired-state computation, and (as of
+2026-08-30) `common/device_identity.py`'s Squid-side identity resolution.
+
+| Column          | Type    | Constraints |
+|---|---|---|
+| `id`             | INTEGER | PRIMARY KEY |
+| `device_id`      | INTEGER | REFERENCES `devices(id)` ON DELETE SET NULL, nullable |
+| `mac_address`    | TEXT    | NOT NULL |
+| `ipv4_address`   | TEXT    | NOT NULL |
+| `first_seen_at`  | TEXT    | NOT NULL |
+| `last_seen_at`   | TEXT    | NOT NULL |
+| `source`         | TEXT    | NOT NULL `CHECK IN ('rtnetlink','snapshot','adguard','bettercap','active_scan')` |
+| `confidence`     | REAL    | NOT NULL DEFAULT 1.0 |
+| `active`         | INTEGER | NOT NULL DEFAULT 1 |
+|                  |         | `UNIQUE(mac_address, ipv4_address)` |
+
+A device's IP can change (DHCP renewal) and an IP can be reassigned to a
+different MAC over time -- this table keeps every observed pairing rather
+than overwriting in place, with `active` marking which one to trust right
+now. Written exclusively through `common/identity.py`'s
+`record_binding()`, which handles both conflict shapes (IP reassigned to a
+new MAC; a device's own IP changing) by deactivating the stale row and
+logging a `network_events` row. `device_id` is nullable and deliberately
+never auto-associated from network data alone (no hostname/vendor
+guessing) -- a brand-new MAC gets a pending (`device_id` NULL) binding
+awaiting a human association via the dashboard. **Freshness caveat**: the
+only thing that calls `record_binding()` today is
+`controller/discovery.py`'s `snapshot_once()` (a periodic `ip neigh show`
+poll), which per its own docstring is **not wired into any running loop
+yet** -- see `docs/security/overview.md` §3 for the concrete consequence
+this has for identity resolution. Indexed on `device_id` and on
+`(ipv4_address, active)`.
+
+### `interception_runtime`
+Singleton row (`CHECK (singleton_id = 1)`) tracking Phase 3's own runtime
+state -- what generation the controller wants applied vs. what the ARP
+worker has confirmed, plus separate health columns for the
+controller↔ARP-worker pipeline and for `phase3/nftables-manager`, so the
+two subsystems never clobber each other's status. Written by
+`controller/health.py`; not read by anything in this repo yet (an
+"interception health" dashboard view doesn't exist).
+
+| Column                 | Type    | Constraints |
+|---|---|---|
+| `singleton_id`          | INTEGER | PRIMARY KEY `CHECK (singleton_id = 1)` |
+| `desired_generation`    | INTEGER | NOT NULL DEFAULT 0 |
+| `applied_generation`    | INTEGER | NOT NULL DEFAULT 0 |
+| `mode`                  | TEXT    | NOT NULL DEFAULT `'stopped'` `CHECK IN ('stopped','running','repair_only','fail_open')` |
+| `last_healthy_at`       | TEXT    | nullable |
+| `fail_open_reason`      | TEXT    | nullable |
+| `desired_policy_json`   | TEXT    | nullable -- `controller/policy_state.py`'s `DesiredPolicy` blob, read directly by `phase3/nftables-manager` (Go) via the shared DB rather than a new IPC protocol |
+| `nft_mode`              | TEXT    | NOT NULL DEFAULT `'stopped'` `CHECK IN ('stopped','running','fail_open')` |
+| `nft_last_healthy_at`   | TEXT    | nullable |
+| `nft_fail_reason`       | TEXT    | nullable |
+
+### `network_events`
+Append-only, normalized network/identity-layer event log (device
+seen/lost, a binding created or superseded by a MAC/IP conflict) --
+distinct from `access_log`, which is proxy-layer allow/deny decisions.
+This is the "outbox events" RoadMap.md's Milestone 4 refers to. Written by
+`common/identity.py`'s `record_binding()`/`record_network_event()`.
+
+| Column         | Type    | Constraints |
+|---|---|---|
+| `id`            | INTEGER | PRIMARY KEY |
+| `event_type`    | TEXT    | NOT NULL, free-text (e.g. `ip_reassigned`, `ip_changed`, `binding_pending_association`) |
+| `device_id`     | INTEGER | REFERENCES `devices(id)` ON DELETE SET NULL, nullable |
+| `mac_address`   | TEXT    | nullable |
+| `ipv4_address`  | TEXT    | nullable |
+| `source`        | TEXT    | NOT NULL |
+| `observed_at`   | TEXT    | NOT NULL |
+| `payload_json`  | TEXT    | nullable |
+
+Indexed on `observed_at DESC` and on `device_id`.
 
 ## Relationships (ER summary)
 
@@ -331,7 +481,9 @@ convention followed by every write site. Enumerated by grepping every
 `reason=` assignment in `proxy/sni_helper.py` and `proxy/authz_helper.py`:
 
 From `proxy/sni_helper.py` (SNI/splice layer, `path` always NULL):
-- `not_authenticated` -- `handle_splice()`: no login present at all (`%LOGIN` was `-`/empty).
+- `not_authenticated` -- `handle_splice()`: `device_identity.resolve_user()`
+  found no identity for the client IP (no active `device_bindings` row, or
+  the device isn't assigned to a user).
 - `outside_lan` -- `handle_splice()`: client IP failed `ip_in_configured_lan()`.
 - `global_domain` -- `handle_splice()`: allowed because `domains.is_global = 1`.
 - `user_domain` -- `handle_splice()`: allowed because of an explicit `user_domains` row.

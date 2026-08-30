@@ -35,9 +35,15 @@ and intentionally has no pip packages installed):
   timing side-channel on hash comparison).
 - Constants: `ITERATIONS = 260_000`, `ALGORITHM = "pbkdf2_sha256"`.
 
-This same module is used for **both** the dashboard admin password and every
-per-person proxy login password (see §3) — one hashing scheme, two different
-credential stores (`settings.admin_password_hash` vs. `users.password_hash`).
+This same module is used for both the dashboard admin password
+(`settings.admin_password_hash`) and `users.password_hash` — but as of
+2026-08-30 (see §3), nothing actually reads/verifies `users.password_hash`
+today. It's set by `add_user()`/`reset_password()` but has no active
+consumer: Squid no longer authenticates per-request at all (intercept
+mode, §3), and the Phase 4 captive portal that would eventually verify a
+kid's own login against this same field (see RoadMap.md's Phase 4 section)
+isn't built yet. Treat it as reserved/dormant, not as a currently-enforced
+credential, until that portal exists.
 
 ### Where admin credentials live and how they're checked
 
@@ -78,13 +84,17 @@ nothing in `dashboard.py` calls `flask.session` — the key exists but is
 unused for auth; if Flask sessions are added later, this key is already
 provisioned correctly (random, DB-persisted, not re-generated per process).
 
-### Per-person proxy login passwords (same hashing, different store)
+### `users.password_hash` — reserved for the future captive portal, not consumed today
 
 `add_user()` (`/users/add`) and `reset_password()` (`/users/reset-password`)
 in `dashboard/dashboard.py` both call `auth.hash_password(password)` and
-store the result in `users.password_hash`. These are the credentials each
-family member configures in their device's proxy settings — entirely
-separate from the dashboard admin login. See §3 for how Squid verifies them.
+store the result in `users.password_hash`. Before 2026-08-30 this was the
+credential each family member configured in their device's proxy settings,
+checked by Squid on every request; that mechanism is gone (§3) —
+`users.password_hash` is written but nothing verifies it today. It exists
+now for the Phase 4 captive portal's eventual kid-facing login (see
+RoadMap.md), which will check it the same way the dashboard admin login
+checks `settings.admin_password_hash`, once that portal is built.
 
 ---
 
@@ -147,67 +157,74 @@ itself.
 
 ---
 
-## 3. Squid-side per-user authentication (HTTP Basic via `basic_auth_helper.py`)
+## 3. Squid-side identity: device-based, not credential-based (intercept mode)
 
-**Where:** `proxy/basic_auth_helper.py`, driven by `common/squid_helper.py`;
-configured in `proxy/squid.conf.template` under `auth_param basic program`.
+**Where:** `common/device_identity.py` (the resolver), consumed by
+`proxy/sni_helper.py` and `proxy/authz_helper.py`; intercept-mode ports
+configured in `proxy/squid.conf.template` (`http_port 3129 intercept`,
+`https_port 3130 intercept ssl-bump ...`).
 
-Each family member gets one login (`auth_param basic realm "Parental Proxy"`,
-`credentialsttl 4 hours` — Squid caches a successful check for 4 hours before
-re-asking the helper). Squid calls the external helper process
-(`basic_auth_helper.py`) over stdin/stdout — see §4 for the general helper
-protocol — passing `username password` fields.
+**This replaced a real, previously-documented mechanism.** Before
+2026-08-30, each family member had one login, checked per-request by
+`proxy/basic_auth_helper.py` via Squid's `auth_param basic` (HTTP Basic,
+challenged with a 407 during the `CONNECT` handshake). That mechanism was
+removed along with `basic_auth_helper.py` itself when Squid moved to
+**intercept mode** — nftables NAT-redirects a bump-enabled device's own
+port 80/443 traffic to Squid (see
+`phase3/nftables-manager/internal/nft/knftables_adapter.go`'s `bump_v4`
+rules and RoadMap.md's "two independent axes"/"Squid intercept mode"
+sections), so the client never sends a `CONNECT` at all for an intercepted
+HTTPS connection — there is no handshake step left for a 407 challenge to
+answer, and therefore no way to challenge for a per-request login anymore.
 
-### The percent-encoding gotcha
+### The replacement: resolve identity from the client's IP, not a credential
 
-The docstring at the top of `proxy/basic_auth_helper.py` documents a
-correction made against a real Squid instance:
+`common/device_identity.py`'s `resolve_user(conn, client_ip)`:
 
-> Confirmed against a real Squid 5.7 instance (2026-08-28): despite the
-> "classic Basic doesn't percent-encode" folklore this docstring used to
-> repeat, this Squid version *does* percent-encode both fields exactly like
-> its external_acl_type helpers — a raw capture showed a password of
-> `a b%c d` arriving as `a%20b%25c%20d`.
-
-In other words: the common assumption that Squid's `auth_param basic`
-protocol passes the raw username/password unescaped (as "classic" HTTP Basic
-auth helpers historically did) is **wrong for this Squid version**. Squid
-percent-encodes both fields the same way it encodes fields for
-`external_acl_type` helpers (see §4). Before this was discovered, the helper
-was configured with `unquote=False`, meaning any password containing a
-space, `%`, or another character requiring escaping could never successfully
-authenticate — Squid would send the encoded form, the helper would compare
-it verbatim against the (unencoded) stored password, and it would never
-match.
-
-### How the helper addresses it
-
-`basic_auth_helper.py`'s `main()` calls the shared loop with:
-
-```python
-squid_helper.run("basic_auth_helper", 2, check, unquote=True, keep_trailing_spaces=True)
+```sql
+SELECT u.* FROM device_bindings b
+JOIN devices d ON d.id = b.device_id
+JOIN users u ON u.id = d.user_id
+WHERE b.ipv4_address = ? AND b.active = 1
+ORDER BY b.last_seen_at DESC LIMIT 1
 ```
 
-- `unquote=True` — `common/squid_helper.py`'s `run()` applies
-  `urllib.parse.unquote(p)` to every field before calling the handler,
-  undoing Squid's percent-encoding.
-- `keep_trailing_spaces=True` — the line is split with
-  `line.split(" ", field_count - 1)` (i.e. `split(" ", 1)` for 2 fields)
-  rather than `line.split()`, so only the *first* space separates username
-  from password — everything after it, including further literal spaces, is
-  preserved as part of the password field. This matters because a proxy
-  password may legitimately contain spaces.
-- `check(conn, username, password)` looks up `users.password_hash` by
-  username and calls `auth.verify_password(password, row["password_hash"])`
-  (same PBKDF2 verification as the dashboard admin login, §1). A missing
-  username returns `False` without a timing-safe comparison against a dummy
-  hash — a minor username-enumeration-via-timing surface, not mitigated.
+Both `sni_helper.py` (`handle_splice`, `handle_block_page`) and
+`authz_helper.py` (`decide`) call this with `%>a` (the client's source IP,
+still available on an intercepted connection) in place of the old `%LOGIN`
+field, and treat `None` — no active binding for that IP, or an unassigned
+device — exactly like the old "empty/absent `%LOGIN`" case: denied,
+logged as unidentified where the old code logged `"(unauthenticated)"`.
 
-**Anyone extending or reusing this Basic-auth-over-Squid pattern should not
-assume "no encoding" for either helper type — always percent-decode fields
-read from Squid**, and confirm against the actual Squid version in use if
-the behavior is ever in doubt (this project's finding was version-specific
-folklore-correction, not a documented Squid guarantee found in advance).
+**This is not itself a new authentication mechanism — it deliberately has
+none.** There is no credential check anywhere in this path. "Identity" here
+means *whichever device currently holds this IP, and whichever user that
+device is administratively assigned to* (via the dashboard's `/devices`
+page, or eventually Phase 4's captive portal) — a standing assignment, not
+a per-request proof of identity. See §6 below for the trust-boundary
+consequence of that.
+
+### Why this is safe to rely on despite IPs changing (DHCP)
+
+`device_bindings` is keyed by MAC address, not IP — `common/identity.py`'s
+`record_binding()` handles a device's IP changing (DHCP renewal) by
+deactivating the stale `(mac, old_ip)` row and activating a fresh
+`(mac, new_ip)` one, so `resolve_user()`'s `WHERE ... AND active = 1` always
+targets whichever IP is *currently* live for that MAC, not a stale one.
+
+**The gap this depends on**: something has to actually call
+`record_binding()` promptly when a device's IP changes for this to stay
+current. Today, the only piece that does this is
+`controller/discovery.py`'s `snapshot_once()` (a periodic `ip neigh show`
+snapshot) — and per that module's own docstring, **it is not wired into
+any running loop yet**; the higher-precedence live rtnetlink-event listener
+(RoadMap.md Milestone 4) doesn't exist either. Until one of those runs
+continuously, a real DHCP renewal can leave `device_bindings` stale for an
+unbounded window, during which `resolve_user()` for the device's new IP
+returns `None` — the device fails toward *less* access (denied, not
+misattributed to a different user), which is the safe direction, but it is
+a real reliability gap, not a hypothetical one. See RoadMap.md Milestone 4
+and `controller/discovery.py`'s docstring.
 
 ---
 
@@ -241,13 +258,15 @@ keep_trailing_spaces=False)`:
   bug documented in `squid.conf.template` around the trailing `%DATA`
   macro) is answered `"ERR\n"` without ever calling the handler.
 
-`sni_helper.py` uses `field_count=4` (`%LOGIN %>a %ssl::>sni %DATA`) and is
+`sni_helper.py` uses `field_count=3` (`%>a %ssl::>sni %DATA`) and is
 invoked four times under four different `sys.argv[1]` modes (`bump`,
 `trusted`, `splice`, `block_page`) dispatched via a `HANDLERS` dict — each
 mode backs a separate `acl ... external ...` line and a separate long-lived
 helper process (no shared in-memory state between the four modes).
-`authz_helper.py` uses `field_count=5` (`%LOGIN %>a %DST %PATH %DATA`) and is
-invoked once, only for domains already decided to be in `bump` mode.
+`authz_helper.py` uses `field_count=4` (`%>a %DST %PATH %DATA`) and is
+invoked once, only for domains already decided to be in `bump` mode. Both
+field counts dropped by one from their pre-2026-08-30 values when `%LOGIN`
+was removed (§3).
 
 ### Threat model: local trust, not network-exposed
 
@@ -262,12 +281,12 @@ Consequences for what threat model applies:
 
 - **Does apply:** input to these helpers must be treated as coming from a
   trusted-but-fallible local component (Squid itself) that can send
-  malformed, unexpected, or (per §3's discovery) unexpectedly-encoded data
-  due to version quirks or config mistakes — hence the defensive per-line
-  try/except and field-count validation in `squid_helper.run()`. The values
-  inside the fields (`%LOGIN`, `%DST`, SNI, path) originate from the
-  end-user's traffic and **are** attacker-influenceable in content (a
-  malicious hostname/path/SNI string), so the handlers must not trust those
+  malformed, unexpected, or unexpectedly-encoded data due to version quirks
+  or config mistakes — hence the defensive per-line try/except and
+  field-count validation in `squid_helper.run()`. The values inside the
+  fields (`%>a`, `%DST`, SNI, path) originate from the end-user's traffic
+  and **are** attacker-influenceable in content (a malicious
+  hostname/path/SNI string, or — per §3 — a spoofed source IP), so the handlers must not trust those
   values as safe — e.g. all DB access goes through parameterized queries
   (`conn.execute("... WHERE username = ?", (username,))`), and hostname/path
   parsing (`_split_host_port`, `matching.find_domain`) treats them as
@@ -316,7 +335,8 @@ openssl req -new -newkey rsa:2048 -sha256 -days 3650 -nodes -x509 \
 `sslcrtd_program` (`security_file_certgen`, configured in
 `squid.conf.template`'s `sslcrtd_program`/`sslcrtd_children`) can mint
 per-site leaf certificates signed by this key on the fly, as directed by
-`http_port ... ssl-bump generate-host-certificates=on cert=... key=...`.
+`https_port 3130 intercept ssl-bump generate-host-certificates=on
+cert=... key=...`.
 
 **Once a device is told to trust this CA certificate as a root, that CA can
 mint a certificate for *any* hostname and have the device accept it as
@@ -390,23 +410,27 @@ internet:
   can attempt unlimited HTTP Basic credential guesses. PBKDF2 at 260,000
   iterations (§1) raises the cost of guessing per attempt, but nothing caps
   the number of attempts.
-- **Per-person proxy login** (`basic_auth_helper.py` via Squid's
-  `auth_param basic`): same situation — Squid's `credentialsttl 4 hours`
-  only controls how long a *successful* auth is cached, not how many failed
-  attempts are permitted. No lockout on repeated bad passwords.
 - **No IP-based throttling** anywhere in `common/squid_helper.py`,
   `matching.py`, or `dashboard.py`.
+- **Squid's side has no login left to brute-force at all** (§3) — a
+  meaningfully *different* risk now, not a smaller version of the old one:
+  identity is granted to whoever's traffic arrives from a bump-enabled
+  device's current IP, with no credential check whatsoever. There is
+  nothing to guess, but also nothing standing between "controls that IP"
+  and "is treated as that device's assigned user" — see §7's LAN-trust
+  discussion for why this is accepted rather than mitigated.
 
 The only two mitigating factors present are architectural, not
 brute-force-specific: (a) `_check_admin_auth`'s password comparison is
 constant-time (`hmac.compare_digest` inside `verify_password`), removing a
 timing side-channel, and (b) the LAN-scoping described in §7, which — while
 it is *not itself authentication* and is explicitly not one — currently
-limits who can even reach these login prompts to begin with in the intended
-LAN-only deployment. If this system is ever deployed such that either login
-surface (dashboard or proxy) is reachable from the internet, brute-force
-protection (rate limiting, lockout, fail2ban-style IP banning, or a WAF in
-front) would need to be added — nothing in the current code provides it.
+limits who can even reach the dashboard's login prompt, or spoof a
+bump-enabled device's IP, to begin with in the intended LAN-only
+deployment. If this system is ever deployed such that the dashboard is
+reachable from the internet, brute-force protection (rate limiting,
+lockout, fail2ban-style IP banning, or a WAF in front) would need to be
+added — nothing in the current code provides it.
 
 ---
 
@@ -424,15 +448,23 @@ IP against the `local_network` setting — one or more space-separated CIDRs
 (e.g. `192.168.1.0/24`). It is consulted in two places: `authz_helper.py`'s
 `decide()` (HTTP-layer, bump-mode domains) and `sni_helper.py`'s
 `handle_splice()` (SNI-layer, splice-mode domains) — both deny with
-`reason="outside_lan"` if the client IP doesn't match. This is explicitly a
-**second, independent layer on top of** per-person proxy authentication
-(§3), not a replacement for it: a correct username/password from outside the
-configured range is still denied.
+`reason="outside_lan"` if the client IP doesn't match.
+
+**Its role changed with §3's identity model.** Before 2026-08-30 this was
+explicitly a second, independent layer on top of per-person proxy
+authentication — a correct username/password from outside the configured
+range was still denied. With that per-request credential gone, this check
+is now, alongside `device_identity.resolve_user()`'s device-assignment
+lookup, one of the only two things standing between arbitrary traffic
+reaching Squid's intercept ports and being treated as a specific user's
+(the third, upstream layer is nftables only ever redirecting a
+bump-enabled device's own current IP to those ports in the first place —
+see §3's device-identity section and RoadMap.md's nftables skeleton, not
+covered further in this file).
 
 An empty `local_network` setting **disables this check entirely** —
 `ip_in_configured_lan()`'s docstring and code both treat a blank value as
-"check disabled" (`return True`), falling back to per-person proxy logins as
-the sole gate.
+"check disabled" (`return True`).
 
 ### The Docker networking caveat
 
@@ -442,16 +474,16 @@ the sole gate.
 > host networking on Linux. Under Docker Desktop (Windows/Mac) or plain
 > bridge networking the proxy sees an internal gateway address instead, and
 > this would reject every request. In that case leave it blank (here or in
-> the dashboard) to disable the check and rely on the per-person proxy
-> logins alone.
+> the dashboard) to disable the check.
 
 This is echoed in the Settings page hint text in `dashboard.py`
 (`SETTINGS_BODY`) and in `README.md`. **An agent changing networking mode
 (e.g. adding a bridge-mode Docker Compose profile) should recognize that
 doing so silently makes this defense layer unable to distinguish LAN clients
-from anything else**, and that the documented mitigation is disabling the
-check outright and accepting that proxy-login credentials are the only
-remaining gate.
+from anything else**, and that the documented mitigation — disabling the
+check outright — now leaves nftables' bump_v4 IP-set membership (RoadMap.md)
+as the only thing gating which traffic reaches Squid's intercept ports at
+all, with no LAN-range check or credential behind it.
 
 ### Current LAN-only assumptions worth revisiting before any internet-facing deployment
 
@@ -470,14 +502,14 @@ what's evidenced in code:
   browser and dashboard. This is a reasonable trade for a LAN-only tool but
   would need a reverse proxy with TLS (or equivalent) in front before any
   exposure beyond a trusted LAN/VPN.
-- The LAN-IP check (§7) is treated throughout the codebase as a meaningful
-  trust signal on top of per-login auth — but per `.env.example`, it is
-  routinely disabled outright under Docker Desktop/bridge networking,
-  leaving per-person proxy logins (§3, with no brute-force protection, §6)
-  as the sole gate in that configuration.
+- The LAN-IP check is treated throughout the codebase as a meaningful trust
+  signal — but per `.env.example`, it is routinely disabled outright under
+  Docker Desktop/bridge networking, at which point nftables' bump_v4 set
+  membership (§3) is the only thing left gating Squid access, with no
+  LAN-range check and no credential of any kind behind it.
 - No rate limiting anywhere (§6) — acceptable when the only reachable
-  parties are already on the trusted LAN, not acceptable once either login
-  surface is reachable from an untrusted network.
+  parties are already on the trusted LAN, not acceptable once the dashboard
+  is reachable from an untrusted network.
 - Squid's `ssl_bump` CA trust model (§5) assumes the operator controls and
   can push CA trust to every device on the network (README's per-device
   certificate-trust install steps) — a workable assumption for a household
@@ -487,7 +519,7 @@ what's evidenced in code:
 None of this is a defect in what the project claims to be — README and
 `.env.example` are explicit that this is a home/LAN parental-control tool —
 but any future work aimed at internet-facing or multi-household/multi-tenant
-use would need to add: TLS on the dashboard, brute-force protection on both
-login surfaces (§6), and a reconsideration of what "LAN membership" is even
+use would need to add: TLS on the dashboard, brute-force protection on its
+login (§6), and a reconsideration of what "LAN membership" is even
 supposed to mean as a trust signal once clients aren't all on one
 administratively-controlled network.

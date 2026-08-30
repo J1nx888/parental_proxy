@@ -1652,8 +1652,13 @@ DEVICE_DETAIL_BODY = """
   exists. <strong>Bypass login</strong> is for a device that can never complete
   a login flow (a smart TV, Echo, thermostat) -- it'll be exempted from the
   future captive-portal gate and fall back to its assignment above instead of
-  a personal login. None of this is enforced yet -- this page is groundwork
-  for that work.
+  a personal login. <strong>SSL-Bump enabled</strong> and the device's user/
+  group assignment are now real, enforced settings once Phase 3's ARP-spoof
+  + nftables + Squid-intercept stack (see RoadMap.md) is actually running --
+  that stack is fully built and tested but has not yet been deployed against
+  a real household network (Milestone 10, a deliberate, owner-only decision,
+  is still pending). <strong>Bypass login</strong>'s captive-portal gate
+  itself is still Phase 4, not yet built at all.
 </p>
 </div>
 """

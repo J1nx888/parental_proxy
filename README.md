@@ -137,13 +137,26 @@ containers.
 
 ## Setting up a person
 
-1. **Dashboard → Users → Add user.** Pick a username and password -- this is
-   what goes in that person's device proxy settings, not the dashboard
-   login.
-2. **On that person's device:** install the CA certificate (Users page has
-   a download link -- same certificate for everyone, no per-user cert) and
-   set the device's Wi-Fi/network proxy to this machine's IP, port `3128`,
-   with that person's username/password.
+**As of 2026-08-30, there is no device proxy configuration and no
+per-person proxy password anymore** -- Squid runs in native intercept mode
+and resolves identity from the device itself (see RoadMap.md's Squid
+intercept-mode section). The username/password created below is for
+domain/show assignment only; it currently has no login of its own to use
+anywhere (reserved for the future Phase 4 captive portal).
+
+1. **Dashboard → Users → Add user.** Pick a username and password for this
+   person (the password isn't checked by anything yet -- see above).
+2. **For any device that needs SSL-Bump refinement** (e.g. Crunchyroll):
+   **Dashboard → Devices → Add device**, enter its MAC address, assign it
+   to this person, and check "SSL-Bump enabled." Then, on that device,
+   install the CA certificate (Users page has a download link -- same
+   certificate for every device, no per-device cert). That's the only
+   manual step on the device itself; no proxy address, port, or
+   credential to set anywhere. (A device that only needs DNS-tier
+   protection, not SSL-Bump, doesn't need this step at all once Phase 3's
+   captive portal exists -- see RoadMap.md's Phase 4 section; today, every
+   device still needs a manual `Devices` entry since that portal isn't
+   built yet.)
 3. **Approve shows/sites** ahead of time (from their user page / the
    Domains page), reactively from the Report page as blocks show up, or
    let the kid ask -- the block page has its own "Request approval"
@@ -159,10 +172,10 @@ still gets Squid's own generic "Access Denied" page rather than nothing --
 `DASHBOARD_URL` is a nicer version of that, not a requirement for it to
 work at all.
 
-Per-device certificate trust steps (Windows/macOS/iOS/Android/Chromebook)
+Per-device CA-certificate-trust steps (Windows/macOS/iOS/Android/Chromebook)
 are the same as v1 -- see the "Setting up a device" walkthrough in that
-project's history if you need the exact menus; the mechanism (trust one CA
-cert, set one proxy) hasn't changed.
+project's history if you need the exact menus; trusting one CA cert is now
+the *only* mechanism, with no proxy setting to pair it with.
 
 **Native apps:** same caveat as v1 -- this filters the *website*. A native
 app doing certificate pinning will fail to connect rather than being

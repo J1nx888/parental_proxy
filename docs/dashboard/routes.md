@@ -61,10 +61,15 @@ credentials stored in the `settings` table (`admin_username`,
   cookies; all state is server-side in SQLite and all auth is Basic Auth
   re-sent by the browser on every request.
 - Per-user (kid) accounts in the `users` table are a **completely separate**
-  credential set used by the Squid/proxy side (`proxy/basic_auth_helper.py`)
-  for the child's device proxy login -- not for dashboard access. Don't
-  confuse `users.password_hash` (checked by the proxy) with
-  `settings.admin_password_hash` (checked by the dashboard).
+  credential set from the dashboard admin login -- but as of 2026-08-30
+  (Squid's move to intercept mode), `users.password_hash` has no active
+  consumer: identity for the Squid side is now resolved from the client's
+  device (`common/device_identity.py`, source IP → `device_bindings` →
+  `devices.user_id`), not a per-request login. `users.password_hash` is
+  reserved for the future Phase 4 captive-portal login (see RoadMap.md).
+  Don't confuse it with `settings.admin_password_hash` (checked by the
+  dashboard) -- they remain two entirely separate credential stores even
+  though only one is currently checked by anything.
 
 ## CSRF protection
 
@@ -339,6 +344,51 @@ admin's next action is one edit + submit rather than starting from scratch:
   All three branches end with `flash_redirect("report", ...)` except branch
   2, which does a plain `redirect(url_for("domain_detail", ...))` instead
   (no flash message on that hop, just the `prefill_path` param).
+
+### Devices and groups (`/devices`, `/groups`)
+
+Undocumented until this pass (2026-08-30) -- these routes predate the
+Squid intercept-mode change but were missing from this file entirely. This
+is where a device's `user_id`/`group_id`/`bump_enabled`/`bypass_login`
+assignment (consumed by `common/device_identity.py` and, once Phase 3 is
+deployed, `common/policy_class.py`/nftables) is actually set -- there is no
+captive-portal auto-registration yet (Phase 4, not built), so every device
+must be added here manually today.
+
+- `GET /devices` -> `devices()` -- lists all `devices` rows (LEFT JOINed to
+  `users`/`groups` for display), plus the add-device and add-group forms.
+  Renders `DEVICES_BODY`.
+- `POST /devices/add` -> `add_device()` -- form fields `mac_address`
+  (validated/normalized via `normalize_mac()`), `label` (optional),
+  `assignment` (parsed by `_parse_device_assignment()` into a `(user_id,
+  group_id, ignored)` triple -- see `DEVICE_ASSIGNMENT_SELECT`'s combined
+  dropdown). Inserts into `devices`; duplicate MAC (UNIQUE constraint) ->
+  error flash.
+- `GET /devices/<int:device_id>` -> `device_detail()` -- one device's
+  editable assignment, `bump_enabled`, and `bypass_login` checkboxes.
+  Renders `DEVICE_DETAIL_BODY`. Redirects to `devices` with an error flash
+  if the device id doesn't exist.
+- `POST /devices/update` -> `update_device()` -- form fields `device_id`,
+  `label`, `assignment`, `bump_enabled` (checkbox), `bypass_login`
+  (checkbox). Updates the row. Redirects to `device_detail`.
+- `POST /devices/delete` -> `delete_device()` -- form field `device_id`.
+  Hard-deletes the row (`device_bindings`/`device_domains`/
+  `network_events` referencing it fall back to `device_id = NULL` via `ON
+  DELETE SET NULL`/`CASCADE`, not left dangling). Redirects to `devices`.
+- `POST /devices/cleanup` -> `cleanup_stale_devices()` -- deletes every
+  device whose `last_seen_at` is older than the `device_stale_days`
+  setting (see below); a device never observed at all (`last_seen_at IS
+  NULL`) is never matched, so this can't mass-delete devices just because
+  nothing populates `last_seen_at` yet (see `common/db.py`'s schema
+  comment). Redirects to `devices`.
+- `POST /groups/add` -> `add_group()` -- form field `name` (required, <=
+  100 chars). Inserts into `groups`; duplicate name -> error flash.
+- `POST /groups/delete` -> `delete_group()` -- form field `group_id`.
+  Hard-deletes the row (`devices.group_id`/`group_domains` fall back to
+  `NULL`/cascade). Redirects to `devices`.
+- `POST /settings/device-stale-days` -> `update_device_stale_days()` --
+  form field `device_stale_days` (a whole number of days, or blank to
+  disable cleanup entirely). Feeds `cleanup_stale_devices()` above.
 
 ### Settings (`/settings`)
 

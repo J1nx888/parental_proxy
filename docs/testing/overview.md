@@ -145,13 +145,20 @@ Used throughout `tests/test_logging_dedupe.py`, `tests/test_seed_idempotent.py`,
 | `tests/test_auth.py` | 12 | PBKDF2 hash round-trip, and every way a stored hash can be malformed/tampered |
 | `tests/test_logging_dedupe.py` | 9 | Access-log dedupe window, keyed by `(username, domain, allowed, series_id)` (and path — see GH #5 tests) |
 | `tests/test_seed_idempotent.py` | 8 | `seed_defaults.seed()` run twice is a no-op; the S2.2 (`crunchyrollcdn.com` mode) fix; confirms `crunchyrollsvc.com` (dev-only, removed) is never seeded |
-| `tests/test_helpers_protocol.py` | 36 | The shared Squid stdin/stdout protocol (`common/squid_helper.py`) plus the decision logic of all three helpers (`basic_auth_helper`, `sni_helper`, `authz_helper`), including the Crunchyroll show-approval flow |
+| `tests/test_helpers_protocol.py` | 33 | The shared Squid stdin/stdout protocol (`common/squid_helper.py`) plus the decision logic of both helpers (`sni_helper`, `authz_helper`), including the Crunchyroll show-approval flow. Identity is set up via real `device_bindings` rows (`common/identity.record_binding()`) since 2026-08-30, not a login string -- see `common/device_identity.py`. |
 | `tests/test_dashboard.py` | 61 | Flask test client: admin auth, user/domain CRUD (incl. `add_show`/`remove_show`, `user_detail`, `domain_detail`, `update_domain`), all of Settings (incl. changing the admin login itself), report-approve (site and show), CSRF/cross-origin guard |
 | `tests/test_cr_api.py` | 28 | `TokenManager` refresh/expiry, `SeriesResolver`'s retry-once-on-401, every `_read_json` error path (HTTP error, unreachable, timeout, malformed/non-dict JSON), every `series_id_of` fallback branch |
 | `tests/test_series_resolve.py` | 11 | The object-id -> series-id cache: positive/negative TTL, cache-hit short-circuiting, the S2.6 stale-on-error fallback |
-| `tests/test_squid_conf_regressions.py` | 5 | Config-text/structure regressions in `proxy/squid.conf.template` that a pure-logic unit test can't catch (see below) |
+| `tests/test_squid_conf_regressions.py` | 7 | Config-text/structure regressions in `proxy/squid.conf.template` that a pure-logic unit test can't catch (see below), plus two 2026-08-30 regression guards keeping the deliberately-deferred `ssl_bump`/`http_access` catch-all flip (see `docs/security/overview.md` §3, RoadMap.md) from being silently re-flipped |
 
-Total as of this writing: **206** test functions across these 10 files (`grep -c "^def test_" tests/*.py`, summed). Run `pytest --collect-only -q` for a live, authoritative count as the suite grows.
+The counts above are per-file spot checks for the files this doc discusses in
+detail, not a full table refresh -- this table predates several later
+additions to `tests/` (Phase 3's `phase3/arp-worker`/`phase3/nftables-manager`
+Go test suites aren't Python and aren't counted here at all; the Python
+`tests/` directory itself has also grown past this table's original per-file
+counts). Run `pytest --collect-only -q` against `tests/` for a live,
+authoritative total (358 as of 2026-08-30) rather than trusting the sum of
+this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 
@@ -164,19 +171,24 @@ just needs isolated DB state and no mocking.
 
 A different style worth knowing about: these tests don't exercise Python
 *logic* at all — they check the **text/structure of `proxy/squid.conf.template`**
-directly (via `Path.read_text()` + regex), plus what `field_count` and
-`unquote` kwargs each helper's `main()` passes to `squid_helper.run` (captured
-by monkeypatching `squid_helper.run` itself). This file exists because three
-real bugs were found running against a live Squid instance (2026-08-28 smoke
+directly (via `Path.read_text()` + regex), plus what `field_count` kwarg
+each helper's `main()` passes to `squid_helper.run` (captured by
+monkeypatching `squid_helper.run` itself). This file exists because real
+bugs were found running against a live Squid instance (2026-08-28 smoke
 test) that no unit test of helper logic could have caught: a missing `%DATA`
-macro accounting in every `external_acl_type` FORMAT string, a bare
+macro accounting in every `external_acl_type` FORMAT string, and a bare
 `http_access allow step1`/`step2` that doesn't reset Squid's `at_step` state
-and so bypasses `authz_allowed` for decrypted requests, and
-`basic_auth_helper.py` needing `unquote=True` because Squid actually
-percent-encodes `auth_param basic` fields despite the old docstring's claim.
-When you fix something that's actually a Squid ACL/protocol semantics issue
-(not a Python bug), this is the file to add a regression test to — see its
-module docstring for the full incident writeups.
+and so bypasses `authz_allowed` for decrypted requests. (A third,
+`basic_auth_helper.py`'s `unquote=True` percent-encoding fix, was removed
+2026-08-30 along with that file itself -- see RoadMap.md's Squid
+intercept-mode section.) Two more tests were added 2026-08-30, of a
+slightly different kind: guards against silently completing a *listed but
+deliberately deferred* checklist item (flipping the `ssl_bump`/`http_access`
+catch-alls to allow-by-default before the AdGuard hard-deny integration
+exists) -- see `docs/security/overview.md` §3 for why that flip is
+currently wrong. When you fix something that's actually a Squid ACL/protocol
+semantics issue (not a Python bug), this is the file to add a regression
+test to — see its module docstring for the full incident writeups.
 
 ## Mutation-testing verification approach
 

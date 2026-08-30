@@ -49,8 +49,12 @@ builds and starts both containers. Walking through exactly what it does:
    - Writes all of the above to `.env` in the project root.
 5. **Runs `docker compose up -d --build`.**
 6. **Prints next steps**: the dashboard URL to open, and a reminder to create
-   a user per person, install the CA cert on each device, and set that
-   device's proxy to `<host-ip>:3128` with the person's credentials.
+   a user per person, and — for each device that needs SSL-Bump refinement
+   (e.g. Crunchyroll) — add it under **Devices**, assign it to that person,
+   and install the CA cert on that one device. There is no proxy
+   address/port/password to configure on any device; Phase 3's interception
+   layer (see RoadMap.md) routes matching traffic to Squid transparently
+   once it's deployed.
 
 Run it from the project root:
 
@@ -78,10 +82,13 @@ or non-interactive deploys:
    `http://<host-ip>:8787/` if `DASHBOARD_BIND=0.0.0.0`) and log in with the
    admin credentials from `.env` (or the auto-generated password from the
    dashboard container's logs if `DASHBOARD_PASSWORD` was left blank).
-4. Create a user per person under **Users**, download the CA certificate from
-   the Users page, install it as a trusted root on each device, and point
-   that device's proxy settings at this machine's IP on port `3128` with the
-   new user's credentials.
+4. Create a user per person under **Users**. For any device that needs
+   SSL-Bump refinement, add it under **Devices**, assign it to that person
+   (and check "SSL-Bump enabled"), download the CA certificate from the
+   Users page, and install it as a trusted root on that device — no proxy
+   host/port/credential to configure anywhere; identity is resolved from
+   the device itself once Phase 3's interception layer is deployed (see
+   RoadMap.md).
 5. Approve shows/sites per user ahead of time, or reactively from the
    **Report** page as blocks show up.
 
@@ -91,8 +98,10 @@ Two services, defined in `docker-compose.yml` at the project root, sharing
 one named Docker volume:
 
 - **`proxy`** (container name `parental-proxy`, built from
-  `proxy/Dockerfile`) — the SSL-bumping Squid proxy. Listens on port `3128`.
-  Runs `proxy/entrypoint.sh` as its `ENTRYPOINT`.
+  `proxy/Dockerfile`) — the SSL-bumping Squid proxy, running in native
+  intercept mode since 2026-08-30 (`http_port 3129 intercept` /
+  `https_port 3130 intercept ssl-bump`; see RoadMap.md's Squid
+  intercept-mode section). Runs `proxy/entrypoint.sh` as its `ENTRYPOINT`.
 - **`dashboard`** (container name `parental-proxy-dashboard`, built from
   `dashboard/Dockerfile`) — the Flask web UI (`dashboard/dashboard.py`).
   Listens on port `8787`, run as the `proxy` user (Debian uid 13).
@@ -193,10 +202,13 @@ dashboard container.
 
 **What a client device needs to do:** install `ca_cert.pem` (not the key —
 the private key never leaves the proxy container) as a trusted root
-certificate, then point the device's Wi-Fi/network proxy settings at this
-host's IP on port `3128` with that person's dashboard-created username and
-password. The dashboard's **Users** page has a direct download link for the
-certificate — same file for every user, no per-user cert. Per-OS install
+certificate. That's the only per-device step since 2026-08-30 — there is no
+proxy host/port/username/password to configure on the device at all; the
+device just needs to be added under the dashboard's **Devices** page and
+assigned to a user, and its traffic reaches Squid transparently once
+Phase 3's interception layer (NAT redirection, see RoadMap.md) is deployed.
+The dashboard's **Users** page has a direct download link for the
+certificate — same file for every device, no per-device cert. Per-OS install
 steps (Windows/macOS/iOS/Android/Chromebook) aren't duplicated here; see the
 README's "Setting up a person" section and the "Setting up a device"
 reference it points to.
@@ -214,34 +226,41 @@ documented in `.env.example`:
 > networking on Linux. Under Docker Desktop (Windows/Mac) or plain bridge
 > networking the proxy sees an internal gateway address instead, and this
 > would reject every request. In that case leave it blank (here or in the
-> dashboard) to disable the check and rely on the per-person proxy logins
-> alone.
+> dashboard) to disable the check -- see docs/security/overview.md for what's
+> left gating Squid access once this is off.
 
 In other words:
 - **Linux with host networking**: the proxy container can see clients' real
-  LAN IPs, so `LOCAL_NETWORK` correctly restricts proxy use to that CIDR as
-  a belt-and-suspenders layer on top of per-user Basic Auth.
+  LAN IPs, so `LOCAL_NETWORK` correctly restricts proxy use to that CIDR.
+  Since 2026-08-30, there is no per-request login behind it at all (see
+  `docs/security/overview.md` §3/§7) — this CIDR check, alongside nftables
+  only ever redirecting a bump-enabled device's own IP to Squid in the
+  first place (Phase 3, once deployed), is what stands between arbitrary
+  LAN traffic and being treated as a specific user.
 - **Docker Desktop (Windows/Mac) or plain bridge networking**: the proxy
   only sees an internal Docker gateway address for every connection,
   regardless of the real client. Leaving `LOCAL_NETWORK` set in this
   environment would reject *every* request. Set it to blank (via `.env`,
   or `none`/`off`/`disabled` at the `setup.sh` prompt, or later from the
-  dashboard's Settings page) to disable the CIDR check entirely and rely
-  solely on per-person proxy logins for access control.
+  dashboard's Settings page) to disable the CIDR check entirely — at which
+  point nftables' `bump_v4` set membership (Phase 3) is the only thing
+  left gating which traffic reaches Squid at all.
 - This setting is editable at runtime from the dashboard (Settings page)
   without restarting either container — the `.env` value only seeds it on
   first run (`db.set_setting_if_absent` in `entrypoint.sh`).
 
 `docker-compose.yml` itself does not configure `network_mode: host` for the
-proxy service — it uses default bridge networking with an explicit port
-mapping (`3128:3128`). Host networking, where relevant, would be a
-Linux-specific override to the compose file, not the shipped default.
+proxy service — it uses default bridge networking with explicit port
+mappings (`3129:3129`, `3130:3130`, updated 2026-08-30 from the old
+`3128:3128`). Host networking, where relevant, would be a Linux-specific
+override to the compose file, not the shipped default.
 
 ## Port mappings
 
 | Port | Service | Compose mapping | Notes |
 |---|---|---|---|
-| `3128` | proxy | `"3128:3128"` (all interfaces) | Squid's HTTP/HTTPS proxy port. Client devices point their proxy settings here. |
+| `3129` | proxy | `"3129:3129"` (all interfaces) | Squid's intercept-mode HTTP port (`http_port 3129 intercept`). No device configures a proxy setting for this -- it's a NAT-redirect target for Phase 3's interception layer once deployed. |
+| `3130` | proxy | `"3130:3130"` (all interfaces) | Squid's intercept-mode HTTPS/SSL-Bump port (`https_port 3130 intercept ssl-bump ...`). Same NAT-redirect model as 3129. |
 | `8787` | dashboard | `"${DASHBOARD_BIND:-127.0.0.1}:8787:8787"` | Flask dashboard. Bound only to `127.0.0.1` on the host by default — **not LAN-reachable** unless `DASHBOARD_BIND=0.0.0.0` is set (see the `DASHBOARD_BIND` row above). Remote access to a `127.0.0.1`-bound dashboard requires SSH port-forwarding. |
 
 ## CI

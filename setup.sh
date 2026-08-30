@@ -39,7 +39,7 @@ else
   echo "A few questions, then this will build and start everything."
   echo
   echo "LAN CIDR: the network your kids' devices connect from. This is a"
-  echo "belt-and-suspenders check on top of the per-person proxy logins."
+  echo "belt-and-suspenders check on top of each device's own assignment."
   echo "It only works with host networking (Linux); under Docker Desktop the"
   echo "proxy can't see real client IPs, so enter 'none' to disable it there."
   read -rp "LAN CIDR devices will connect from [${guess:-192.168.1.0/24}]: " local_network
@@ -112,9 +112,13 @@ echo
 echo "1. Open http://${host_ip}:8787/ (or http://127.0.0.1:8787/ if you kept"
 echo "   the dashboard local-only) and log in with your admin credentials."
 echo "2. Create a user for each person, under Users."
-echo "3. On each device: install the CA certificate (Users page has a"
-echo "   download link), then set its proxy to ${host_ip}:3128 with that"
-echo "   person's username/password."
+echo "3. On each device that needs SSL-Bump refinement (e.g. Crunchyroll):"
+echo "   under Devices, add its MAC address and assign it to that person,"
+echo "   then just install the CA certificate on that one device (Users"
+echo "   page has a download link) -- no proxy address, port, or password"
+echo "   to configure anywhere; Phase 3's interception layer (see"
+echo "   RoadMap.md) routes matching traffic to Squid transparently once"
+echo "   it's deployed."
 echo "4. Approve shows/sites per user, or just let them try and approve from"
 echo "   the Report page as blocks show up."
 echo
