@@ -390,6 +390,35 @@ must be added here manually today.
   form field `device_stale_days` (a whole number of days, or blank to
   disable cleanup entirely). Feeds `cleanup_stale_devices()` above.
 
+### Health (`/health`)
+
+Added 2026-08-30. Read-only view of `interception_runtime` (see
+`common/db.py`'s schema comment) -- the only place this table's data is
+surfaced anywhere in the app. Requires the optional `interception` compose
+profile to actually be running; shows a "not running" card instead when
+the singleton row doesn't exist at all (a normal, unremarkable deployment
+shape, not an error).
+
+- `GET /health` -> `health_page()` -- reads `mode`/`last_healthy_at`/
+  `fail_open_reason`/`applied_generation` (controller<->arp-worker
+  pipeline) and `nft_mode`/`nft_last_healthy_at`/`nft_fail_reason`
+  (nftables-manager) from `interception_runtime`'s singleton row. Renders
+  `HEALTH_BODY` with a green/red/amber badge per subsystem via
+  `HEALTH_MODE_BADGE_CLASS`. `_is_stale()` additionally flags either
+  subsystem "stale" (badge class `pending`) when its `last_healthy_at`
+  hasn't advanced in over `HEALTH_STALE_AFTER_SECONDS` (30s) and `mode`
+  isn't already `fail_open` -- a crashed/crash-looping process can't
+  write its own `fail_open` row, so a frozen timestamp is itself the
+  signal something's wrong (found live via a sustained OOM-kill test,
+  see RoadMap.md). This page doesn't auto-refresh; reload to see the
+  latest status.
+- `render()` (the shared page-chrome wrapper every route calls into, not
+  a route itself) separately queries the same singleton row on every
+  page load to decide whether to show a "!" alarm badge next to "Health"
+  in the sidebar -- lit for either subsystem being `fail_open` or stale,
+  by the same `_is_stale()` logic. A missing row (interception profile
+  not running) never lights this badge.
+
 ### Settings (`/settings`)
 
 - `GET /settings` -> `settings_page()` -- reads `local_network`,

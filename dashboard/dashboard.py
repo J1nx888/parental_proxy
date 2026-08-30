@@ -2256,6 +2256,16 @@ HEALTH_BODY = """
 # staleness needs its own check at all (a dead process can't self-report).
 HEALTH_STALE_AFTER_SECONDS = 30
 
+# Badge classes reuse the report page's allowed/blocked/pending palette --
+# green for healthy, red for fail-open, amber for repair-only (ARP side
+# only; nft_mode has no repair_only state), gray for not-yet-started. Fully
+# static, so it's a module-level constant (like HEALTH_STALE_AFTER_SECONDS
+# above) rather than rebuilt inside health_page() on every request.
+HEALTH_MODE_BADGE_CLASS = {
+    "running": "allowed", "fail_open": "blocked",
+    "repair_only": "pending", "stopped": "mode-trusted",
+}
+
 
 def _is_stale(last_healthy_at: str | None) -> bool:
     if not last_healthy_at:
@@ -2272,13 +2282,6 @@ def health_page():
         "nft_mode, nft_last_healthy_at, nft_fail_reason "
         "FROM interception_runtime WHERE singleton_id = 1"
     ).fetchone()
-    # Badge classes reuse the report page's allowed/blocked/pending palette --
-    # green for healthy, red for fail-open, amber for repair-only (ARP side
-    # only; nft_mode has no repair_only state), gray for not-yet-started.
-    mode_badge = {
-        "running": "allowed", "fail_open": "blocked",
-        "repair_only": "pending", "stopped": "mode-trusted",
-    }
     nft_mode_badge_class = mode_badge_class = "mode-trusted"
     mode_stale = nft_mode_stale = False
     if runtime_row:
@@ -2292,8 +2295,8 @@ def health_page():
         # cannot, by construction.
         mode_stale = runtime_row["mode"] != "fail_open" and _is_stale(runtime_row["last_healthy_at"])
         nft_mode_stale = runtime_row["nft_mode"] != "fail_open" and _is_stale(runtime_row["nft_last_healthy_at"])
-        mode_badge_class = mode_badge.get(runtime_row["mode"], "mode-trusted")
-        nft_mode_badge_class = mode_badge.get(runtime_row["nft_mode"], "mode-trusted")
+        mode_badge_class = HEALTH_MODE_BADGE_CLASS.get(runtime_row["mode"], "mode-trusted")
+        nft_mode_badge_class = HEALTH_MODE_BADGE_CLASS.get(runtime_row["nft_mode"], "mode-trusted")
     body = render_template_string(
         HEALTH_BODY, runtime_row=runtime_row,
         mode_badge_class=mode_badge_class, nft_mode_badge_class=nft_mode_badge_class,

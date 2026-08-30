@@ -69,21 +69,38 @@ def test_get_custom_rules_strips_trailing_slash_from_base_url(monkeypatch):
     assert captured["url"] == "http://127.0.0.1:3000/control/filtering/status"
 
 
-def test_get_custom_rules_treats_missing_user_rules_key_as_empty(monkeypatch):
-    # A key AdGuard should always send but a defensive default anyway --
-    # see the null case below, which is the one actually confirmed live.
+def test_get_custom_rules_rejects_missing_user_rules_key(monkeypatch):
+    # A key entirely missing is more anomalous than the confirmed-live null
+    # case below (wrong endpoint, incompatible AdGuard version) -- code
+    # review 2026-08-30 caught an earlier version of this fix treating this
+    # the same as null, which let sync_once() silently proceed to a
+    # destructive full-replace write on a merely malformed read. This must
+    # still raise and fail closed.
     monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({}))
-    assert adguard_client.get_custom_rules("http://127.0.0.1:3000", "admin", "x") == []
+    with pytest.raises(adguard_client.AdGuardError, match="user_rules"):
+        adguard_client.get_custom_rules("http://127.0.0.1:3000", "admin", "x")
 
 
 def test_get_custom_rules_treats_null_user_rules_as_empty(monkeypatch):
     # Confirmed live 2026-08-30: a freshly-configured AdGuard Home instance
-    # that has never had a custom rule set reports `"user_rules": null`,
-    # not `[]` -- see adguard_client.py's module docstring. This must NOT
-    # raise, or sync_once() could never complete its first cycle ever
-    # against a brand-new instance (it always reads before it writes).
+    # that has never had a custom rule set reports `"user_rules": null`
+    # (key PRESENT, value null), not `[]` -- see adguard_client.py's module
+    # docstring. This must NOT raise, or sync_once() could never complete
+    # its first cycle ever against a brand-new instance (it always reads
+    # before it writes).
     monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({"user_rules": None}))
     assert adguard_client.get_custom_rules("http://127.0.0.1:3000", "admin", "x") == []
+
+
+def test_get_custom_rules_rejects_non_dict_top_level_response(monkeypatch):
+    # A bare JSON array/scalar at the top level is a different, more
+    # anomalous failure than the confirmed null-on-fresh-install quirk
+    # (wrong endpoint, a proxy/auth error page that happens to be valid
+    # JSON) and must still raise rather than being silently swallowed as
+    # "no rules yet" -- code review 2026-08-30.
+    monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response(["not", "a", "dict"]))
+    with pytest.raises(adguard_client.AdGuardError, match="JSON object"):
+        adguard_client.get_custom_rules("http://127.0.0.1:3000", "admin", "x")
 
 
 def test_get_custom_rules_rejects_non_list_user_rules(monkeypatch):

@@ -91,6 +91,17 @@ func ReadDesiredPolicy(dbPath string) (policy.DesiredPolicy, error) {
 // last_healthy_at/fail_open_reason columns (see common/db.py's schema
 // comment) so the two subsystems never clobber each other's status in
 // the shared singleton row. Pass a nil failReason to report success.
+//
+// nft_last_healthy_at is only ever advanced on a successful ("running")
+// report -- deliberately mirroring controller/health.py's own
+// report_healthy()/report_fail_open() split, where report_fail_open()
+// doesn't mention last_healthy_at at all and so leaves it untouched. An
+// earlier version of this function unconditionally set it to "now" on
+// every call, including fail-open ones, which meant a continuously
+// failing-but-still-polling nftables-manager kept refreshing its own
+// "last healthy" timestamp forever -- caught by code review 2026-08-30,
+// before the dashboard's staleness view (see dashboard/dashboard.py's
+// _is_stale) grew a reason to compare this column directly.
 func WriteHealth(dbPath, mode string, failReason error) error {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -103,12 +114,21 @@ func WriteHealth(dbPath, mode string, failReason error) error {
 		reason = sql.NullString{String: failReason.Error(), Valid: true}
 	}
 
+	var healthyAt sql.NullString
+	if mode != "fail_open" {
+		healthyAt = sql.NullString{String: nowISO(), Valid: true}
+	}
+
 	_, err = db.Exec(
 		"INSERT INTO interception_runtime (singleton_id, nft_mode, nft_last_healthy_at, nft_fail_reason) "+
 			"VALUES (1, ?, ?, ?) "+
 			"ON CONFLICT(singleton_id) DO UPDATE SET nft_mode = excluded.nft_mode, "+
-			"nft_last_healthy_at = excluded.nft_last_healthy_at, nft_fail_reason = excluded.nft_fail_reason",
-		mode, nowISO(), reason,
+			// COALESCE, not a plain assignment: on a fail_open report
+			// healthyAt is NULL, and this keeps whatever nft_last_healthy_at
+			// already held rather than wiping it to NULL.
+			"nft_last_healthy_at = COALESCE(excluded.nft_last_healthy_at, nft_last_healthy_at), "+
+			"nft_fail_reason = excluded.nft_fail_reason",
+		mode, healthyAt, reason,
 	)
 	if err != nil {
 		return fmt.Errorf("write health: %w", err)

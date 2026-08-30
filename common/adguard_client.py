@@ -41,15 +41,22 @@ import path, three separate Squid startup bugs this same session):
   `doh.routes` -- so letting AdGuard build its own config is both
   simpler and version-correct in a way a template can't be kept in sync
   with automatically).
-- `/control/filtering/status`'s `user_rules` key is `null`, not `[]`,
-  on a freshly-configured instance that has never had a custom rule set
-  -- confirmed live 2026-08-30 running the full interception stack
-  against a brand-new AdGuard container for the first time ever (every
-  earlier live AdGuard test this project ran had already pushed at
-  least one custom rule by the time `get_custom_rules` was exercised,
+- `/control/filtering/status`'s `user_rules` key is present but `null`,
+  not `[]`, on a freshly-configured instance that has never had a custom
+  rule set -- confirmed live 2026-08-30 running the full interception
+  stack against a brand-new AdGuard container for the first time ever
+  (every earlier live AdGuard test this project ran had already pushed
+  at least one custom rule by the time `get_custom_rules` was exercised,
   which is exactly why this hadn't surfaced before). `get_custom_rules`
-  below treats `null`/missing as "no rules yet" (empty list), same as
-  `[]` -- NOT as a malformed response.
+  below treats that ONE specific shape -- key present, value `null` --
+  as "no rules yet" (empty list), same as `[]`. It deliberately does NOT
+  extend the same treatment to a missing key or a non-object response:
+  an early version of this fix did, and a code review the same day
+  caught that this let `sync_once()` silently proceed to a destructive
+  full-replace write on what could be a genuinely malformed response
+  (wrong endpoint, incompatible AdGuard version) rather than the
+  confirmed benign case -- those still raise `AdGuardError` and fail
+  closed, exactly as before this fix existed.
 
 No third-party dependencies -- matches common/cr_api.py's own
 urllib-based pattern, mirrored here, rather than adding `requests` to a
@@ -133,13 +140,25 @@ def get_custom_rules(
         decoded = json.loads(body)
     except ValueError as exc:
         raise AdGuardError(f"malformed JSON from {base_url}/control/filtering/status: {exc}") from exc
-    rules = decoded.get("user_rules") if isinstance(decoded, dict) else None
+    if not isinstance(decoded, dict):
+        raise AdGuardError(f"{base_url}/control/filtering/status didn't return a JSON object")
+    if "user_rules" not in decoded:
+        raise AdGuardError("AdGuard Home's filtering/status response had no 'user_rules' key")
+    rules = decoded["user_rules"]
     if rules is None:
         # A freshly-configured instance that's never had a custom rule set
-        # reports `null` here, not `[]` -- see this module's docstring.
-        # Treat it the same as an empty list rather than raising, or
-        # sync_once() could never complete its very first cycle against a
-        # brand-new AdGuard instance (it always reads before it writes).
+        # reports the KEY PRESENT but `null`, not `[]` -- see this module's
+        # docstring. Treat that one specific, confirmed-live shape as an
+        # empty list rather than raising, or sync_once() could never
+        # complete its very first cycle against a brand-new AdGuard
+        # instance (it always reads before it writes). Deliberately narrow:
+        # a non-dict response or a missing key entirely is a genuinely
+        # different, more anomalous failure (wrong endpoint, incompatible
+        # AdGuard version) and should still raise and fail closed --
+        # collapsing all three into one silent "no rules yet" used to let
+        # sync_once() proceed to a full-replace write on a merely
+        # malformed read, silently discarding any admin-added rules that
+        # were actually still there (found via code review 2026-08-30).
         rules = []
     if not isinstance(rules, list):
         raise AdGuardError("AdGuard Home's filtering/status response had a non-list 'user_rules'")

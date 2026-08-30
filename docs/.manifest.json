@@ -10,9 +10,9 @@
     },
     "dashboard": {
       "source_paths": ["dashboard/", "common/db.py", "common/matching.py"],
-      "fingerprint": "40466216ce0c3ad3a0d322afaa286f47d212e2e1204835260731db7d96d76f55",
+      "fingerprint": "25ebf361ec86a6fefb317808c0e5f949c9f758f875cea65e6438e9312f7d2f87",
       "doc_path": "docs/dashboard/routes.md",
-      "last_updated": "2026-08-30T23:00:00Z"
+      "last_updated": "2026-08-31T00:00:00Z"
     },
     "database": {
       "source_paths": ["common/db.py", "defaults/seed_defaults.py"],

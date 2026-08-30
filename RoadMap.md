@@ -838,6 +838,69 @@ blocked domain -- and separately confirmed the HTTPS case's clean
 pytest suite: 435 passed on the VM. All test containers/networks/the
 `.env` file torn down afterward.
 
+### Dashboard "interception health" view, plus real bugs found running the full stack live for the first time (2026-08-30)
+
+Built the dashboard `/health` view the Milestones summary above had
+flagged as unbuilt (`dashboard/dashboard.py`'s `health_page()`): shows
+`interception_runtime`'s `mode`/`last_healthy_at`/`fail_open_reason`
+(controller<->arp-worker pipeline) and `nft_mode`/`nft_last_healthy_at`/
+`nft_fail_reason` (nftables-manager) as green/red/amber badges, plus a
+sidebar "!" alarm badge visible from every page. Live-verified against
+the real containerized stack on the smoke-test VM.
+
+**Staleness detection, added after a real live finding**: OOM-killing
+the controller container (`docker update --memory 10m`, sustained) put
+it into a genuine SIGKILL/restart crash loop, but
+`interception_runtime.mode` stayed frozen at `'running'` forever --
+the code path that would write `fail_open` lives in the same process
+that keeps dying before it can run. `_is_stale()` now flags either
+column "stale" (amber, explicit explanation) when its `last_healthy_at`
+hasn't advanced in over 30s, independent of what `mode` still says.
+
+**A real bug found and fixed along the way**: `common/adguard_client.py`'s
+`get_custom_rules()` raised on AdGuard's own real response shape -- a
+freshly-configured instance that's never had a custom rule set reports
+`user_rules: null`, not `[]` -- which meant AdGuard domain-block-rule
+sync could never complete a single cycle on any brand-new deployment,
+forever. Fixed and confirmed live against a brand-new AdGuard instance.
+
+**A `/code-review max` pass the same day caught a real regression in
+that same fix** before it shipped further: the first version of the
+null-handling fix was too broad -- it also silently swallowed a
+non-dict or key-missing response as "no rules yet," which would have
+let `sync_once()`'s full-replace write silently erase an admin's real
+custom rules on a merely malformed read, not just the one confirmed
+benign case. Tightened to only special-case an explicit `null` with the
+key present; a missing key or non-object response still raises and
+fails closed, as before. The review also caught a test
+(`test_health_page_shows_running_mode_and_generation`) whose hardcoded
+absolute timestamp had already aged past the staleness threshold by
+the time of review, silently testing the wrong render branch -- fixed
+to use a relative, always-fresh timestamp. Two known-but-deferred
+design gaps from that same review, not fixed yet:
+- Staleness detection lives only in the dashboard's read path,
+  computed transiently per page load, and is never written back to
+  `interception_runtime` -- any other future consumer of that table
+  (an API, a CLI tool, alerting) still sees a stale `mode` forever.
+  Fixing this properly likely means the peer process (or a lightweight
+  watchdog) writing `fail_open` on a dead process's behalf, not another
+  dashboard-side heuristic.
+- `HEALTH_STALE_AFTER_SECONDS = 30` is hardcoded in `dashboard.py`,
+  disconnected from `controller`'s `--poll-interval` and
+  `nftables-manager`'s `-poll-interval` (both default 5s today, but
+  nftables-manager's own README calls its default "a guessed default,
+  not soak-tested"). Should probably be derived from a poll interval
+  each writer persists into the DB itself, not assumed.
+
+**Milestone 9 fault-campaign progress, container-testable slice**: also
+used this session's containerization work (not available before it) to
+run two real fault-injection tests against the smoke-test VM's live
+stack: an ungraceful crash of `arp-worker` (found that `docker kill`
+does NOT trigger Docker's `restart: unless-stopped` -- only a crash
+from inside the container's own PID 1 does; confirmed the controller's
+reconnect logic recovers correctly either way) and the OOM-kill test
+above. NIC down/up and gateway reboot still need real hardware.
+
 ### Fail-open engineering (a correction to an earlier assumption)
 
 Linux neighbor-cache entries are a state machine, not a fixed TTL — a
@@ -1226,14 +1289,16 @@ Milestones 1–9 above (all but the soak test) have real, tested — several
 functionally verified against real nftables/real sockets/real subprocess
 behavior, including the controller and nftables-manager coordinating
 live through the shared DB (Milestone 7's end-to-end proof) — work
-behind them as of 2026-08-29. What's NOT built: a full discovery daemon
-(only the periodic snapshot source exists so far, not wired into a
-running loop, and not the higher-precedence live rtnetlink listener), a
-dashboard "interception health" view reading the tables above, and
-running any of this against a real network interface (`CAP_NET_RAW`/
-`CAP_NET_ADMIN` deliberately withheld from every sandboxed test account
-used so far — nothing here has ever run outside a disposable VM or
-container).
+behind them. As of 2026-08-30: the discovery daemon is wired into a
+running loop with the higher-precedence live rtnetlink listener on by
+default (see above), the dashboard "interception health" view reading
+the tables above is built (see "Dashboard 'interception health' view..."
+below), and this has run against real network interfaces inside
+disposable VMs/containers. What's NOT built/done: a soak test
+(Milestone 10, deliberately owner-gated), and running any of this
+against a REAL household LAN and real hardware NIC (`CAP_NET_RAW`/
+`CAP_NET_ADMIN` have only ever been granted inside a disposable VM or
+container so far, never on the real production Beelink box).
 
 ---
 

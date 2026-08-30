@@ -87,3 +87,81 @@ func TestReadDesiredPolicy_NoRowReturnsZeroValue(t *testing.T) {
 		t.Fatalf("expected zero-value DesiredPolicy, got %+v", got)
 	}
 }
+
+func readNftHealth(t *testing.T, path string) (mode string, healthyAt sql.NullString, failReason sql.NullString) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer db.Close()
+
+	row := db.QueryRow("SELECT nft_mode, nft_last_healthy_at, nft_fail_reason FROM interception_runtime WHERE singleton_id = 1")
+	if err := row.Scan(&mode, &healthyAt, &failReason); err != nil {
+		t.Fatalf("scan health row: %v", err)
+	}
+	return mode, healthyAt, failReason
+}
+
+// Regression test for the bug found via code review 2026-08-30: WriteHealth
+// used to unconditionally refresh nft_last_healthy_at on every call,
+// including fail-open reports, unlike controller/health.py's
+// report_fail_open() (Python side) which deliberately leaves
+// last_healthy_at untouched on failure. A continuously fail-open-but-
+// still-polling nftables-manager kept refreshing its own "last healthy"
+// timestamp forever, which would have made dashboard.py's staleness
+// detection (_is_stale) wrongly treat it as fresh/healthy on any future
+// use that didn't also gate on nft_mode != "fail_open".
+func TestWriteHealth_DoesNotAdvanceLastHealthyOnFailOpen(t *testing.T) {
+	path := setupDB(t, "")
+
+	if err := WriteHealth(path, "running", nil); err != nil {
+		t.Fatalf("WriteHealth(running): %v", err)
+	}
+	_, firstHealthyAt, _ := readNftHealth(t, path)
+	if !firstHealthyAt.Valid || firstHealthyAt.String == "" {
+		t.Fatalf("expected nft_last_healthy_at to be set after a successful report, got %+v", firstHealthyAt)
+	}
+
+	if err := WriteHealth(path, "fail_open", errFake{"nft command failed"}); err != nil {
+		t.Fatalf("WriteHealth(fail_open): %v", err)
+	}
+	mode, healthyAtAfterFailure, failReason := readNftHealth(t, path)
+
+	if mode != "fail_open" {
+		t.Fatalf("nft_mode = %q, want fail_open", mode)
+	}
+	if !failReason.Valid || failReason.String != "nft command failed" {
+		t.Fatalf("nft_fail_reason = %+v, want \"nft command failed\"", failReason)
+	}
+	if healthyAtAfterFailure != firstHealthyAt {
+		t.Fatalf("nft_last_healthy_at changed on a fail-open report: was %+v, now %+v", firstHealthyAt, healthyAtAfterFailure)
+	}
+}
+
+// A fail-open report on the very first-ever write (no prior successful
+// report) should leave nft_last_healthy_at NULL, not set it -- matching
+// controller/health.py's report_fail_open(), which never mentions
+// last_healthy_at in its INSERT either.
+func TestWriteHealth_FailOpenOnFirstWriteLeavesLastHealthyNull(t *testing.T) {
+	path := setupDB(t, "")
+
+	if err := WriteHealth(path, "fail_open", errFake{"never started"}); err != nil {
+		t.Fatalf("WriteHealth(fail_open): %v", err)
+	}
+	mode, healthyAt, failReason := readNftHealth(t, path)
+
+	if mode != "fail_open" {
+		t.Fatalf("nft_mode = %q, want fail_open", mode)
+	}
+	if healthyAt.Valid {
+		t.Fatalf("nft_last_healthy_at = %+v, want NULL on a first-ever fail-open report", healthyAt)
+	}
+	if !failReason.Valid || failReason.String != "never started" {
+		t.Fatalf("nft_fail_reason = %+v, want \"never started\"", failReason)
+	}
+}
+
+type errFake struct{ msg string }
+
+func (e errFake) Error() string { return e.msg }

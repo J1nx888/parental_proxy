@@ -754,6 +754,23 @@ def test_update_block_page_mode_invalid_value_rejected(client, db_conn):
 # HEALTH (interception_runtime)
 # ============================================================
 
+def _insert_runtime_row(db_conn, mode="running", nft_mode="running", **overrides):
+    """Seeds the interception_runtime singleton row -- mirrors this file's
+    existing _insert_device_with_last_seen/_insert_recent_denial/
+    _insert_logged helper pattern instead of each test hand-writing its own
+    INSERT column list. `overrides` accepts any other column by name (e.g.
+    last_healthy_at=..., fail_open_reason=..., nft_fail_reason=...,
+    applied_generation=...)."""
+    columns = {"mode": mode, "nft_mode": nft_mode, **overrides}
+    names = ", ".join(columns)
+    placeholders = ", ".join("?" for _ in columns)
+    db_conn.execute(
+        f"INSERT INTO interception_runtime (singleton_id, {names}) VALUES (1, {placeholders})",
+        tuple(columns.values()),
+    )
+    db_conn.commit()
+
+
 def test_health_page_requires_admin_auth(client):
     resp = client.get("/health")
     assert resp.status_code == 401
@@ -767,24 +784,28 @@ def test_health_page_shows_not_running_when_no_runtime_row(client):
 
 
 def test_health_page_shows_running_mode_and_generation(client, db_conn):
-    db_conn.execute(
-        "INSERT INTO interception_runtime (singleton_id, mode, last_healthy_at, applied_generation, nft_mode) "
-        "VALUES (1, 'running', '2026-08-30T12:00:00Z', 7, 'running')"
-    )
-    db_conn.commit()
+    # A hardcoded absolute timestamp here (an earlier version of this test
+    # used '2026-08-30T12:00:00Z') silently ages past HEALTH_STALE_AFTER_
+    # SECONDS as real time passes, at which point this test starts
+    # exercising the "stale" render branch instead of the intended plain-
+    # running one, while still passing on these same weak substring
+    # assertions -- caught by code review 2026-08-30. Use a relative,
+    # always-fresh timestamp instead, and assert the specific generation
+    # text plus the ABSENCE of the stale badge, so a regression in either
+    # the generation display or the staleness threshold actually fails
+    # this test rather than passing by coincidence.
+    import db
+    recent_ts = db.now_iso()
+    _insert_runtime_row(db_conn, last_healthy_at=recent_ts, applied_generation=7)
     resp = client.get("/health", headers=_auth_header())
     assert resp.status_code == 200
-    assert b"running" in resp.data
-    assert b"2026-08-30T12:00:00Z" in resp.data
-    assert b"7" in resp.data
+    assert b"Applied ARP-worker generation: 7." in resp.data
+    assert recent_ts.encode() in resp.data
+    assert b"stale" not in resp.data.lower()
 
 
 def test_health_page_shows_fail_open_reason(client, db_conn):
-    db_conn.execute(
-        "INSERT INTO interception_runtime (singleton_id, mode, fail_open_reason, nft_mode) "
-        "VALUES (1, 'fail_open', 'worker connection lost', 'running')"
-    )
-    db_conn.commit()
+    _insert_runtime_row(db_conn, mode="fail_open", fail_open_reason="worker connection lost")
     resp = client.get("/health", headers=_auth_header())
     assert resp.status_code == 200
     assert b"worker connection lost" in resp.data
@@ -797,13 +818,7 @@ def test_health_page_flags_stale_mode_despite_running_status(client, db_conn):
     # process died, since the process that would report fail_open is the
     # same one that's dead.
     import db
-    old_ts = db.iso_secs_ago(60)
-    db_conn.execute(
-        "INSERT INTO interception_runtime (singleton_id, mode, last_healthy_at, nft_mode) "
-        "VALUES (1, 'running', ?, 'running')",
-        (old_ts,),
-    )
-    db_conn.commit()
+    _insert_runtime_row(db_conn, last_healthy_at=db.iso_secs_ago(60))
     resp = client.get("/health", headers=_auth_header())
     assert resp.status_code == 200
     assert b"stale" in resp.data.lower()
@@ -812,12 +827,7 @@ def test_health_page_flags_stale_mode_despite_running_status(client, db_conn):
 
 def test_health_page_does_not_flag_recent_running_status_as_stale(client, db_conn):
     import db
-    db_conn.execute(
-        "INSERT INTO interception_runtime (singleton_id, mode, last_healthy_at, nft_mode, nft_last_healthy_at) "
-        "VALUES (1, 'running', ?, 'running', ?)",
-        (db.now_iso(), db.now_iso()),
-    )
-    db_conn.commit()
+    _insert_runtime_row(db_conn, last_healthy_at=db.now_iso(), nft_last_healthy_at=db.now_iso())
     resp = client.get("/health", headers=_auth_header())
     assert resp.status_code == 200
     assert b"stale" not in resp.data.lower()
@@ -825,23 +835,13 @@ def test_health_page_does_not_flag_recent_running_status_as_stale(client, db_con
 
 def test_sidebar_shows_alarm_badge_for_stale_status_too(client, db_conn):
     import db
-    old_ts = db.iso_secs_ago(60)
-    db_conn.execute(
-        "INSERT INTO interception_runtime (singleton_id, mode, last_healthy_at, nft_mode) "
-        "VALUES (1, 'running', ?, 'running')",
-        (old_ts,),
-    )
-    db_conn.commit()
+    _insert_runtime_row(db_conn, last_healthy_at=db.iso_secs_ago(60))
     resp = client.get("/settings", headers=_auth_header())
     assert b'class="badge blocked">!' in resp.data
 
 
 def test_health_page_shows_nft_fail_open_reason(client, db_conn):
-    db_conn.execute(
-        "INSERT INTO interception_runtime (singleton_id, mode, nft_mode, nft_fail_reason) "
-        "VALUES (1, 'running', 'fail_open', 'nft command failed')"
-    )
-    db_conn.commit()
+    _insert_runtime_row(db_conn, nft_mode="fail_open", nft_fail_reason="nft command failed")
     resp = client.get("/health", headers=_auth_header())
     assert resp.status_code == 200
     assert b"nft command failed" in resp.data
@@ -852,10 +852,7 @@ def test_sidebar_shows_alarm_badge_only_when_fail_open(client, db_conn):
     resp = client.get("/settings", headers=_auth_header())
     assert b'class="badge blocked">!' not in resp.data
 
-    db_conn.execute(
-        "INSERT INTO interception_runtime (singleton_id, mode, nft_mode) VALUES (1, 'fail_open', 'running')"
-    )
-    db_conn.commit()
+    _insert_runtime_row(db_conn, mode="fail_open")
     resp = client.get("/settings", headers=_auth_header())
     assert b'class="badge blocked">!' in resp.data
 
