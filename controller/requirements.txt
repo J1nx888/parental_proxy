@@ -1,0 +1,10 @@
+# Only needed for controller/rtnetlink_listener.py's live neighbor-table
+# event listener (added 2026-08-30) -- pure Python, no C extension/compiler
+# needed (confirmed via PyPI metadata: "the core requires only Python
+# stdlib"), matching this project's own constraint that its test/deploy
+# environments have no C compiler available. Everything else in controller/
+# stays stdlib-only, same as common/ (see e.g. common/sdnotify.py's own
+# docstring) -- this is the one deliberate exception, for the one thing
+# Python's stdlib genuinely doesn't expose a usable API for (parsing
+# RTM_NEWNEIGH/RTM_DELNEIGH netlink messages).
+pyroute2>=0.7

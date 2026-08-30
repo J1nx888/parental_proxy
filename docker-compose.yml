@@ -138,7 +138,119 @@ services:
     volumes:
       - pp_config:/config
 
+  # ==========================================================
+  # Phase 3 interception layer (arp-worker, nftables-manager, controller)
+  # -- containerized 2026-08-30, gated behind the "interception" compose
+  # profile so a plain `docker compose up` (no --profile flag) behaves
+  # exactly as before: proxy + adguard + dashboard only, nothing here
+  # starts, nothing touches a real network interface. Bringing this
+  # profile up for real (`docker compose --profile interception up -d`)
+  # is the actual "start intercepting this LAN" decision -- deliberately
+  # left as an explicit, separate step an operator has to choose to take
+  # (see RoadMap.md's fail-open/testing-discipline sections on why this
+  # project treats that as a decision that needs a human, not something
+  # a default `docker compose up` should ever do by itself), and it
+  # requires real values for ARP_WORKER_IFACE/GATEWAY_IP/GATEWAY_MAC
+  # below -- none of which have a sensible default.
+  #
+  # Verified 2026-08-30 via the same safe Docker-bridge test pattern
+  # used throughout this project's development (a disposable
+  # gateway/victim/worker triad, never the real production box or a
+  # real household LAN) -- see RoadMap.md's live-verification section.
+
+  arp-worker:
+    build:
+      context: phase3/arp-worker
+    container_name: parental-proxy-arp-worker
+    restart: unless-stopped
+    profiles: ["interception"]
+    # network_mode: host -- needs to see the REAL LAN-facing interface
+    # (ARP_WORKER_IFACE) to send/receive real ARP packets; a bridge-
+    # networked container only ever sees a virtual veth, never the
+    # host's actual interface.
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    volumes:
+      - pp_run:/run/parental_proxy
+    command:
+      - -iface=${ARP_WORKER_IFACE:-}
+      - -socket=/run/parental_proxy/arp-worker.sock
+      - -controller-uid=${CONTROLLER_UID:-0}
+    # No default for ARP_WORKER_IFACE on purpose -- pp-arp-worker's own
+    # main.go refuses to start with -iface="" ("-iface and
+    # -controller-uid are both required"), so an unconfigured attempt
+    # to enable this profile fails loudly and immediately rather than
+    # silently doing nothing or guessing an interface.
+
+  nftables-manager:
+    build:
+      context: phase3/nftables-manager
+    container_name: parental-proxy-nftables-manager
+    restart: unless-stopped
+    profiles: ["interception"]
+    # Same reasoning as proxy/adguard's own network_mode: host --
+    # manages the SAME "parental_proxy" nftables table those services'
+    # redirect rules depend on, which only makes sense in the host's own
+    # network namespace.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - pp_config:/config
+    command:
+      - -db-path=/config/parental_proxy.db
+      - -poll-interval=${NFTABLES_POLL_INTERVAL:-5s}
+
+  controller:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    container_name: parental-proxy-controller
+    restart: unless-stopped
+    profiles: ["interception"]
+    # network_mode: host -- same reason dashboard needed it (added the
+    # same day): this process calls AdGuard's admin API
+    # (controller/adguard_sync.py) at ADGUARD_URL, which is
+    # loopback-bound under host networking (see adguard's own
+    # ADGUARD_WEB_BIND comment) and unreachable from a bridge-networked
+    # container. It also needs phase3/nftables-manager's own
+    # `parental_proxy` table to exist already, though it never touches
+    # nftables directly itself -- only through the shared DB.
+    network_mode: host
+    # depends_on only waits for these containers to *start*, not to be
+    # actually ready (arp-worker's socket file, AdGuard's API) -- same
+    # caveat docs/deployment/setup.md already notes for proxy/dashboard.
+    # controller/main.py's own WorkerClient.connect() has no retry on
+    # its *initial* connection attempt, so a too-early start here just
+    # means one restart cycle (restart: unless-stopped) before it
+    # settles, not a permanent failure.
+    depends_on:
+      - proxy
+      - adguard
+      - arp-worker
+    volumes:
+      - pp_config:/config
+      - pp_run:/run/parental_proxy
+    command:
+      - --socket=/run/parental_proxy/arp-worker.sock
+      - --db-path=/config/parental_proxy.db
+      - --gateway-ip=${GATEWAY_IP:-}
+      - --gateway-mac=${GATEWAY_MAC:-}
+      - --adguard-url=${ADGUARD_URL:-http://127.0.0.1:3000}
+      - --adguard-username=${ADGUARD_USERNAME:-admin}
+      - --adguard-password=${ADGUARD_PASSWORD:-}
+    # No default for GATEWAY_IP/GATEWAY_MAC on purpose -- main.py's own
+    # argparse refuses to start without both ("--db-path requires
+    # --gateway-ip and --gateway-mac"), same fail-loudly reasoning as
+    # ARP_WORKER_IFACE above.
+
 volumes:
   pp_config:
   pp_adguard_conf:
   pp_adguard_work:
+  # Shared between arp-worker and controller ONLY -- just the Unix
+  # socket file the two speak IPC over (network_mode: host shares the
+  # network namespace, not the filesystem, so this still needs an
+  # explicit shared volume even though both containers are host-networked).
+  pp_run:

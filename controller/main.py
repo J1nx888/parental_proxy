@@ -38,13 +38,20 @@ from pathlib import Path
 from typing import Callable
 
 # common/*.py lives in ../common relative to this file when run from a
-# repo checkout -- no Dockerfile for this component yet (see this
-# package's own status notes), so there's no flat-copy build step to
-# rely on. Mirrors dashboard/dev_server.py's bootstrap.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
+# repo checkout. controller/Dockerfile (added 2026-08-30) instead
+# flat-copies common/*.py alongside controller/*.py into one directory,
+# matching proxy/Dockerfile and dashboard/Dockerfile's own pattern --
+# in that layout ../common doesn't exist, but it doesn't need to:
+# Python already puts this script's own directory (where the flat-
+# copied common/*.py sit) on sys.path[0] by default. Only insert the
+# repo-checkout path when it's actually there, so both layouts work.
+_common_dir = Path(__file__).resolve().parent.parent / "common"
+if _common_dir.is_dir():
+    sys.path.insert(0, str(_common_dir))
 
 import adguard_sync
 import discovery
+import rtnetlink_listener
 import health
 import sdnotify
 from ipc_client import Target, WorkerClient, WorkerConnectionError
@@ -80,6 +87,7 @@ def run(
     health_conn: sqlite3.Connection | None = None,
     policy_conn: sqlite3.Connection | None = None,
     discovery_interval: float | None = None,
+    enable_rtnetlink: bool = False,
     adguard_interval: float | None = None,
     adguard_url: str | None = None,
     adguard_username: str | None = None,
@@ -108,6 +116,16 @@ def run(
     default) means no discovery loop runs, matching this parameter's
     absence before 2026-08-30 -- existing callers that don't pass it see
     no behavior change.
+
+    enable_rtnetlink, if True, starts
+    controller/rtnetlink_listener.py's live RTM_NEWNEIGH listener
+    alongside the discovery snapshot loop above -- the higher-precedence
+    source discovery.py's own docstring flagged as still unbuilt until
+    2026-08-30. Also stopped in the `finally` block below. Independent
+    of discovery_interval -- both can run together (the snapshot catches
+    anything the live listener missed, e.g. a device already-idle before
+    this process started), matching the design doc's own layered
+    precedence order rather than one replacing the other.
 
     adguard_interval, if given (not None), starts
     controller/adguard_sync.py's periodic hard-deny sync on its own
@@ -176,6 +194,12 @@ def run(
             on_error=lambda exc: log.warning("discovery snapshot failed: %s", exc),
         )
 
+    rtnetlink_task = None
+    if enable_rtnetlink:
+        rtnetlink_task = rtnetlink_listener.run_loop(
+            on_error=lambda exc: log.warning("rtnetlink listener failed: %s", exc),
+        )
+
     adguard_task = None
     if adguard_interval is not None:
         adguard_task = adguard_sync.run_loop(
@@ -208,6 +232,8 @@ def run(
         pacer.stop()
         if discovery_task is not None:
             discovery_task.stop()
+        if rtnetlink_task is not None:
+            rtnetlink_task.stop()
         if adguard_task is not None:
             adguard_task.stop()
         try:
@@ -314,6 +340,14 @@ def main(argv: list[str] | None = None) -> int:
         "(cron, a separate process) and doesn't want it duplicated here.",
     )
     parser.add_argument(
+        "--no-rtnetlink", action="store_true",
+        help="Disable the live rtnetlink RTM_NEWNEIGH listener "
+        "(controller/rtnetlink_listener.py) even when --db-path is set. "
+        "Requires the pyroute2 package (controller/requirements.txt) and a "
+        "Linux host -- enabled by default alongside --db-path since it has "
+        "no interval of its own to tune, only a way to turn it off.",
+    )
+    parser.add_argument(
         "--adguard-url",
         help="Base URL of AdGuard Home's control API, e.g. http://127.0.0.1:3000 "
         "(or http://adguard:3000 once this process runs in the same compose "
@@ -338,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
 
     conn: sqlite3.Connection | None = None
     discovery_interval: float | None = None
+    enable_rtnetlink = False
     adguard_interval: float | None = None
     if args.db_path:
         if not args.gateway_ip or not args.gateway_mac:
@@ -351,6 +386,12 @@ def main(argv: list[str] | None = None) -> int:
             # args.db_path by _build_db_backed_provider above, so it just
             # needs to be told to run at all, and at what interval.
             discovery_interval = args.discovery_interval
+        if not args.no_rtnetlink:
+            # rtnetlink_listener.run_loop() opens its own connection
+            # internally too, same reasoning -- see its own module
+            # docstring for why pyroute2 (Linux-only) is imported lazily
+            # rather than at this file's top level.
+            enable_rtnetlink = True
         if args.adguard_url:
             # Same reasoning as discovery_interval above -- adguard_sync
             # opens its own connection internally, reading the DB
@@ -367,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         health_conn=conn,
         policy_conn=conn,
         discovery_interval=discovery_interval,
+        enable_rtnetlink=enable_rtnetlink,
         adguard_interval=adguard_interval,
         adguard_url=args.adguard_url,
         adguard_username=args.adguard_username,

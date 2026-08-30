@@ -18,12 +18,15 @@ import json
 import os
 import signal
 import socket
+import sys
 import threading
 import time
+import types
 
 import pytest
 
 import discovery
+import rtnetlink_listener
 from ipc_client import Target
 from main import run
 from reconcile import DesiredState
@@ -242,3 +245,117 @@ def test_run_with_discovery_interval_populates_device_bindings_on_a_separate_thr
     ).fetchone()
     assert row is not None, "expected the discovery loop to have recorded the mocked binding"
     assert row["mac_address"] == "aa:bb:cc:dd:ee:99"
+
+
+def test_run_with_enable_rtnetlink_populates_device_bindings_on_a_separate_thread(
+    tmp_path, conn, monkeypatch, restore_signal_handlers
+):
+    """Same shape as the discovery test above, but for
+    controller/rtnetlink_listener.py's live listener (added 2026-08-30)
+    -- a fourth concurrent thread (heartbeat pacer, discovery snapshot
+    disabled here via discovery_interval=None, rtnetlink listener, main
+    reconcile loop), still sharing one process. pyroute2 is faked via
+    sys.modules injection (see test_controller_rtnetlink_listener.py's
+    own comment on why -- it's Linux-only and this suite also runs on
+    this project's Windows dev machine, though this whole file is
+    AF_UNIX-gated anyway)."""
+    fake_module = types.ModuleType("pyroute2")
+
+    class _FakeIPRoute:
+        def __init__(self):
+            self._sent = False
+
+        def bind(self):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def get(self):
+            if not self._sent:
+                self._sent = True
+                return [{
+                    "event": "RTM_NEWNEIGH", "family": socket.AF_INET, "state": 0x02,
+                    "attrs": [("NDA_DST", "192.168.1.51"), ("NDA_LLADDR", "aa:bb:cc:dd:ee:88")],
+                }]
+            raise socket.timeout()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    fake_module.IPRoute = _FakeIPRoute
+    monkeypatch.setitem(sys.modules, "pyroute2", fake_module)
+
+    sock_path = str(tmp_path / "worker.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(sock_path)
+    server.listen(1)
+    server.settimeout(0.5)
+    stop_server = threading.Event()
+
+    def serve():
+        while not stop_server.is_set():
+            try:
+                conn_sock, _ = server.accept()
+            except socket.timeout:
+                continue
+            conn_sock.settimeout(2)
+            try:
+                while True:
+                    try:
+                        req = _read_line(conn_sock)
+                    except (ConnectionError, socket.timeout):
+                        break
+                    if req["op"] == "replace_targets":
+                        _send_line(conn_sock, {
+                            "v": 1, "op": "generation_applied",
+                            "generation": req["generation"],
+                            "target_count": len(req["targets"]),
+                            "resolution_failures": [],
+                        })
+                    elif req["op"] == "heartbeat":
+                        _send_line(conn_sock, {
+                            "v": 1, "op": "heartbeat_ack",
+                            "sequence": req["sequence"], "sent_counters": {},
+                        })
+                    elif req["op"] == "shutdown":
+                        break
+            except (ConnectionError, OSError, socket.timeout):
+                pass
+            finally:
+                conn_sock.close()
+
+    server_thread = threading.Thread(target=serve)
+    server_thread.start()
+
+    def send_sigterm_after_delay():
+        time.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    timer_thread = threading.Thread(target=send_sigterm_after_delay)
+    timer_thread.start()
+
+    try:
+        run(
+            sock_path,
+            _desired_state_provider,
+            heartbeat_interval=0.05,
+            poll_interval=0.05,
+            health_conn=conn,
+            policy_conn=None,
+            enable_rtnetlink=True,
+        )
+    finally:
+        stop_server.set()
+        server_thread.join(timeout=3)
+        timer_thread.join(timeout=3)
+        server.close()
+
+    row = conn.execute(
+        "SELECT mac_address FROM device_bindings WHERE ipv4_address = ?", ("192.168.1.51",)
+    ).fetchone()
+    assert row is not None, "expected the rtnetlink listener to have recorded the fake binding"
+    assert row["mac_address"] == "aa:bb:cc:dd:ee:88"
