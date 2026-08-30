@@ -139,11 +139,24 @@ def test_no_proxy_auth_left_in_intercept_mode():
 def test_ports_are_intercept_mode_not_explicit_proxy():
     """Regression guard: the old explicit-proxy `http_port 3128 ssl-bump`
     must not come back -- it's fundamentally incompatible with NAT-redirected
-    traffic (no CONNECT is ever sent for an intercepted HTTPS connection)."""
+    traffic (no CONNECT is ever sent for an intercepted HTTPS connection).
+
+    `http_port 127.0.0.1:3128` (added 2026-08-30, confirmed live against a
+    real Squid binary) is NOT that port coming back -- it's a deliberate,
+    loopback-only, non-intercept port that exists purely so Squid has a
+    "normal" address to build its own internal URLs from (built-in icons
+    for e.g. FTP listings); without it, an intercept-only Squid FATALs at
+    startup with "mimeLoadIcon: cannot parse internal URL" before ever
+    opening the real intercept listeners. It's never reachable from
+    outside the container and never carries real traffic, so the
+    meaningful guard is "no *explicit ssl-bump proxy* on 3128", not "the
+    digits 3128 never appear in the file" -- see docs/review-2026-08-28.md
+    equivalent write-up in RoadMap.md's live-verification section."""
     text = TEMPLATE_PATH.read_text()
     assert re.search(r"^http_port\s+3129\s+intercept\s*$", text, re.MULTILINE)
     assert re.search(r"^https_port\s+3130\s+intercept\s+ssl-bump\b", text, re.MULTILINE)
-    assert "3128" not in text
+    assert not re.search(r"^http_port\s+3128\s+ssl-bump\b", text, re.MULTILINE)
+    assert re.search(r"^http_port\s+127\.0\.0\.1:3128\s*$", text, re.MULTILINE)
 
 
 def test_ssl_bump_catchall_is_still_terminate_not_splice():
