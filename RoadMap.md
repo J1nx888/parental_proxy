@@ -187,6 +187,43 @@ once intercepted:
 - `quarantine_v4` — an optional, explicitly operator-triggered isolation
   state.
 
+### The core architectural claim, verified live end-to-end (2026-08-30)
+
+Everything above — ARP-spoof a victim, transparently redirect its
+traffic via `nftables`, driven by DB policy — was proven together for
+real, on a Docker bridge network standing in for a real LAN switch (see
+the ARP-worker README for why this, not a cloud VM, is the right free
+substitute). Real processes throughout: `pp-arp-worker`,
+`pp-nftables-manager`, `controller/main.py`, a real SQLite DB, real
+`curl` traffic.
+
+Sequence: a victim container with no route to the interception box at
+all first confirmed to get nothing on the "gateway"'s port 80
+(baseline — nothing was listening there). Then, with the ARP worker
+actively poisoning the victim's cache and the nftables-manager applying
+the victim's `authenticated_v4` membership computed from a real DB row,
+the victim's `curl http://<gateway-ip>/` request — addressed to what it
+still believes is the real gateway — was transparently delivered to a
+local HTTP listener standing in for Squid, returning that listener's
+distinct content. Then, **without stopping or restarting anything** —
+the ARP worker kept poisoning, the controller kept its connection,
+nftables-manager kept its reconcile loop running — the device's
+`is_authenticated` flag was flipped to 0 in the DB. On its next poll
+cycle, nftables-manager moved the victim's IP from `authenticated_v4`
+to `unauthenticated_v4`, and the *same* `curl` request from the *same*
+still-poisoned victim immediately started landing on a second local
+listener standing in for the future login portal instead — proving
+policy reclassification takes effect live, independent of the ARP
+interception layer, exactly matching the "interception scope and
+policy scope are different axes" design decision.
+
+This is the strongest verification available without a real LAN.
+What's still unverified: real Squid/AdGuard behind these redirects
+(as opposed to stand-in HTTP listeners), a real switch's more complex
+behavior (STP, VLANs, actual physical NICs) instead of a Linux bridge,
+and everything the Orbi validation section below calls out (mesh
+roaming, wireless backhaul, satellite-attached clients).
+
 ### Fail-open engineering (a correction to an earlier assumption)
 
 Linux neighbor-cache entries are a state machine, not a fixed TTL — a
