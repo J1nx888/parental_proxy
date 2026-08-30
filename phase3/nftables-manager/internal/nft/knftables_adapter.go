@@ -29,6 +29,16 @@ type Manager struct {
 	nft knftables.Interface
 }
 
+// allManagedSets is every nftables set this package creates and reads
+// -- policy.AllSetNames' four mutually-exclusive classes plus the
+// orthogonal policy.SetBump. Deliberately not the same slice as
+// policy.AllSetNames: that list's contract is "priority-ordered,
+// mutually exclusive" (see its doc comment), which bump_v4 doesn't
+// satisfy, but EnsureBaseline/ReadActual just need "every set this
+// process manages," so they get their own list instead of overloading
+// AllSetNames' meaning.
+var allManagedSets = append(append([]policy.SetName{}, policy.AllSetNames...), policy.SetBump)
+
 // New opens a knftables interface for the `inet` family's
 // "parental_proxy" table. Requires CAP_NET_ADMIN.
 func New() (*Manager, error) {
@@ -39,7 +49,7 @@ func New() (*Manager, error) {
 	return &Manager{nft: nft}, nil
 }
 
-// EnsureBaseline creates the table, the four named sets, and the
+// EnsureBaseline creates the table, the five named sets (allManagedSets), and the
 // prerouting redirect chain if they don't already exist, and
 // (re-)establishes the redirect rules -- fully idempotent, safe to
 // call on every startup regardless of whether the table already has
@@ -63,7 +73,7 @@ func (m *Manager) EnsureBaseline(ctx context.Context) error {
 		Comment: knftables.PtrTo("parental_proxy interception policy -- see RoadMap.md"),
 	})
 
-	for _, name := range policy.AllSetNames {
+	for _, name := range allManagedSets {
 		tx.Add(&knftables.Set{
 			Name:  string(name),
 			Type:  "ipv4_addr",
@@ -93,23 +103,37 @@ func (m *Manager) EnsureBaseline(ctx context.Context) error {
 // baselineRules are the redirect rules from the design skeleton,
 // applied in the order given (evaluation order matters -- bypass must
 // be checked, and short-circuit via `return`, before anything else).
+//
+// Corrected 2026-08-30 for the "two independent axes" architecture
+// (RoadMap.md, locked that date): the old ruleset redirected EVERY
+// authenticated_v4 device's tcp 80/443 to Squid unconditionally, which
+// was wrong -- Squid access is a separate, admin-chosen per-device
+// opt-in (bump_v4), not a consequence of authentication. authenticated_v4
+// now only carries its DNS redirect; bump_v4 independently carries the
+// tcp 80/443 redirect to Squid's intercept ports, and composes with
+// (does not replace) authenticated_v4 -- a device is normally a member
+// of both. Squid itself narrows this all-or-nothing per-device redirect
+// down to specific domains via its own unchanged SNI splice/bump logic
+// (nftables can't see hostnames below the TLS layer, so it can't be
+// selective by domain the way Squid can) -- see RoadMap.md's Squid
+// intercept-mode section.
 var baselineRules = []string{
 	"ip saddr @bypass_v4 return",
+	"ip saddr @bump_v4 tcp dport 80 redirect to :3129",
+	"ip saddr @bump_v4 tcp dport 443 redirect to :3130",
 	"ip saddr @authenticated_v4 udp dport 53 redirect to :5353",
 	"ip saddr @authenticated_v4 tcp dport 53 redirect to :5353",
-	"ip saddr @authenticated_v4 tcp dport 80 redirect to :3129",
-	"ip saddr @authenticated_v4 tcp dport 443 redirect to :3130",
 	"ip saddr @unauthenticated_v4 udp dport 53 redirect to :5353",
 	"ip saddr @unauthenticated_v4 tcp dport 80 redirect to :3131",
 	"ip saddr @quarantine_v4 counter drop",
 }
 
-// ReadActual reads the live membership of all four sets from the
-// kernel -- never cached, matching policy.ActualPolicy's own doc
-// comment on why a reconciler must always read fresh.
+// ReadActual reads the live membership of all five sets (allManagedSets)
+// from the kernel -- never cached, matching policy.ActualPolicy's own
+// doc comment on why a reconciler must always read fresh.
 func (m *Manager) ReadActual(ctx context.Context) (policy.ActualPolicy, error) {
-	actual := make(policy.ActualPolicy, len(policy.AllSetNames))
-	for _, name := range policy.AllSetNames {
+	actual := make(policy.ActualPolicy, len(allManagedSets))
+	for _, name := range allManagedSets {
 		elements, err := m.nft.ListElements(ctx, "set", string(name))
 		if err != nil {
 			return nil, fmt.Errorf("list elements of %s: %w", name, err)

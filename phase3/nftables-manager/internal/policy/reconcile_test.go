@@ -51,8 +51,8 @@ func TestReconcile_MultipleSetsDiffIndependently(t *testing.T) {
 		Quarantine:    []string{"192.168.1.50"},
 	}
 	actual := ActualPolicy{
-		SetAuthenticated: []string{},                 // needs 192.168.1.21 added
-		SetBypass:        []string{"192.168.1.1"},    // desired has none here -> needs removal
+		SetAuthenticated: []string{},              // needs 192.168.1.21 added
+		SetBypass:        []string{"192.168.1.1"}, // desired has none here -> needs removal
 	}
 	diffs := Reconcile(desired, actual)
 
@@ -67,6 +67,29 @@ func TestReconcile_MultipleSetsDiffIndependently(t *testing.T) {
 	}
 	if _, ok := diffs[SetUnauthenticated]; ok {
 		t.Fatalf("unauthenticated should have no diff, got %+v", diffs[SetUnauthenticated])
+	}
+}
+
+func TestReconcile_BumpDiffedIndependentlyOfAuthenticated(t *testing.T) {
+	desired := DesiredPolicy{
+		Authenticated: []string{"192.168.1.21"}, // unchanged from actual
+		Bump:          []string{"192.168.1.21"}, // newly added
+	}
+	actual := ActualPolicy{
+		SetAuthenticated: []string{"192.168.1.21"},
+		SetBump:          []string{},
+	}
+	diffs := Reconcile(desired, actual)
+
+	if _, ok := diffs[SetAuthenticated]; ok {
+		t.Fatalf("expected no diff for authenticated_v4 (unchanged), got %+v", diffs[SetAuthenticated])
+	}
+	d, ok := diffs[SetBump]
+	if !ok {
+		t.Fatal("expected a diff for bump_v4")
+	}
+	if len(d.Add) != 1 || d.Add[0] != "192.168.1.21" {
+		t.Fatalf("expected to add 192.168.1.21 to bump_v4, got %+v", d)
 	}
 }
 

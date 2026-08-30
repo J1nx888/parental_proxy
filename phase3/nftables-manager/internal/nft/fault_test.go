@@ -29,10 +29,10 @@ type listOnlyFake struct {
 	err    error
 }
 
-func (f *listOnlyFake) NewTransaction() *knftables.Transaction                    { return nil }
-func (f *listOnlyFake) Run(ctx context.Context, tx *knftables.Transaction) error  { return nil }
+func (f *listOnlyFake) NewTransaction() *knftables.Transaction                     { return nil }
+func (f *listOnlyFake) Run(ctx context.Context, tx *knftables.Transaction) error   { return nil }
 func (f *listOnlyFake) Check(ctx context.Context, tx *knftables.Transaction) error { return nil }
-func (f *listOnlyFake) ListAll(ctx context.Context) (map[string][]string, error) { return nil, nil }
+func (f *listOnlyFake) ListAll(ctx context.Context) (map[string][]string, error)   { return nil, nil }
 func (f *listOnlyFake) List(ctx context.Context, objectType string) ([]string, error) {
 	return nil, nil
 }
@@ -56,13 +56,13 @@ func TestReadActual_PropagatesListElementsError(t *testing.T) {
 	}
 }
 
-func TestReadActual_ReturnsAllFourSetsEvenWhenEmpty(t *testing.T) {
+func TestReadActual_ReturnsAllFiveSetsEvenWhenEmpty(t *testing.T) {
 	m := &Manager{nft: &listOnlyFake{result: map[string][]*knftables.Element{}}}
 	actual, err := m.ReadActual(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	for _, name := range policy.AllSetNames {
+	for _, name := range allManagedSets {
 		if _, ok := actual[name]; !ok {
 			t.Errorf("expected actual to have an (empty) entry for %s", name)
 		}
@@ -148,14 +148,21 @@ func TestEnsureBaselineThenApplyDiffs_AgainstFake(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadActual (initial): %v", err)
 	}
-	for _, name := range policy.AllSetNames {
+	for _, name := range allManagedSets {
 		if len(actual[name]) != 0 {
 			t.Fatalf("expected set %s to start empty, got %v", name, actual[name])
 		}
 	}
 
-	desired := policy.DesiredPolicy{Authenticated: []string{"192.168.1.21"}}
-	diffs := policy.Reconcile(desired, actual)
+	desired := policy.DesiredPolicy{
+		Authenticated: []string{"192.168.1.21"},
+		Bump:          []string{"192.168.1.21"}, // composes with Authenticated, not exclusive with it
+	}
+	resolved, conflicts := policy.ResolveConflicts(desired)
+	if len(conflicts) != 0 {
+		t.Fatalf("expected no conflicts, got %+v", conflicts)
+	}
+	diffs := policy.Reconcile(resolved, actual)
 	if err := m.ApplyDiffs(ctx, diffs); err != nil {
 		t.Fatalf("ApplyDiffs: %v", err)
 	}
@@ -167,11 +174,14 @@ func TestEnsureBaselineThenApplyDiffs_AgainstFake(t *testing.T) {
 	if got := actual2[policy.SetAuthenticated]; len(got) != 1 || got[0] != "192.168.1.21" {
 		t.Fatalf("expected 192.168.1.21 in authenticated_v4, got %v", got)
 	}
+	if got := actual2[policy.SetBump]; len(got) != 1 || got[0] != "192.168.1.21" {
+		t.Fatalf("expected 192.168.1.21 in bump_v4 too (composes with authenticated_v4), got %v", got)
+	}
 
 	// Re-reconcile against unchanged desired state -- must be a no-op,
 	// same idempotency property verified live against real nftables
 	// earlier.
-	if diffs2 := policy.Reconcile(desired, actual2); len(diffs2) != 0 {
+	if diffs2 := policy.Reconcile(resolved, actual2); len(diffs2) != 0 {
 		t.Fatalf("expected no diffs on unchanged desired state, got %+v", diffs2)
 	}
 }

@@ -10,11 +10,11 @@ import identity
 from policy_state import compute_desired_policy, write_desired_policy
 
 
-def _add_device(conn, mac_address, ignored=0, quarantined_at=None, is_authenticated=1):
+def _add_device(conn, mac_address, ignored=0, quarantined_at=None, is_authenticated=1, bump_enabled=0):
     conn.execute(
-        "INSERT INTO devices (mac_address, ignored, quarantined_at, is_authenticated, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (mac_address, ignored, quarantined_at, is_authenticated, db.now_iso()),
+        "INSERT INTO devices (mac_address, ignored, quarantined_at, is_authenticated, bump_enabled, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (mac_address, ignored, quarantined_at, is_authenticated, bump_enabled, db.now_iso()),
     )
     conn.commit()
     return conn.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_address,)).fetchone()
@@ -26,7 +26,13 @@ def _bind(conn, mac_address, ip):
 
 def test_empty_db_yields_all_empty_sets(conn):
     policy = compute_desired_policy(conn)
-    assert policy == {"authenticated": [], "unauthenticated": [], "bypass": [], "quarantine": []}
+    assert policy == {
+        "authenticated": [],
+        "unauthenticated": [],
+        "bypass": [],
+        "quarantine": [],
+        "bump": [],
+    }
 
 
 def test_authenticated_device_goes_in_authenticated_set(conn):
@@ -35,6 +41,7 @@ def test_authenticated_device_goes_in_authenticated_set(conn):
     policy = compute_desired_policy(conn)
     assert policy["authenticated"] == ["192.168.1.21"]
     assert policy["unauthenticated"] == []
+    assert policy["bump"] == []
 
 
 def test_unauthenticated_device_goes_in_unauthenticated_set(conn):
@@ -57,6 +64,32 @@ def test_quarantined_device_goes_in_quarantine_set(conn):
     _bind(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21")
     policy = compute_desired_policy(conn)
     assert policy["quarantine"] == ["192.168.1.21"]
+
+
+def test_bump_enabled_authenticated_device_is_in_both_authenticated_and_bump(conn):
+    _add_device(conn, "aa:bb:cc:dd:ee:01", is_authenticated=1, bump_enabled=1)
+    _bind(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21")
+    policy = compute_desired_policy(conn)
+    assert policy["authenticated"] == ["192.168.1.21"]
+    assert policy["bump"] == ["192.168.1.21"]
+
+
+def test_bump_enabled_but_unauthenticated_device_is_excluded_from_bump(conn):
+    # Hasn't logged in yet -- no DNS-tier access at all, so it can't be
+    # bump-eligible either, regardless of the admin's bump_enabled flag.
+    _add_device(conn, "aa:bb:cc:dd:ee:01", is_authenticated=0, bump_enabled=1)
+    _bind(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21")
+    policy = compute_desired_policy(conn)
+    assert policy["unauthenticated"] == ["192.168.1.21"]
+    assert policy["bump"] == []
+
+
+def test_bump_enabled_but_ignored_device_is_excluded_from_bump(conn):
+    _add_device(conn, "aa:bb:cc:dd:ee:01", ignored=1, bump_enabled=1)
+    _bind(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21")
+    policy = compute_desired_policy(conn)
+    assert policy["bypass"] == ["192.168.1.21"]
+    assert policy["bump"] == []
 
 
 def test_device_with_no_binding_is_excluded_from_every_set(conn):

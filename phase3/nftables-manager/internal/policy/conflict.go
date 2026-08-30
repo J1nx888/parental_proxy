@@ -13,14 +13,28 @@ type Conflict struct {
 }
 
 // ResolveConflicts returns a DesiredPolicy where every IP appears in at
-// most one set, keeping each conflicting IP only in its
-// highest-priority set (AllSetNames order: bypass > authenticated >
-// unauthenticated > quarantine, matching the design skeleton's
-// prerouting chain evaluation order -- bypass short-circuits via
-// `return` before anything else is checked, so an IP that's also
-// listed in quarantine but belongs in bypass must never be dropped),
-// plus the list of conflicts found so the caller can log them. An
-// empty conflict list means the input was already well-formed.
+// most one of the four mutually-exclusive sets (AllSetNames), keeping
+// each conflicting IP only in its highest-priority set (AllSetNames
+// order: bypass > authenticated > unauthenticated > quarantine,
+// matching the design skeleton's prerouting chain evaluation order --
+// bypass short-circuits via `return` before anything else is checked,
+// so an IP that's also listed in quarantine but belongs in bypass must
+// never be dropped), plus the list of conflicts found so the caller
+// can log them. An empty conflict list means the input was already
+// well-formed.
+//
+// desired.Bump is resolved separately and is NOT part of the four-way
+// exclusivity above -- it composes with Authenticated rather than
+// competing with it (see SetBump's doc comment). Its only precondition
+// is RoadMap.md's hard-deny invariant: a bump-enabled device must also
+// BE an authenticated one, since bump-tier is a refinement of
+// authenticated access, not a standalone class. A bump IP that didn't
+// resolve into Authenticated above (e.g. a device flagged bump_enabled
+// while also ignored or quarantined -- a bug in the caller's own
+// desired-state computation, not something that should happen) is
+// dropped here rather than trusted blindly, with a Conflict recorded
+// (Resolved left as the zero value, meaning "member of no set") so it
+// isn't silently swallowed.
 //
 // Output ordering is deterministic (sorted by IP) so callers -- and
 // this package's own tests -- can compare results without needing an
@@ -53,7 +67,34 @@ func ResolveConflicts(desired DesiredPolicy) (DesiredPolicy, []Conflict) {
 		}
 		resolved = appendIP(resolved, winner, ip)
 	}
+
+	resolved.Bump, conflicts = resolveBump(desired.Bump, resolved.Authenticated, conflicts)
 	return resolved, conflicts
+}
+
+// resolveBump keeps only the bump IPs that are also members of the
+// (already-resolved) authenticated set, deduplicates, sorts, and
+// records a Conflict for anything dropped. Split out from
+// ResolveConflicts for the same reason diffSet is split out in
+// reconcile.go: it's an independent piece of logic with its own
+// precondition, not another branch of the four-way exclusivity above.
+func resolveBump(bump, authenticated []string, conflicts []Conflict) ([]string, []Conflict) {
+	authenticatedSet := toSet(authenticated)
+	seen := make(map[string]bool, len(bump))
+	var kept []string
+	for _, ip := range bump {
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		if !authenticatedSet[ip] {
+			conflicts = append(conflicts, Conflict{IP: ip, Sets: []SetName{SetBump}})
+			continue
+		}
+		kept = append(kept, ip)
+	}
+	sort.Strings(kept)
+	return kept, conflicts
 }
 
 func appendIP(d DesiredPolicy, name SetName, ip string) DesiredPolicy {

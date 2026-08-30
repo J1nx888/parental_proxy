@@ -17,28 +17,54 @@ const (
 	SetUnauthenticated SetName = "unauthenticated_v4"
 	SetBypass          SetName = "bypass_v4"
 	SetQuarantine      SetName = "quarantine_v4"
+
+	// SetBump is the fifth set, added for the "two independent axes"
+	// architecture correction locked in RoadMap.md 2026-08-30:
+	// devices.bump_enabled is a separate, admin-only, per-device opt-in
+	// for Squid/SSL-bump refinement, layered ON TOP of an already
+	// authenticated device -- not a fifth mutually-exclusive policy
+	// class. An IP can (correctly) be a member of both SetAuthenticated
+	// and SetBump at once. Deliberately excluded from AllSetNames below
+	// for exactly that reason -- see its doc comment.
+	SetBump SetName = "bump_v4"
 )
 
 // AllSetNames in the design skeleton's evaluation-order priority --
 // highest priority (checked/short-circuited first in the prerouting
 // chain) to lowest. ResolveConflicts uses this order to decide which
 // set wins when an IP is (incorrectly) requested in more than one.
+//
+// SetBump is NOT included here. This list's whole purpose is driving
+// ResolveConflicts' winner-take-all logic, which assumes membership in
+// one of these sets excludes membership in the others -- that
+// assumption is true for these four (a device is in exactly one) but
+// false for bump_v4, which composes with SetAuthenticated rather than
+// competing with it. See ResolveConflicts' own doc comment for how
+// bump membership is validated instead.
 var AllSetNames = []SetName{SetBypass, SetAuthenticated, SetUnauthenticated, SetQuarantine}
 
 // DesiredPolicy is what the controller wants nftables set membership
-// to be right now, one IPv4 address list per class. Mirrors
-// controller/reconcile.go's DesiredState on the ARP-worker side, but
-// for firewall policy instead of poisoning targets -- a deliberately
-// separate concept, since (per the design doc) interception scope and
-// policy scope are different axes.
+// to be right now, one IPv4 address list per class, plus the
+// independent Bump opt-in list. Mirrors controller/reconcile.go's
+// DesiredState on the ARP-worker side, but for firewall policy instead
+// of poisoning targets -- a deliberately separate concept, since (per
+// the design doc) interception scope and policy scope are different
+// axes.
 type DesiredPolicy struct {
 	Authenticated   []string
 	Unauthenticated []string
 	Bypass          []string
 	Quarantine      []string
+
+	// Bump holds the IPs of bump_enabled devices that are ALSO
+	// authenticated (see ResolveConflicts). Deliberately not part of
+	// the four fields above's mutual exclusivity -- an IP can appear
+	// here and in Authenticated simultaneously.
+	Bump []string
 }
 
-// ByName returns the desired member list for one set.
+// ByName returns the desired member list for one set, including the
+// orthogonal SetBump.
 func (d DesiredPolicy) ByName(name SetName) []string {
 	switch name {
 	case SetAuthenticated:
@@ -49,6 +75,8 @@ func (d DesiredPolicy) ByName(name SetName) []string {
 		return d.Bypass
 	case SetQuarantine:
 		return d.Quarantine
+	case SetBump:
+		return d.Bump
 	default:
 		return nil
 	}

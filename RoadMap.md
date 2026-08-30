@@ -287,36 +287,53 @@ documented feature for exactly this scenario, not something exotic:
 This is a locked architecture decision, not yet implemented — see the
 changes-needed checklist immediately below for the concrete work.
 
-### Changes needed to implement this (not yet started)
+### Changes needed to implement this
 
 Schema: no new columns needed — `devices.is_authenticated` and
 `devices.bump_enabled` already exist from Phase 2. What's missing is
 entirely in the policy-computation and enforcement layers:
 
-- [ ] **`common/policy_class.py`** — `bump_enabled` needs to become a
-      second, independent signal alongside `PolicyClass`, not folded
-      into the same mutually-exclusive enum. A device's *desired
-      policy* is really `(PolicyClass, bump_eligible: bool)`, where
-      `bump_eligible` is only ever true when `PolicyClass ==
-      AUTHENTICATED` and `bump_enabled = 1` and the device isn't
-      ignored.
-- [ ] **`controller/policy_state.py`** — `compute_desired_policy()`
-      needs to also emit a `bump` key (IPs where `bump_eligible` is
-      true) alongside today's four auth-state keys, computed
-      independently — a device's IP can appear in both
-      `authenticated` and `bump` at once.
-- [ ] **`phase3/nftables-manager/internal/policy`** — add a `Bump
-      []string` field to `DesiredPolicy`/`ActualPolicy`. It must be
-      handled independently of `AllSetNames`'s mutual-exclusivity
-      logic in `ResolveConflicts` — a device belonging to both
-      `authenticated_v4` and `bump_v4` simultaneously is correct, not
-      a conflict to resolve.
-- [ ] **`phase3/nftables-manager/internal/nft/knftables_adapter.go`**
-      — `EnsureBaseline`'s `baselineRules`: remove the blanket `ip
-      saddr @authenticated_v4 tcp dport 80/443 redirect to :3129/:3130`
-      rules; add a new `bump_v4` set and its own independent `tcp
-      dport 80/443 redirect` rules, ordered so it composes with (not
-      instead of) the DNS rules `authenticated_v4` still needs.
+- [x] **`common/policy_class.py`** — done 2026-08-30. Added
+      `bump_eligible(device_row)` as a second, independent signal
+      alongside `PolicyClass`, not folded into the mutually-exclusive
+      enum: `bump_eligible` is only ever true when `classify_device()
+      == AUTHENTICATED` *and* `bump_enabled = 1` — re-derives
+      `classify_device()` itself rather than trusting the flag alone,
+      so BYPASS/QUARANTINE/PREAUTH devices can never be bump-eligible
+      even if `bump_enabled` was mistakenly set on one. Unit tests in
+      `tests/test_policy_class.py` cover all four PolicyClass values.
+- [x] **`controller/policy_state.py`** — done 2026-08-30.
+      `compute_desired_policy()` now also emits a `"bump"` key (IPs
+      where `bump_eligible()` is true), computed independently
+      alongside the four `to_set_name()` keys — a device's IP can
+      appear in both `"authenticated"` and `"bump"` at once. Covered in
+      `tests/test_controller_policy_state.py`.
+- [x] **`phase3/nftables-manager/internal/policy`** — done 2026-08-30.
+      Added `SetBump`/`policy.DesiredPolicy.Bump []string`, deliberately
+      excluded from `AllSetNames` (whose whole contract is mutual
+      exclusivity). `ResolveConflicts` now also validates `Bump`
+      against the *resolved* `Authenticated` set — a bump IP that isn't
+      also authenticated is dropped and recorded as a `Conflict`, never
+      trusted blindly. `Reconcile` diffs `Bump` independently. Unit
+      tests in `conflict_test.go`/`reconcile_test.go`.
+- [x] **`phase3/nftables-manager/internal/nft/knftables_adapter.go`** —
+      done 2026-08-30. Removed the blanket `ip saddr @authenticated_v4
+      tcp dport 80/443 redirect to :3129/:3130` rules; `authenticated_v4`
+      now carries only its DNS redirect. Added the `bump_v4` set (via a
+      new `allManagedSets` list, since it's outside `AllSetNames`) and
+      its own independent `ip saddr @bump_v4 tcp dport 80/443 redirect
+      to :3129/:3130` rules, so it composes with (not instead of)
+      `authenticated_v4`'s DNS rules. `EnsureBaseline`/`ReadActual` both
+      updated to manage all five sets. **Verified for real** on the
+      smoke-test VM: `go build`, `go vet`, `gofmt -l`, and `go test
+      -count=5` (including a new end-to-end case in
+      `TestEnsureBaselineThenApplyDiffs_AgainstFake` proving an IP lands
+      in both `authenticated_v4` and `bump_v4` simultaneously against
+      knftables' real in-memory `Fake`) all clean — this is Go logic
+      proven against a real build, not written from memory and left
+      unverified.
+
+Still not started:
 - [ ] **`proxy/squid.conf.template`** — replace the explicit
       `http_port 3128 ssl-bump` + `proxy_auth` block with
       `http_port 3129 intercept` / `https_port 3130 intercept

@@ -5,12 +5,20 @@ being ARP-spoofed at all (spoofing scope is
 controller/desired_state.py's job; this is a different axis, per
 docs/design/phase3-technical-design.md section 5).
 
-Matches phase3/nftables-manager/internal/policy's four sets 1:1 --
-PolicyClass here uses RoadMap.md's own naming (AUTHENTICATED/PREAUTH/
-BYPASS/QUARANTINE); to_set_name() bridges to the nftables set names
+Matches phase3/nftables-manager/internal/policy's four mutually-exclusive
+sets 1:1 -- PolicyClass here uses RoadMap.md's own naming (AUTHENTICATED/
+PREAUTH/BYPASS/QUARANTINE); to_set_name() bridges to the nftables set names
 (authenticated/unauthenticated/bypass/quarantine, matching
 controller/policy_state.py's JSON keys and the Go side's DesiredPolicy
 JSON tags exactly -- keep all three in sync if any changes).
+
+`bump_eligible()` below is a SEPARATE, independent axis added for the
+"two independent axes" architecture correction locked in RoadMap.md
+2026-08-30: devices.bump_enabled is a per-device, admin-only opt-in for
+Squid/SSL-bump refinement, layered on top of an already-authenticated
+device -- not a fifth PolicyClass value. A device can be AUTHENTICATED
+*and* bump_eligible at once; see bump_eligible()'s own doc comment for
+why it is never true for any other PolicyClass.
 """
 from __future__ import annotations
 
@@ -71,3 +79,21 @@ def classify_device(device_row) -> PolicyClass:
     if device_row["is_authenticated"]:
         return PolicyClass.AUTHENTICATED
     return PolicyClass.PREAUTH
+
+
+def bump_eligible(device_row) -> bool:
+    """Whether this device should be a member of nftables' bump_v4 set
+    -- the independent, orthogonal opt-in for Squid/SSL-bump refinement
+    (RoadMap.md's "two independent axes" section, locked 2026-08-30).
+
+    Deliberately re-derives PolicyClass instead of trusting
+    `device_row["bump_enabled"]` alone: the hard-deny invariant this
+    project settled on requires that bump-tier only ever composes with
+    an actually-authenticated device, never with BYPASS, QUARANTINE, or
+    PREAUTH -- e.g. an ignored (BYPASS) device's traffic must never be
+    forced through Squid just because an admin once also checked
+    bump_enabled on it, and a not-yet-logged-in (PREAUTH) device can't
+    be bump-eligible before it even has DNS-tier access. Same
+    `device_row` shape as classify_device() plus `bump_enabled`.
+    """
+    return bool(device_row["bump_enabled"]) and classify_device(device_row) == PolicyClass.AUTHENTICATED

@@ -353,9 +353,22 @@ run against the **original, now-superseded** skeleton above (blanket
 existed. The underlying mechanisms those tests proved — real ARP
 poisoning, real atomic nftables reconciliation, real live policy
 toggling reaching real traffic — all still hold; what changes is only
-*which* set the HTTP/HTTPS redirect rules attach to. Re-verifying
-specifically against `bump_v4` once it's implemented is still
-worthwhile, not assumed to carry over automatically.
+*which* set the HTTP/HTTPS redirect rules attach to.
+
+**Update (2026-08-30, later same day): the `bump_v4` Go logic itself is
+now implemented and verified** — see RoadMap.md's changes-needed
+checklist. `go build`/`go vet`/`gofmt`/`go test -count=5` all pass
+clean on the smoke-test VM, including an end-to-end case (knftables'
+real in-memory `Fake`) proving an IP lands in both `authenticated_v4`
+and `bump_v4` at once, and that `ResolveConflicts` correctly drops a
+bump IP that isn't also authenticated. What this does **not** yet
+cover: a live `--cap-add=NET_ADMIN` container test against a real
+kernel (the way the original blanket-redirect skeleton was verified
+live, per the ARP worker's own README) — the `Fake`-based test proves
+the Go logic is correct, not that the real kernel's `nft` ruleset
+behaves identically. Worth doing once Squid's own side (intercept mode)
+is also in place, so the two can be verified together rather than
+separately.
 
 ---
 

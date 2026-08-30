@@ -74,6 +74,64 @@ func TestResolveConflicts_ConflictRecordsEverySetInPriorityOrder(t *testing.T) {
 	namesEqual(t, conflicts[0].Sets, []SetName{SetBypass, SetQuarantine})
 }
 
+func TestResolveConflicts_BumpPassesThroughWhenAlsoAuthenticated(t *testing.T) {
+	desired := DesiredPolicy{
+		Authenticated: []string{"192.168.1.21"},
+		Bump:          []string{"192.168.1.21"},
+	}
+	resolved, conflicts := ResolveConflicts(desired)
+	if len(conflicts) != 0 {
+		t.Fatalf("expected no conflicts, got %+v", conflicts)
+	}
+	if len(resolved.Authenticated) != 1 || resolved.Authenticated[0] != "192.168.1.21" {
+		t.Fatalf("authenticated set changed unexpectedly: %+v", resolved)
+	}
+	if len(resolved.Bump) != 1 || resolved.Bump[0] != "192.168.1.21" {
+		t.Fatalf("expected bump to also carry the IP, got %+v", resolved.Bump)
+	}
+}
+
+func TestResolveConflicts_BumpDroppedWithoutAuthenticated(t *testing.T) {
+	// A device flagged bump_enabled while also ignored/quarantined (a
+	// bug in the caller's own desired-state computation) must not put
+	// its IP into bump_v4 unguarded -- the hard-deny invariant depends
+	// on bump only ever composing with an actually-authenticated device.
+	desired := DesiredPolicy{
+		Bypass: []string{"192.168.1.5"},
+		Bump:   []string{"192.168.1.5"},
+	}
+	resolved, conflicts := ResolveConflicts(desired)
+	if len(resolved.Bump) != 0 {
+		t.Fatalf("expected bump to be dropped when the IP isn't authenticated, got %+v", resolved.Bump)
+	}
+	found := false
+	for _, c := range conflicts {
+		if c.IP == "192.168.1.5" && len(c.Sets) == 1 && c.Sets[0] == SetBump {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a recorded conflict for the dropped bump IP, got %+v", conflicts)
+	}
+}
+
+func TestResolveConflicts_BumpDeduplicatedAndSorted(t *testing.T) {
+	desired := DesiredPolicy{
+		Authenticated: []string{"192.168.1.10", "192.168.1.20"},
+		Bump:          []string{"192.168.1.20", "192.168.1.10", "192.168.1.20"},
+	}
+	resolved, _ := ResolveConflicts(desired)
+	want := []string{"192.168.1.10", "192.168.1.20"}
+	if len(resolved.Bump) != len(want) {
+		t.Fatalf("resolved.Bump = %v, want %v", resolved.Bump, want)
+	}
+	for i, ip := range want {
+		if resolved.Bump[i] != ip {
+			t.Fatalf("resolved.Bump = %v, want sorted+deduped %v", resolved.Bump, want)
+		}
+	}
+}
+
 func TestResolveConflicts_OutputIsSortedByIP(t *testing.T) {
 	desired := DesiredPolicy{Authenticated: []string{"192.168.1.30", "192.168.1.10", "192.168.1.20"}}
 	resolved, _ := ResolveConflicts(desired)

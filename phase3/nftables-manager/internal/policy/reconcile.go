@@ -26,7 +26,10 @@ func (d SetDiff) Empty() bool {
 //
 // Callers should pass desired through ResolveConflicts first --
 // Reconcile itself does not check for an IP appearing in more than one
-// set.
+// of the four exclusive sets, nor does it re-check Bump's authenticated
+// precondition. SetBump is diffed here alongside the four exclusive
+// sets even though it's outside AllSetNames -- it's still just one more
+// independent set to converge, the same diffSet logic applies.
 func Reconcile(desired DesiredPolicy, actual ActualPolicy) map[SetName]SetDiff {
 	diffs := make(map[SetName]SetDiff)
 	for _, name := range AllSetNames {
@@ -34,6 +37,9 @@ func Reconcile(desired DesiredPolicy, actual ActualPolicy) map[SetName]SetDiff {
 		if !d.Empty() {
 			diffs[name] = d
 		}
+	}
+	if d := diffSet(desired.Bump, actual[SetBump]); !d.Empty() {
+		diffs[SetBump] = d
 	}
 	return diffs
 }
