@@ -60,6 +60,23 @@ type Config struct {
 	Interval          time.Duration
 	CorrectiveRepeats int
 	CorrectiveSpacing time.Duration
+
+	// OnSendError, if non-nil, is called for every ARPSender.Reply()
+	// failure -- added 2026-08-30 after a real, silent failure went
+	// completely unnoticed during this project's first live-container
+	// verification pass (see worker.go's sendGratuitousReply, which
+	// used to just discard the error with `_ = err`): the poisoning
+	// loop applied cleanly, the controller reported success, and
+	// nothing anywhere logged that not a single ARP packet was actually
+	// going out. Optional (nil is fine, matches every existing caller
+	// unchanged) rather than a required constructor parameter, since
+	// this is observability, not a behavior change -- the loop must
+	// still keep running through individual send failures (see this
+	// TODO's own original reasoning, unchanged: a single dropped frame
+	// must not tear down the whole generation). Does not yet escalate
+	// to a controller "fault" IPC message on sustained failure -- see
+	// sendGratuitousReply's own remaining TODO for that.
+	OnSendError func(error)
 }
 
 // DefaultConfig returns conservative placeholder values. See the

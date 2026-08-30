@@ -2,8 +2,10 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -12,8 +14,9 @@ import (
 // Reply call -- it lets the scheduling/switching logic in worker.go be
 // verified with no real NIC, no CAP_NET_RAW, and no OS dependency.
 type fakeSender struct {
-	mu    sync.Mutex
-	calls []replyCall
+	mu       sync.Mutex
+	calls    []replyCall
+	replyErr error // if non-nil, every Reply() call fails with this
 }
 
 type replyCall struct {
@@ -27,7 +30,7 @@ func (f *fakeSender) Reply(senderIP net.IP, senderMAC net.HardwareAddr, dstIP ne
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, replyCall{senderIP, senderMAC, dstIP, dstMAC})
-	return nil
+	return f.replyErr
 }
 
 func (f *fakeSender) Resolve(ip net.IP) (net.HardwareAddr, error) {
@@ -151,4 +154,63 @@ func TestApplyGeneration_LeavingTargetGetsCorrective(t *testing.T) {
 	}
 
 	w.Shutdown()
+}
+
+// TestApplyGeneration_ReportsSendFailuresViaOnSendError guards against
+// the real bug found 2026-08-30 during this project's first live-
+// container verification pass: a sender that fails on every call
+// (confirmed live to be exactly what a misconfigured raw-socket setup
+// looks like) used to fail completely silently -- the controller still
+// reported "generation applied," nothing anywhere logged that not one
+// ARP packet was actually reaching the wire. Config.OnSendError exists
+// specifically so a caller (cmd/pp-arp-worker/main.go) can surface this.
+func TestApplyGeneration_ReportsSendFailuresViaOnSendError(t *testing.T) {
+	fs := &fakeSender{replyErr: errors.New("simulated: operation not permitted")}
+	selfMAC := mustMAC("02:00:00:00:00:01")
+
+	var errCount int64
+	cfg := Config{Interval: 5 * time.Millisecond, CorrectiveRepeats: 1, CorrectiveSpacing: time.Millisecond}
+	cfg.OnSendError = func(err error) {
+		atomic.AddInt64(&errCount, 1)
+	}
+	w := New(fs, selfMAC, cfg)
+
+	gw := Target{IP: net.ParseIP("192.168.1.1"), MAC: mustMAC("02:00:00:00:00:02")}
+	target := Target{IP: net.ParseIP("192.168.1.22"), MAC: mustMAC("02:00:00:00:00:04")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w.ApplyGeneration(ctx, Generation{ID: 1, Gateway: gw, Targets: []Target{target}})
+	time.Sleep(20 * time.Millisecond)
+	w.Shutdown()
+
+	if atomic.LoadInt64(&errCount) == 0 {
+		t.Error("expected OnSendError to have been called at least once for a sender that always fails")
+	}
+	// The generation must keep running through send failures -- the
+	// fake sender still recorded every attempted call even though each
+	// one "failed."
+	if len(fs.snapshot()) == 0 {
+		t.Error("expected the poisoning loop to keep attempting sends despite failures, not stop after the first")
+	}
+}
+
+// TestApplyGeneration_NilOnSendErrorIsSafe guards the zero-value case --
+// every existing caller before this field existed gets Config{} with
+// OnSendError left nil, which must not panic on a send failure.
+func TestApplyGeneration_NilOnSendErrorIsSafe(t *testing.T) {
+	fs := &fakeSender{replyErr: errors.New("simulated failure")}
+	selfMAC := mustMAC("02:00:00:00:00:01")
+	w := New(fs, selfMAC, Config{Interval: 5 * time.Millisecond, CorrectiveRepeats: 1, CorrectiveSpacing: time.Millisecond})
+
+	gw := Target{IP: net.ParseIP("192.168.1.1"), MAC: mustMAC("02:00:00:00:00:02")}
+	target := Target{IP: net.ParseIP("192.168.1.22"), MAC: mustMAC("02:00:00:00:00:04")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w.ApplyGeneration(ctx, Generation{ID: 1, Gateway: gw, Targets: []Target{target}})
+	time.Sleep(15 * time.Millisecond)
+	w.Shutdown() // must not panic
 }

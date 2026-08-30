@@ -56,6 +56,9 @@ func main() {
 	defer sender.Close()
 
 	cfg := worker.DefaultConfig() // placeholder constants -- see RoadMap.md section 8
+	cfg.OnSendError = func(err error) {
+		log.Printf("ARP send failed (worker keeps running, see worker.Config.OnSendError's own doc comment): %v", err)
+	}
 	w := worker.New(sender, ifi.HardwareAddr, cfg)
 
 	h := &controllerHandler{worker: w}

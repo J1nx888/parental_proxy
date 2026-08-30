@@ -117,13 +117,15 @@ func (w *Worker) runGeneration(ctx context.Context, stopped chan struct{}, gen G
 
 func (w *Worker) sendGratuitousReply(senderIP net.IP, senderMAC net.HardwareAddr, dstIP net.IP, dstMAC net.HardwareAddr) {
 	if err := w.sender.Reply(senderIP, senderMAC, dstIP, dstMAC); err != nil {
+		if w.cfg.OnSendError != nil {
+			w.cfg.OnSendError(err)
+		}
 		// TODO(Milestone 2 hardening): a single dropped frame
-		// shouldn't tear down the whole generation, but sustained
-		// failure should feed a controller "fault" IPC message
-		// (internal/ipc/protocol.go) instead of being silently
-		// swallowed forever. Needs a logger/metrics hook threaded
-		// through from main.go.
-		_ = err
+		// shouldn't tear down the whole generation (unchanged --
+		// still true, still the right call), but SUSTAINED failure
+		// should still escalate to a controller "fault" IPC message
+		// (internal/ipc/protocol.go), not just a log line. Needs a
+		// failure-rate/consecutive-failure counter, not built here.
 	}
 }
 
