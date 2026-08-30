@@ -159,6 +159,106 @@ def test_run_reconnects_after_worker_dies_then_shuts_down_cleanly(tmp_path, conn
     )
 
 
+def test_run_reconnects_when_only_the_heartbeat_notices_a_dead_worker(
+    tmp_path, conn, restore_signal_handlers
+):
+    """A real gap found 2026-08-30 during this project's first live-
+    container verification pass: _desired_state_provider() below always
+    returns the SAME DesiredState, so after the first successful
+    replace_targets, reconcile() correctly returns None on every later
+    cycle (nothing changed, nothing to send) -- run_cycle() therefore
+    never touches the connection again at all. If the worker dies at
+    that point, only the heartbeat pacer -- which touches the
+    connection every single cycle regardless of desired state -- can
+    ever notice. This is exactly what happened live: `docker restart`
+    on the arp-worker container left the controller heartbeating into a
+    dead pipe indefinitely, since heartbeat failures used to only be
+    logged, never acted on.
+    """
+    sock_path = str(tmp_path / "worker.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(sock_path)
+    server.listen(1)
+    server.settimeout(0.5)
+
+    connection_count = 0
+    stop_server = threading.Event()
+
+    def serve():
+        nonlocal connection_count
+        while not stop_server.is_set():
+            try:
+                conn_sock, _ = server.accept()
+            except socket.timeout:
+                continue
+            connection_count += 1
+            first_connection = connection_count == 1
+            conn_sock.settimeout(2)
+            heartbeats_answered = 0
+            try:
+                while True:
+                    try:
+                        req = _read_line(conn_sock)
+                    except (ConnectionError, socket.timeout):
+                        break
+                    if req["op"] == "replace_targets":
+                        _send_line(conn_sock, {
+                            "v": 1, "op": "generation_applied",
+                            "generation": req["generation"],
+                            "target_count": len(req["targets"]),
+                            "resolution_failures": [],
+                        })
+                    elif req["op"] == "heartbeat":
+                        if first_connection and heartbeats_answered >= 2:
+                            # Simulate the worker dying silently mid-lease,
+                            # with desired state never having changed --
+                            # no more replace_targets is ever coming, so
+                            # this is the ONLY signal a dead worker gets a
+                            # chance to produce.
+                            break
+                        heartbeats_answered += 1
+                        _send_line(conn_sock, {
+                            "v": 1, "op": "heartbeat_ack",
+                            "sequence": req["sequence"], "sent_counters": {},
+                        })
+                    elif req["op"] == "shutdown":
+                        break
+            except (ConnectionError, OSError, socket.timeout):
+                pass
+            finally:
+                conn_sock.close()
+
+    server_thread = threading.Thread(target=serve)
+    server_thread.start()
+
+    def send_sigterm_after_delay():
+        time.sleep(1.5)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    timer_thread = threading.Thread(target=send_sigterm_after_delay)
+    timer_thread.start()
+
+    try:
+        run(
+            sock_path,
+            _desired_state_provider,  # always the same DesiredState -- see docstring
+            heartbeat_interval=0.1,
+            poll_interval=0.15,
+            health_conn=conn,
+            policy_conn=None,
+        )
+    finally:
+        stop_server.set()
+        server_thread.join(timeout=3)
+        timer_thread.join(timeout=3)
+        server.close()
+
+    assert connection_count >= 2, (
+        f"expected the heartbeat failure alone to trigger a reconnect, "
+        f"saw only {connection_count} connection(s)"
+    )
+
+
 def test_run_with_discovery_interval_populates_device_bindings_on_a_separate_thread(
     tmp_path, conn, monkeypatch, restore_signal_handlers
 ):

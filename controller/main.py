@@ -33,6 +33,7 @@ import logging
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -152,6 +153,33 @@ def run(
     possibly skipping a resend because desired state happens not to
     have changed since the connection dropped.
 
+    **This reconnect path is also triggered by a failed heartbeat, not
+    just a failed run_cycle() (added 2026-08-30, a real gap found during
+    this project's first live-container verification pass)**: if
+    desired state never changes across a worker restart, run_cycle()'s
+    own reconcile() correctly returns None every time (nothing new to
+    send) and never touches the connection at all -- with an unchanging
+    desired state, a dead worker could previously go undetected
+    indefinitely, since the heartbeat pacer's own failures were only
+    ever logged, never acted on. The heartbeat pacer is the one thing
+    that touches the connection every single cycle regardless of
+    desired state, which is what makes it the thing that actually
+    notices. `heartbeat_worker_dead` (a threading.Event set by the
+    pacer's on_error callback, checked at the top of the main loop)
+    routes a heartbeat-detected failure through the exact same
+    `_reconnect()` codepath run_cycle()'s own WorkerConnectionError
+    uses, rather than duplicating the reconnect logic.
+
+    Known race, accepted rather than fixed here given the scope of this
+    pass: the heartbeat pacer runs on its own thread and reads `client`
+    from this closure at call time. If it fires in the narrow window
+    between closing a dead client and a fresh one being assigned, its
+    heartbeat call raises AttributeError on None -- HeartbeatPacer's own
+    broad exception handling logs it via on_error rather than crashing,
+    so this is a harmless, if noisy, cosmetic race, not a correctness
+    bug. A future pass could add a lock around client reads/writes if
+    the noise proves annoying in practice.
+
     Known race, accepted rather than fixed here given the scope of this
     pass: the heartbeat pacer runs on its own thread and reads `client`
     from this closure at call time. If it fires in the narrow window
@@ -180,11 +208,28 @@ def run(
         client.heartbeat(sequence)
         sdnotify.watchdog()  # a successful heartbeat round-trip IS this process's own liveness signal
 
-    pacer = HeartbeatPacer(
-        heartbeat_interval,
-        _send_heartbeat,
-        on_error=lambda exc: log.warning("heartbeat failed: %s", exc),
-    )
+    # Set by the heartbeat pacer's own error callback below when a
+    # heartbeat fails with WorkerConnectionError -- checked at the top
+    # of the main loop to trigger the exact same reconnect path
+    # run_cycle()'s own WorkerConnectionError handling uses. Added
+    # 2026-08-30 after a real gap found during this project's first
+    # live-container verification pass: if desired state never changes
+    # across a worker restart, run_cycle() never touches the connection
+    # at all (by design -- reconcile() returns None, nothing to send),
+    # so a dead worker was previously only ever noticed by whichever
+    # thread happened to actually try using the socket next -- which,
+    # with an unchanging desired state, could be never. The heartbeat
+    # pacer is the one thing that ALWAYS touches the connection every
+    # cycle regardless of desired state, making it the right place to
+    # actually detect this.
+    heartbeat_worker_dead = threading.Event()
+
+    def _on_heartbeat_error(exc: Exception) -> None:
+        log.warning("heartbeat failed: %s", exc)
+        if isinstance(exc, WorkerConnectionError):
+            heartbeat_worker_dead.set()
+
+    pacer = HeartbeatPacer(heartbeat_interval, _send_heartbeat, on_error=_on_heartbeat_error)
     pacer.start()
 
     discovery_task = None
@@ -212,21 +257,29 @@ def run(
 
     sdnotify.ready()
 
+    def _reconnect(reason: str) -> None:
+        nonlocal client, applied
+        log.warning("worker connection lost (%s) -- attempting to reconnect", reason)
+        if health_conn is not None:
+            health.report_fail_open(health_conn, f"worker connection lost: {reason}")
+        client.close()
+        try:
+            client = WorkerClient.connect(socket_path)
+            applied = None
+            log.info("reconnected to worker")
+        except OSError as reconnect_exc:
+            log.warning("reconnect attempt failed, will retry next cycle: %s", reconnect_exc)
+
     try:
         while not stop:
-            try:
-                applied = run_cycle(client, desired_state_provider, applied, health_conn, policy_conn)
-            except WorkerConnectionError as exc:
-                log.warning("worker connection lost (%s) -- attempting to reconnect", exc)
-                if health_conn is not None:
-                    health.report_fail_open(health_conn, f"worker connection lost: {exc}")
-                client.close()
+            if heartbeat_worker_dead.is_set():
+                heartbeat_worker_dead.clear()
+                _reconnect("detected via a failed heartbeat")
+            else:
                 try:
-                    client = WorkerClient.connect(socket_path)
-                    applied = None
-                    log.info("reconnected to worker")
-                except OSError as reconnect_exc:
-                    log.warning("reconnect attempt failed, will retry next cycle: %s", reconnect_exc)
+                    applied = run_cycle(client, desired_state_provider, applied, health_conn, policy_conn)
+                except WorkerConnectionError as exc:
+                    _reconnect(str(exc))
             time.sleep(poll_interval)
     finally:
         pacer.stop()
