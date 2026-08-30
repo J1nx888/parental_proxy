@@ -57,14 +57,17 @@ adguard/                      AdGuard Home container (Phase 3, added 2026-08-30)
   entrypoint.sh                  automated first-run bootstrap via AdGuard's own
                                   /control/install/configure API -- no manual setup wizard
 
-docker-compose.yml             three services (proxy, adguard, dashboard) -- proxy and adguard
-                                run with network_mode: host (see docker-compose.yml's own comment:
-                                required for nftables' redirect + SO_ORIGINAL_DST/per-client DNS
-                                matching to work at all -- a bridge-networked container is a
-                                different network namespace from where phase3/nftables-manager's
-                                redirect actually fires); dashboard alone stays on the default
-                                bridge network, published via DASHBOARD_BIND. proxy and dashboard
-                                share the pp_config volume; adguard has its own separate
+docker-compose.yml             three services (proxy, adguard, dashboard), ALL THREE run with
+                                network_mode: host (see docker-compose.yml's own comments) --
+                                proxy/adguard need it so nftables' redirect + SO_ORIGINAL_DST/
+                                per-client DNS matching work at all (a bridge-networked container
+                                is a different network namespace from where phase3/nftables-
+                                manager's redirect actually fires); dashboard needs it (added
+                                2026-08-30) to reach AdGuard's loopback-bound admin API for its
+                                filter-refresh button. Each service's own app-level bind address
+                                (DASHBOARD_BIND/ADGUARD_WEB_BIND) is what gates LAN exposure now,
+                                not a Docker port-publish mapping. proxy and dashboard share the
+                                pp_config volume; adguard has its own separate
                                 pp_adguard_conf/pp_adguard_work volumes.
 ```
 
@@ -402,13 +405,18 @@ back to the raw id).
 
 ## 7. Dashboard (`dashboard/dashboard.py`)
 
-Single-file Flask app (~1100 lines), imports `auth`, `cr_api`, `db`,
-`matching` from `common/` (via `sys.path.insert(0, str(Path(__file__).parent))`,
-since the Dockerfile copies `common/*.py` flat into `/app/` alongside
-`dashboard.py`). Served by `waitress.serve()` in `main()`, not Flask's dev
-server, bound to `DASHBOARD_HOST`/`DASHBOARD_PORT` (default `127.0.0.1:8787`,
-overridden to `0.0.0.0` by `docker-compose.yml`, with host exposure actually
-controlled at the Docker port-mapping level via `DASHBOARD_BIND`).
+Single-file Flask app (~1100 lines), imports `adguard_client`, `auth`,
+`cr_api`, `db`, `matching` from `common/` (via
+`sys.path.insert(0, str(Path(__file__).parent))`, since the Dockerfile
+copies `common/*.py` flat into `/app/` alongside `dashboard.py`). Served
+by `waitress.serve()` in `main()`, not Flask's dev server, bound to
+`DASHBOARD_HOST`/`DASHBOARD_PORT` (default `127.0.0.1:8787`). Since
+2026-08-30 `dashboard` runs `network_mode: host` (needed so it can reach
+AdGuard's loopback-bound admin API for the filter-refresh button below),
+so `DASHBOARD_HOST` is set directly from `DASHBOARD_BIND` in
+`docker-compose.yml` and IS the actual host-exposure control now --
+before that, `DASHBOARD_HOST` was hardcoded to `0.0.0.0` and a separate
+Docker port-publish mapping controlled host exposure instead.
 
 Route groups (see the numbered `# ====` section banners in the file):
 - **Admin auth**: `bootstrap_admin()` seeds `admin_username`/

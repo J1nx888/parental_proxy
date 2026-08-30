@@ -393,9 +393,10 @@ must be added here manually today.
 ### Settings (`/settings`)
 
 - `GET /settings` -> `settings_page()` -- reads `local_network`,
-  `admin_username`, `block_page_mode` (default `"terminate"`) settings.
-  Renders `SETTINGS_BODY`. (Never reads or displays
-  `admin_password_hash` -- the password field is always blank/write-only.)
+  `admin_username`, `block_page_mode` (default `"terminate"`),
+  `adguard_url`, `adguard_username` settings. Renders `SETTINGS_BODY`.
+  (Never reads or displays `admin_password_hash` or `adguard_password`
+  -- both password fields are always blank/write-only.)
 - `POST /settings/local-network` -> `update_local_network()` -- form field
   `local_network` (space-separated CIDRs). No format validation beyond
   `.strip()` -- an invalid CIDR just fails silently at match time in
@@ -409,6 +410,19 @@ must be added here manually today.
   leaving it blank keeps the current password hash). Updates
   `admin_username` unconditionally; only rehashes and updates
   `admin_password_hash` if a new password was actually submitted.
+- `POST /settings/adguard` -> `update_adguard_settings()` -- form fields
+  `adguard_url`, `adguard_username` (required, non-empty),
+  `adguard_password` (optional -- leaving it blank keeps the current
+  value, same pattern as `/settings/admin` above, except this one stores
+  the password in plaintext since it has to be replayed as HTTP Basic
+  Auth against AdGuard's own API, not verified locally). Seeded on first
+  run from `ADGUARD_URL`/`ADGUARD_USERNAME`/`ADGUARD_PASSWORD` (added
+  2026-08-30).
+- `POST /settings/adguard/refresh` -> `refresh_adguard_filters()` --
+  calls `adguard_client.refresh_filters()` with the stored connection
+  settings. Flashes an error (not a 500) if the settings are incomplete
+  or AdGuard is unreachable; otherwise flashes how many filter lists had
+  new content (0 is a normal, healthy result). Added 2026-08-30.
 
 ## Notable UI/UX behaviors
 

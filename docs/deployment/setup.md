@@ -116,10 +116,14 @@ Three services, defined in `docker-compose.yml` at the project root:
   application data.
 - **`dashboard`** (container name `parental-proxy-dashboard`, built from
   `dashboard/Dockerfile`) — the Flask web UI (`dashboard/dashboard.py`).
-  Listens on port `8787`, run as the `proxy` user (Debian uid 13). Stays
-  on the default bridge network, published via `DASHBOARD_BIND` — it
-  doesn't participate in traffic interception, so it has no reason to
-  need host networking.
+  Listens on port `8787`, run as the `proxy` user (Debian uid 13). Also
+  `network_mode: host` since 2026-08-30 — not for traffic interception
+  (it doesn't do any), but because its Settings page needs to reach
+  AdGuard's admin API at `127.0.0.1:3000`, which a loopback-bound socket
+  only accepts from within the same network namespace (see
+  [Networking notes](#networking-notes)). `DASHBOARD_BIND` now feeds
+  directly into `DASHBOARD_HOST`, the app's own listen address, instead
+  of a Docker port-publish mapping.
 
 `proxy` and `dashboard` mount the same named volume, **`pp_config`**, at
 **`/config`** in each container. That's where the shared SQLite database
@@ -177,17 +181,19 @@ the dashboard container).
 | `LOCAL_NETWORK` | proxy + dashboard | LAN CIDR(s) allowed to use the proxy, space-separated if more than one. Seeded into the DB once on first run (`db.set_setting_if_absent`); editable afterward from the dashboard's Settings page without restarting. | `192.168.1.0/24` |
 | `DASHBOARD_USER` | dashboard | Admin login username. Only read on first run to seed the account; editable from Settings afterward. | `admin` |
 | `DASHBOARD_PASSWORD` | dashboard | Admin login password. Only read on first run. If left blank, the dashboard generates a random password on first start and prints it to its own container logs. | (blank → auto-generated) |
-| `DASHBOARD_BIND` | host bind, via `docker-compose.yml`'s port mapping (`${DASHBOARD_BIND:-127.0.0.1}:8787:8787`) | Which host interface the dashboard's port 8787 is published on. `127.0.0.1` = this machine only (use SSH port-forwarding for remote access); `0.0.0.0` = reachable from any device on the LAN. | `127.0.0.1` |
+| `DASHBOARD_BIND` | `docker-compose.yml`, feeds directly into `DASHBOARD_HOST` below | Which address the dashboard's own Flask app listens on. `127.0.0.1` = this machine only (use SSH port-forwarding for remote access); `0.0.0.0` = reachable from any device on the LAN. Since 2026-08-30 (`dashboard` runs `network_mode: host`, see [Two/Three-container architecture](#three-container-architecture)) this is the app's own bind address, not a Docker port-publish mapping. | `127.0.0.1` |
 | `DASHBOARD_URL` | proxy (`entrypoint.sh` appends a `deny_info` line to `squid.conf` when set) | If set (e.g. `http://192.168.1.50:8787`), blocked bump-mode requests redirect to a friendly explanation page (`${DASHBOARD_URL}/blocked`) instead of a bare connection error. Only applies to bump-mode domains — splice-mode blocks never show a page. Leave blank to skip. | (blank) |
-| `DASHBOARD_HOST` | dashboard | Bind address *inside* the dashboard container. Hardcoded to `0.0.0.0` in `docker-compose.yml` (not read from `.env`) so the container itself always listens on all interfaces; it's the host-side `DASHBOARD_BIND` port mapping that actually controls external reachability. | `0.0.0.0` (fixed in compose file) |
+| `DASHBOARD_HOST` | dashboard | Bind address the dashboard container's Flask app actually listens on. Set in `docker-compose.yml` to `${DASHBOARD_BIND:-127.0.0.1}` (see that row above) -- prior to 2026-08-30 this was hardcoded to `0.0.0.0` and a separate port-publish mapping controlled reachability instead. | `${DASHBOARD_BIND:-127.0.0.1}` |
 | `PP_DB_PATH` | dashboard (and set internally by `proxy/entrypoint.sh` for its own process) | Path to the shared SQLite database file inside the container. Hardcoded in `docker-compose.yml`'s dashboard environment block to the shared-volume path. | `/config/parental_proxy.db` |
 | `PP_CA_CERT_PATH` | dashboard | Path to the generated CA certificate, used by the dashboard's CA-download endpoint (Users page download link). Hardcoded in `docker-compose.yml`. | `/config/ssl_cert/ca_cert.pem` |
 | `CA_ORG` | proxy (`entrypoint.sh`) | Organization name (`/O=`) baked into the generated CA certificate's subject. Not present in `.env.example`; set it directly in `docker-compose.yml`'s proxy environment block or as a shell-exported var if you want to override it. | `Parental Proxy` |
 | `CA_COMMON_NAME` | proxy (`entrypoint.sh`) | Common name (`/CN=`) baked into the generated CA certificate's subject. Same override mechanism as `CA_ORG`. | `Parental Proxy CA` |
-| `ADGUARD_USERNAME` | adguard (`adguard/entrypoint.sh`, first run only) | AdGuard Home's own admin login username -- a separate account from this project's dashboard. | `admin` |
-| `ADGUARD_PASSWORD` | adguard (`adguard/entrypoint.sh`, first run only) | AdGuard Home's own admin login password. If left blank, a random one is generated and printed to the adguard container's own logs (`docker compose logs adguard`). Must match whatever `controller/main.py --adguard-password` is later run with. | (blank → auto-generated) |
+| `ADGUARD_USERNAME` | adguard (first-run bootstrap) + dashboard (seeds a matching DB setting, only consumed once) | AdGuard Home's own admin login username -- a separate account from this project's dashboard. | `admin` |
+| `ADGUARD_PASSWORD` | adguard (first-run bootstrap) + dashboard (seeds a matching DB setting, only consumed once) | AdGuard Home's own admin login password. If left blank, a random one is generated and printed to the adguard container's own logs (`docker compose logs adguard`) -- the dashboard won't know it either in that case; paste it into the dashboard's Settings page by hand. Must also match whatever `controller/main.py --adguard-password` is later run with. | (blank → auto-generated) |
 | `ADGUARD_WEB_BIND` | adguard (`adguard/entrypoint.sh`, first run only) | Which address AdGuard Home's own admin UI binds to. `127.0.0.1` = this machine only; `0.0.0.0` = reachable from any device on the LAN. Independent of `DASHBOARD_BIND` -- this gates a second, separate admin login surface. | `127.0.0.1` |
 | `ADGUARD_SKIP_EXTRA_BLOCKLISTS` | adguard (`adguard/entrypoint.sh`, first run only) | Set to `1` to skip subscribing to the curated uBlockOrigin/uAssets domain-blocking lists (added 2026-08-30) and keep only AdGuard Home's own default filter (enabled automatically, no action needed for that part). See RoadMap.md's live-verification section for exactly which lists and why. | (blank -> lists added) |
+| `ADGUARD_FILTERS_UPDATE_INTERVAL_HOURS` | adguard (`adguard/entrypoint.sh`, first run only) | How often AdGuard itself re-checks every subscribed filter list, in hours -- `168` = once a week (AdGuard's own "Once a week" UI preset). Independent of the dashboard's "Check for filter updates now" button, which works on demand regardless. | `168` |
+| `ADGUARD_URL` | dashboard, only consumed once to seed the same-named DB setting | Where the dashboard reaches AdGuard Home's control API for its "Check for filter updates now" button. Both run `network_mode: host`, so this is just the loopback address unless AdGuard is ever moved elsewhere. Editable afterward from the dashboard's own Settings page. | `http://127.0.0.1:3000` |
 
 Notes:
 - `DASHBOARD_HOST`, `PP_DB_PATH`, and `PP_CA_CERT_PATH` are not meant to be
@@ -253,9 +259,14 @@ a bridge-networked container is a different namespace (see RoadMap.md's
 live-verification section for the full writeup). This is Linux-only —
 Docker Desktop (Windows/Mac) doesn't support `network_mode: host` the
 same way, so local development/testing there still needs the
-`LOCAL_NETWORK`-blank workaround below. `dashboard` is unaffected and
-stays on the default bridge network, since it doesn't participate in
-any traffic interception.
+`LOCAL_NETWORK`-blank workaround below. `dashboard` also runs
+`network_mode: host` as of 2026-08-30 -- not for traffic interception
+(it does none), but because its Settings page needs to reach AdGuard's
+admin API at `127.0.0.1:3000`, and a loopback-bound socket only accepts
+connections from within the exact same network namespace (confirmed
+live: `host.docker.internal`/`extra_hosts` doesn't work around this --
+that arrives via a bridge-facing address, a genuinely different source
+than `127.0.0.1`).
 
 `LOCAL_NETWORK` (the LAN CIDR check) has a platform-dependent caveat,
 documented in `.env.example`:
@@ -285,9 +296,9 @@ documented in `.env.example`:
 
 ## Port mappings
 
-With `network_mode: host`, `proxy` and `adguard`'s ports bind directly to
+With `network_mode: host`, all three services' ports bind directly to
 the host's own interfaces — there's no compose-level port mapping to look
-at for them, only what each service's own config asks for.
+at for any of them, only what each service's own config asks for.
 
 | Port | Service | Reachable from | Notes |
 |---|---|---|---|
@@ -296,7 +307,7 @@ at for them, only what each service's own config asks for.
 | `3130` | proxy | all host interfaces | Squid's intercept-mode HTTPS/SSL-Bump port (`https_port 3130 intercept ssl-bump ...`). Same NAT-redirect model as 3129. |
 | `3000` | adguard | `ADGUARD_WEB_BIND` (default `127.0.0.1`) | AdGuard Home's own admin UI — a separate login from this project's dashboard. Defaults to loopback-only for the same reason `DASHBOARD_BIND` does; set `ADGUARD_WEB_BIND=0.0.0.0` to expose it on the LAN. |
 | `5353` | adguard | all host interfaces | AdGuard Home's DNS listener — the redirect target for `phase3/nftables-manager`'s `authenticated_v4`/`unauthenticated_v4` DNS rules once deployed. |
-| `8787` | dashboard | `"${DASHBOARD_BIND:-127.0.0.1}:8787:8787"` (bridge network, published) | Flask dashboard. Bound only to `127.0.0.1` on the host by default — **not LAN-reachable** unless `DASHBOARD_BIND=0.0.0.0` is set (see the `DASHBOARD_BIND` row above). Remote access to a `127.0.0.1`-bound dashboard requires SSH port-forwarding. |
+| `8787` | dashboard | `DASHBOARD_BIND` (default `127.0.0.1`) | Flask dashboard. Bound only to `127.0.0.1` on the host by default — **not LAN-reachable** unless `DASHBOARD_BIND=0.0.0.0` is set (see the `DASHBOARD_BIND` row above). Remote access to a `127.0.0.1`-bound dashboard requires SSH port-forwarding. |
 
 ## CI
 

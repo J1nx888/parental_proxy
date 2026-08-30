@@ -651,6 +651,59 @@ counts as the probe, and real ad/tracker domains
 suite re-confirmed clean (389 passed) afterward; VM left at a clean
 `docker compose down -v` state.
 
+### Filter-list update checking: weekly auto-refresh + an admin "check now" button (2026-08-30)
+
+User asked for a way to keep the ad-block lists above current -- a
+periodic check (weekly) plus an admin-triggerable manual check. Used
+AdGuard Home's own built-in mechanisms rather than reimplementing
+update-checking in this project's own code, since it already has a
+mature one: `adguard/entrypoint.sh` now also calls
+`/control/filtering/config` once during first-run bootstrap
+(`interval=168`, confirmed live to be accepted and echoed back exactly
+by `/control/filtering/status`, matching AdGuard's own "Once a week" UI
+preset) -- this is AdGuard's own background schedule, not something
+worth duplicating. `common/adguard_client.py` gained
+`set_filters_update_interval()` (used by the above) and
+`refresh_filters()` (POST `/control/filtering/refresh`, confirmed live
+safe to call as often as wanted, per AdGuard's own docs) for the
+"whenever the admin wants" half.
+
+The dashboard's Settings page gained a new card: a "Check for filter
+updates now" button, plus an editable AdGuard connection-settings form
+(URL/username/password) bootstrapped from the same `ADGUARD_*` env vars
+the `adguard` container itself uses -- editable afterward exactly like
+the dashboard's own admin login, specifically so an operator who left
+`ADGUARD_PASSWORD` blank (auto-generated, printed only to the `adguard`
+container's own logs) can paste it in by hand once and have it work
+from then on.
+
+**Found and fixed a real networking conflict working this out**:
+AdGuard's admin UI defaults to `127.0.0.1`-only (`ADGUARD_WEB_BIND`, a
+deliberate secure default from the pass immediately before this one) --
+a loopback-bound socket only accepts connections from within the exact
+same network namespace, so the (until now) bridge-networked `dashboard`
+container could never have reached it at all, not even via
+`host.docker.internal`/`extra_hosts` (that arrives through a
+bridge-facing address, a genuinely different source than `127.0.0.1` as
+far as a strict loopback bind is concerned). Fixed by giving `dashboard`
+`network_mode: host` too, matching `proxy`/`adguard` -- its own
+`DASHBOARD_HOST` now takes over what the old port-mapping's bind
+address used to control, the same "app's own listen address gates LAN
+exposure under host networking" pattern already established for
+`ADGUARD_WEB_BIND`. Worth remembering: every time a new inter-service
+call gets added to this stack, host networking's reachability rules
+need rechecking -- they're not the same as bridge networking's.
+
+**Verified live end-to-end** through the real `docker compose` flow:
+confirmed the dashboard (host-networked, listening on `127.0.0.1:8787`)
+successfully calls AdGuard's real refresh API over `127.0.0.1:3000` and
+gets back "Checked now -- everything was already up to date." (the
+correct, healthy result immediately after a fresh bootstrap that just
+fetched everything); confirmed `/control/filtering/status` reports
+`interval: 168` and all filter lists populated with their expected rule
+counts. Full pytest suite re-confirmed clean (400 passed) afterward; VM
+left at a clean `docker compose down -v` state.
+
 ### Fail-open engineering (a correction to an earlier assumption)
 
 Linux neighbor-cache entries are a state machine, not a fixed TTL — a
