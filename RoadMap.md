@@ -369,6 +369,26 @@ replaces its Redis-based approach.
       deployable: `main.py`'s desired-state source is an explicit
       placeholder that raises rather than guessing, pending Milestone
       4's identity model.
+
+      **Full pipeline verified together for real, 2026-08-30** — the
+      first time Milestones 2/3/4/6 were run as actual processes
+      together, not just independently: a real DB with a real device,
+      the real `controller/main.py` process, the real
+      `pp-arp-worker` binary, over their real Unix-socket IPC, on the
+      same kind of Docker bridge network already proven to behave like
+      a genuine L2 segment. Confirmed live: the controller computed
+      desired state from the DB and told the worker to apply it; the
+      worker actually poisoned a real container's ARP cache (verified
+      against its real, independently-confirmed MAC); the worker's own
+      lease monitor detected the controller's death on its own and
+      entered repair-only mode without being told to; a SIGTERM to the
+      controller correctly propagated a real "shutdown" IPC message
+      that made the worker send corrective ARPs, restoring the real
+      gateway's MAC in the victim's cache; `interception_runtime`'s
+      health columns updated correctly throughout. Found and fixed one
+      real bug along the way: `-controller-uid=0` (a legitimate UID —
+      root) was being rejected as "not provided," since the flag used
+      0 as both its zero-value default and its required-check sentinel.
 - [ ] **4. Identity model** — `device_bindings`, outbox events, MAC/IP
       conflict handling. **Scaffold written and verified 2026-08-29**:
       `device_bindings`/`interception_runtime`/`network_events` tables
