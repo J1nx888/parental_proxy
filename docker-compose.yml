@@ -5,6 +5,16 @@ services:
       dockerfile: proxy/Dockerfile
     container_name: parental-proxy
     restart: unless-stopped
+    # Squid's intercept-mode ports (both http_port and https_port below,
+    # see proxy/squid.conf.template) bind with the IP_TRANSPARENT socket
+    # option and recover the pre-NAT destination via SO_ORIGINAL_DST --
+    # both require CAP_NET_ADMIN. Without this, Squid fails during
+    # comm_open_listener and exits silently (exit code 1, no stdout/stderr
+    # at the default log level) -- confirmed live 2026-08-30 while
+    # preparing this stack's first real intercept-mode verification pass;
+    # see RoadMap.md.
+    cap_add:
+      - NET_ADMIN
     ports:
       # Intercept-mode ports (RoadMap.md's Squid intercept-mode section,
       # locked 2026-08-30), replacing the old explicit-proxy 3128:3128.
