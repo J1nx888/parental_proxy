@@ -1285,7 +1285,7 @@ fixes for each.
 
 - [ ] **1. Topology probe** — passive discovery, full Orbi attachment
       matrix, PCAP corpus.
-- [ ] **2. ARP worker MVP** — static targets, half-duplex, corrective
+- [x] **2. ARP worker MVP** — static targets, half-duplex, corrective
       restoration on shutdown, unit-tested packet serialization.
       **Scaffold written 2026-08-29** in `phase3/arp-worker/` (Go): the
       generation scheduler, race-free corrective-restoration logic on
@@ -1299,7 +1299,7 @@ fixes for each.
       controller process (Milestone 3, not started) or run against a
       real interface (needs `CAP_NET_RAW`, deliberately withheld until
       proven safe). See `phase3/arp-worker/README.md` for exact status.
-- [ ] **3. Controller** — versioned Unix-socket IPC, generations,
+- [x] **3. Controller** — versioned Unix-socket IPC, generations,
       leases, idempotent reconciliation.
       **Scaffold written and verified 2026-08-29** in `controller/`
       (Python, matching the architecture decision that the controller
@@ -1502,7 +1502,7 @@ fixes for each.
       traffic — is visible to production's discovery loops too) were
       found and deactivated (`active = 0`, not hard-deleted) before
       redeploying, rather than left to linger as bogus pending bindings.
-- [ ] **5. `nftables` integration** — dedicated table, named policy
+- [x] **5. `nftables` integration** — dedicated table, named policy
       sets, atomic apply/rollback. **Scaffold written AND verified
       against real nftables 2026-08-29**, in `phase3/nftables-manager/`
       (Go, `sigs.k8s.io/knftables`): pure conflict-resolution
@@ -1563,7 +1563,7 @@ fixes for each.
       Unix-socket heartbeat, not the worker's actual packet
       transmission. Full writeup, including the live before/during/
       after `/health` proof, is under Milestone 9 below.
-- [ ] **7. Authentication workflow** — toggling
+- [x] **7. Authentication workflow** — toggling
       `devices.is_authenticated` updates policy without restarting
       spoofing. **Done and verified live end-to-end 2026-08-29** — see
       Milestone 5's update above and `controller/policy_state.py`:
@@ -1576,7 +1576,7 @@ fixes for each.
       `unauthenticated_v4` to `authenticated_v4` in the real kernel
       ruleset on its next poll cycle. This is the milestone's exact
       claim, proven against real components.
-- [ ] **8. Future-portal seam** — implement the `PolicyClass` enum
+- [x] **8. Future-portal seam** — implement the `PolicyClass` enum
       (`AUTHENTICATED` / `PREAUTH` / `BYPASS` / `QUARANTINE`) now, even
       though only the first two are used until Phase 4. **Done
       2026-08-29**: `common/policy_class.py`'s `PolicyClass` enum +
