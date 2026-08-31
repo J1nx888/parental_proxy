@@ -901,6 +901,16 @@ from inside the container's own PID 1 does; confirmed the controller's
 reconnect logic recovers correctly either way) and the OOM-kill test
 above. NIC down/up and gateway reboot still need real hardware.
 
+- [ ] **TODO, next session the smoke-test VM is back online**: run
+  `phase3/nftables-manager/internal/dbsource`'s Go test suite
+  (`go test ./...` from that module directory) to actually verify the
+  `WriteHealth` fix above (`TestWriteHealth_DoesNotAdvanceLastHealthyOnFailOpen`,
+  `TestWriteHealth_FailOpenOnFirstWriteLeavesLastHealthyNull`) -- written
+  and carefully read but never compiled/run, since this dev sandbox has
+  no Go toolchain (see AGENTS.md's "Environment notes"). The VM
+  auto-shuts-down at 4pm Eastern daily -- it was down when this fix
+  landed, so this is unverified until then.
+
 ### Fail-open engineering (a correction to an earlier assumption)
 
 Linux neighbor-cache entries are a state machine, not a fixed TTL — a
