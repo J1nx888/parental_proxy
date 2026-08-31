@@ -944,15 +944,81 @@ from inside the container's own PID 1 does; confirmed the controller's
 reconnect logic recovers correctly either way) and the OOM-kill test
 above. NIC down/up and gateway reboot still need real hardware.
 
-- [ ] **TODO, next session the smoke-test VM is back online**: run
-  `phase3/nftables-manager/internal/dbsource`'s Go test suite
-  (`go test ./...` from that module directory) to actually verify the
-  `WriteHealth` fix above (`TestWriteHealth_DoesNotAdvanceLastHealthyOnFailOpen`,
-  `TestWriteHealth_FailOpenOnFirstWriteLeavesLastHealthyNull`) -- written
-  and carefully read but never compiled/run, since this dev sandbox has
-  no Go toolchain (see AGENTS.md's "Environment notes"). The VM
-  auto-shuts-down at 4pm Eastern daily -- it was down when this fix
-  landed, so this is unverified until then.
+- [ ] **TODO, next session the smoke-test VM is back online** — ordered
+  plan, written up 2026-08-30 end-of-night specifically so this can run
+  with minimal check-ins. Each step is self-contained; do them in order,
+  fix anything genuinely broken the same way this session did (don't
+  just report and stop), and write up what happened in this section (or
+  its own dated section below, matching this session's pattern) as you
+  go rather than batching it to the end. Stop and check in only for the
+  two flagged exceptions at the bottom — everything else is a "just go
+  do it" task.
+
+  1. **Housekeeping.** `git pull --ff-only` (expect a fast-forward onto
+     today's commits, nothing local should be ahead). Check whether the
+     controller's Docker memory limit from last night's OOM fault test
+     survived (`docker inspect parental-proxy-controller --format
+     '{{json .HostConfig.Memory}}'`) — if it's still the crippling test
+     value, `docker update --memory 0 parental-proxy-controller` to
+     clear it before anything else.
+  2. **Go test verification** (the one thing this session couldn't do at
+     all — no Go toolchain in the dev sandbox). From
+     `phase3/nftables-manager/`: `go build ./...`, `go vet ./...`, then
+     `go test ./...` — specifically confirm
+     `TestWriteHealth_DoesNotAdvanceLastHealthyOnFailOpen` and
+     `TestWriteHealth_FailOpenOnFirstWriteLeavesLastHealthyNull` (new
+     this session, commit `d53a8a8`) pass. `-race` isn't available
+     (no C compiler) — use `-count=10` for flake-checking if anything
+     seems marginal, matching this project's established substitute. Do
+     the same build/vet/test pass for `phase3/arp-worker/` too, as a
+     baseline confirmation nothing else regressed.
+  3. **Full Linux pytest run.** `pytest -v` from the repo root — this is
+     the first time the full 447-test suite (up from 435) runs on
+     Linux since this session's changes landed; Windows only ran 425 of
+     them (22 are `AF_UNIX`-only and skip there). Should be 447 passed,
+     0 skipped.
+  4. **Live redeploy + smoke test of the whole stack**, all six
+     containers together for the first time since this session's
+     changes: `docker compose --profile interception up -d --build`.
+     Confirm all six containers come up and stay up, hit `/health` in
+     the browser and confirm both subsystems show green "running" (not
+     stale, not fail-open), and check `docker compose logs controller`
+     for zero AdGuard-sync warnings (confirms the tightened
+     `get_custom_rules()` fix still completes real sync cycles against
+     a real AdGuard instance, not just its unit tests).
+  5. **Fault-test `nftables-manager` specifically** — the one component
+     NOT fault-tested last session (only `arp-worker` and `controller`
+     were), and the one most worth proving live given the `WriteHealth`
+     fix now getting real Go-test coverage in step 2. Two scenarios,
+     same techniques as last session:
+     - Ungraceful crash: `docker exec parental-proxy-nftables-manager
+       sh -c 'kill -9 1'` (NOT `docker kill` from outside — that
+       bypasses `restart: unless-stopped`, see last session's own
+       finding). Confirm it auto-restarts and `/health`'s nftables card
+       recovers to "running" on its own.
+     - Sustained OOM-kill: `docker update --memory 10m
+       parental-proxy-nftables-manager`, confirm `OOMKilled=true` and a
+       crash loop, then confirm `/health` correctly flags the nftables
+       card "stale" (not a false "running") within
+       `HEALTH_STALE_AFTER_SECONDS` (30s) — this is the exact scenario
+       the `WriteHealth` fix targets, so this is real end-to-end proof
+       beyond the Go unit tests. Reset the memory limit
+       (`docker update --memory 0 ...`) afterward.
+  6. **Tear down test state**: any throwaway Docker networks created
+     for this (e.g. `ppfaulttest`-style), reset any memory limits still
+     set on any container, and leave `.env` in a normal, non-fault-test
+     state — matching this project's own "leave the VM clean" discipline
+     from every prior live-testing round.
+
+  **Stop and check in, don't guess, if either of these comes up:**
+  - The VM itself is in a broken/inconsistent state (disk full, a
+    snapshot didn't restore cleanly, git history diverged) — that needs
+    you to actually intervene (restore the snapshot), not a code fix.
+  - Everything above finishes clean with time to spare. The next real
+    items on the roadmap (Phase 4 captive portal, Milestone 10's soak
+    test, real-household-LAN/hardware fault testing) each need an actual
+    decision or your physical presence — don't start any of them
+    autonomously; report back and ask instead.
 
 ### Fail-open engineering (a correction to an earlier assumption)
 
