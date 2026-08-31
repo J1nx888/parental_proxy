@@ -220,3 +220,13 @@ These are the ones most likely to waste your time; the full list is
 - Test names are long descriptive sentences, often naming the GH issue or
   `docs/review-2026-08-28.md` item they regress-test. No test classes.
 - `.claude/` is gitignored and stays that way.
+- **Mock up a UI-shape decision before building it.** For a genuine
+  layout/navigation-shape choice (not a small tweak), build 1-2 quick
+  HTML mockups (the `visualize` tool, or any throwaway static page) and
+  get it approved before touching real template code — this is how the
+  sidebar nav shell got picked over a top-bar alternative. Cheaper to
+  redo a mockup than a real implementation.
+- **Write a multi-line commit message to a scratchpad file first**, then
+  commit with `git commit -F <file>`, rather than passing it inline —
+  avoids shell backtick/quote interpolation silently corrupting the
+  message.
