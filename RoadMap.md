@@ -1322,7 +1322,10 @@ fixes for each.
       a genuine L2 segment. Confirmed live: the controller computed
       desired state from the DB and told the worker to apply it; the
       worker actually poisoned a real container's ARP cache (verified
-      against its real, independently-confirmed MAC); the worker's own
+      against its real, independently-confirmed MAC — **but see the
+      2026-08-31 correction under Milestone 9 below: a more rigorous
+      same-VM test found real cause for doubt in this specific
+      claim**); the worker's own
       lease monitor detected the controller's death on its own and
       entered repair-only mode without being told to; a SIGTERM to the
       controller correctly propagated a real "shutdown" IPC message
@@ -1593,6 +1596,60 @@ fixes for each.
       synthetic — no real device answers ARP for it at all today, so
       there is nothing to "reboot" without first building out a real
       stand-in gateway container, not done this pass).
+
+      **Follow-up the same night: isolated the NIC-down/up question from
+      a deeper, more consequential one, and found real cause for doubt
+      in Milestone 3's own "worker actually poisoned a real container's
+      ARP cache" claim below.** Set up a clean baseline with NO
+      interface toggling at all: a real victim container, a real active
+      poisoning target, generation applied and confirmed (`applied
+      generation N (1 targets)`), then explicitly deleted the victim's
+      existing ARP entry for the gateway and forced a genuinely fresh
+      resolution (a real `ping`, via a helper container joined to the
+      victim's network namespace with `CAP_NET_ADMIN` since the victim
+      itself has none). Result, repeated and consistent: the victim
+      resolves the gateway IP to the sandbox bridge's OWN real MAC
+      every time, never the configured spoofed `GATEWAY_MAC` — even
+      though the worker is actively, continuously applying that target
+      (confirmed via the controller's own generation-count logging).
+
+      **Why, and what this means**: `docker network create` gives the
+      bridge device itself an IP (`172.30.0.1` here) and Linux bridges
+      answer ARP for their own IP synchronously, in-kernel, with
+      effectively zero latency — a fundamentally different situation
+      from a real LAN, where the gateway is a separate physical device
+      reachable only over the wire, which is exactly the latency gap
+      ARP-spoofing techniques rely on to win the race. A Docker bridge
+      is not just "a genuine L2 segment" (this file's own 2026-08-30
+      claim, made without a documented test forcing a fresh resolution
+      the way this pass did) — it is also, simultaneously, an
+      authoritative, instant ARP responder for the address being
+      spoofed, which no real gateway is from the worker's point of
+      view. This casts real doubt on the 2026-08-30 Milestone 3 entry's
+      "the worker actually poisoned a real container's ARP cache"
+      claim: the most likely honest explanation, given tonight's
+      result, is that the worker's gratuitous ARP replies genuinely DID
+      land in the victim's neighbor cache for a transient window (a
+      real effect, not a fabricated one) simply because nothing had
+      forced a genuine re-resolution in the narrow window that claim
+      was checked in — not evidence that poisoning holds up durably
+      against real, ongoing ARP traffic the way the feature actually
+      needs it to. That claim is being corrected here, not rewritten,
+      per this project's own established practice.
+
+      **Net effect: this VM's Docker-bridge sandbox cannot conclusively
+      validate the core ARP-poisoning mechanism at all**, in either
+      direction — not the original Milestone 3 claim, not tonight's
+      NIC-down/up recovery question, not gateway reboot. All three need
+      a fundamentally more faithful harness before any of them can be
+      called verified: e.g. two Linux network namespaces joined by a
+      plain veth pair with no bridge (and therefore no in-kernel
+      ARP-answering device) between them, so a genuine peer with real
+      wire-clock latency stands in for the gateway, or real hardware.
+      Building that harness is real, non-trivial work and a genuine
+      design decision (namespace/veth topology, how `arp-worker`'s
+      `ARP_WORKER_IFACE`/`GATEWAY_IP`/`GATEWAY_MAC` map onto it) —
+      flagged to the user rather than started autonomously.
 - [ ] **10. Soak test** — 7–14 days of mixed real household load,
       roaming, sleep/wake, with memory/FD/CPU trend monitoring. **Not
       startable autonomously** — needs the real household network
