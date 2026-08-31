@@ -170,12 +170,30 @@ and later the same day again `tests/test_controller_rtnetlink_listener.py`
 faked `pyroute2`), `tests/test_block_page_server.py` (new file, real
 HTTP behavior of `dashboard/block_page_server.py`), and
 `tests/test_controller_block_page_ip.py` (new file, `main.py`'s
-`_parse_block_page_ip`). Run `pytest --collect-only -q` against `tests/`
-for a live, authoritative total (435 as of 2026-08-30, run on Linux,
-where every test actually runs -- several files marked `AF_UNIX`-only
-skip on Windows, where `socket.AF_UNIX` doesn't exist; a Windows run of
-the same suite at this commit collects 413 passed, 22 skipped) rather
-than trusting the sum of this table.
+`_parse_block_page_ip`). Still the same day, `tests/test_dashboard.py`
+gained a "HEALTH" section (7 tests) for the new `/health` route and
+its sidebar alarm badge, including a regression test for a real bug a
+`/code-review max` pass caught in one of those tests itself -- an
+earlier version hardcoded an absolute timestamp that silently aged past
+the staleness threshold and started testing the wrong render branch,
+fixed to use a relative one (see RoadMap.md) -- and gained
+`_insert_runtime_row()`, matching the file's existing
+`_insert_recent_denial`/`_insert_logged`/`_insert_device_with_last_seen`
+small-factory-helper convention; `tests/test_adguard_client.py` gained
+cases for `get_custom_rules()`'s handling of a `null` `user_rules` key
+(the confirmed-live AdGuard quirk) versus a genuinely missing key or
+non-dict response (which must still raise, not be silently swallowed --
+also a same-day code-review catch). Separately,
+`phase3/nftables-manager/internal/dbsource/sqlite_test.go` gained two
+`WriteHealth` regression tests that are, as of this writing, UNVERIFIED
+-- this dev sandbox has no Go toolchain (see AGENTS.md's "Environment
+notes"); see RoadMap.md's fault-campaign TODO for running them once the
+smoke-test VM is back online. Run `pytest --collect-only -q` against
+`tests/` for a live, authoritative total (447 as of 2026-08-30 --
+`AF_UNIX`-only files still skip on Windows, where `socket.AF_UNIX`
+doesn't exist, so a Windows run of the same suite at this commit
+collects 425 passed, 22 skipped) rather than trusting the sum of this
+table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

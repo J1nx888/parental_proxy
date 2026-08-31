@@ -261,6 +261,26 @@ default 30s). A brand-new or just-renewed device is briefly unresolved
 by identity, not un-denied by policy — see `controller/adguard_sync.py`'s
 own `build_rules()` docstring.
 
+**A subtle failure mode this invariant depends on staying fail-closed**
+(found and fixed 2026-08-30): `adguard_sync.sync_once()` reads AdGuard's
+*current* custom rules first (`common/adguard_client.get_custom_rules()`)
+so it can preserve anything it doesn't manage — an admin's own
+hand-added AdGuard rule — before overwriting with the full replacement
+list. A first version of a fix for a real AdGuard API quirk (a
+freshly-configured instance reports its `user_rules` key as `null`, not
+`[]`) went too far and treated *any* anomalous read (a non-dict
+response, a missing key entirely — not just the one confirmed-live
+`null` shape) the same way: silently as "no rules yet." That would have
+let a merely malformed read proceed straight to a destructive
+full-replace write, silently discarding real rules (including the
+per-client bump-deny rules this section is about) instead of raising
+and leaving AdGuard's actual, working rules untouched. Caught by code
+review before it shipped; `get_custom_rules()` now only special-cases
+the one confirmed shape (key present, value `null`) and still raises
+`AdGuardError` — which `run_loop()` reports via `on_error` without
+touching AdGuard, i.e. fails closed — for a missing key or non-object
+response.
+
 ---
 
 ## 4. The `external_acl_type` helper protocol — internal trust boundary

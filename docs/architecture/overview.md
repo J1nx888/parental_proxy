@@ -460,6 +460,20 @@ Route groups (see the numbered `# ====` section banners in the file):
   domain-level denial it creates a `user_domains` row (creating the `domains`
   row itself first if it never existed, scoped to that one user); for a
   show-level denial it creates a `user_shows` row.
+- **Health** (`/health`, added 2026-08-30): read-only view of
+  `interception_runtime` (the controller<->arp-worker pipeline's
+  `mode`/`last_healthy_at`/`fail_open_reason` and nftables-manager's own
+  `nft_mode`/`nft_last_healthy_at`/`nft_fail_reason`) -- only meaningful
+  once the optional `interception` compose profile is running. Flags a
+  subsystem "stale" (not just its literal `mode` value) when its
+  `last_healthy_at` hasn't advanced in `HEALTH_STALE_AFTER_SECONDS`
+  (30s), since a crashed/crash-looping process can't write its own
+  `fail_open` row -- the process that would do that is the one that's
+  dead. `render()` (the shared page-chrome wrapper every route uses)
+  separately lights a sidebar "!" alarm badge from the same
+  `_subsystem_unhealthy()` predicate on every page, not just `/health`
+  itself. See `docs/dashboard/routes.md`'s own "Health" section for the
+  full route reference.
 - **Settings** (`/settings`, `/settings/local-network`,
   `/settings/block-page-mode`, `/settings/admin`): editable
   `local_network`, `block_page_mode`, and admin credentials -- all live
