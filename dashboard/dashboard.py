@@ -2652,6 +2652,21 @@ def main() -> None:
         block_page_server.start(host="0.0.0.0", port=80)
         print("block page server listening on http://0.0.0.0:80", file=sys.stderr, flush=True)
 
+    # Phase 4 milestone 3: the captive-portal login server nftables'
+    # own baseline rules have redirected unauthenticated_v4's plain-HTTP
+    # traffic to since Phase 3 was designed (see
+    # captive_portal_server.py's own module docstring for the full
+    # design). Unlike block_page_server above, this isn't gated behind
+    # DASHBOARD_URL -- it's part of the interception feature itself, not
+    # an optional cosmetic enhancement -- but CAPTIVE_PORTAL_DISABLED
+    # gives an operator a fast, no-redeploy kill switch if something
+    # about the live rollout needs to be turned off in a hurry.
+    if not os.environ.get("CAPTIVE_PORTAL_DISABLED"):
+        import captive_portal_server
+
+        captive_portal_server.start(host="0.0.0.0", port=3131)
+        print("captive portal server listening on http://0.0.0.0:3131", file=sys.stderr, flush=True)
+
     print(f"dashboard listening on http://{host}:{port}", file=sys.stderr, flush=True)
     serve(app, host=host, port=port, threads=8)
 

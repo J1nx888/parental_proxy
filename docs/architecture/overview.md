@@ -182,7 +182,36 @@ take effect everywhere.
   unassociated MAC from before this shipped is deliberately left alone
   (no retroactive backfill, a 2026-08-31 product decision), even across
   a later DHCP renewal. This is the foundation the captive-portal login
-  flow itself (not yet built) will sit on top of.
+  flow (below) sits on top of.
+- **Captive-portal login server** (`dashboard/captive_portal_server.py`,
+  added 2026-08-31, Phase 4 milestone 3) -- the actual forcing
+  mechanism for the PREAUTH devices milestone 1 creates.
+  `phase3/nftables-manager`'s baseline rules have redirected
+  `unauthenticated_v4`'s plain-HTTP traffic to `:3131` since Phase 3 was
+  first designed (`# -> future portal` in the original design doc); this
+  is that future portal, needing zero nftables/interception changes.
+  Started from `dashboard/dashboard.py`'s `main()` (same
+  `network_mode: host` process as `block_page_server.py`, so `:3131` is
+  reachable at the host's real LAN address), disable-able via
+  `CAPTIVE_PORTAL_DISABLED` as an operator kill switch. Deliberately
+  returns the SAME login-page HTML for every request regardless of path
+  or Host header -- since nftables redirects by source IP and
+  destination port, not hostname, this alone is what makes every major
+  OS's own captive-portal probe (Apple/Google/Microsoft/Firefox, each
+  expecting a different exact response on a different URL) detect "there
+  is a captive portal" and open that exact probe URL in a real browser/
+  webview, which lands right back here and renders the login form. A
+  successful login (checked against the same `users.password_hash`
+  PBKDF2 hashes the admin dashboard already uses) flips
+  `devices.is_authenticated` -- DNS-tier access only, never
+  `bump_enabled` -- via `common/device_identity.py`'s new
+  `resolve_device()` (source IP -> `device_bindings` -> the `devices`
+  row itself, the write-side counterpart to that module's existing
+  `resolve_user()`). No interception for HTTPS (tcp/443) -- see the
+  module's own docstring for why that's a deliberate, industry-standard
+  limitation (matching real commercial captive portals) rather than an
+  oversight, and RoadMap.md for the follow-up hardening option this
+  leaves open.
 
 ---
 

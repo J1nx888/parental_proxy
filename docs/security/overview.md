@@ -84,17 +84,42 @@ nothing in `dashboard.py` calls `flask.session` — the key exists but is
 unused for auth; if Flask sessions are added later, this key is already
 provisioned correctly (random, DB-persisted, not re-generated per process).
 
-### `users.password_hash` — reserved for the future captive portal, not consumed today
+### `users.password_hash` — now consumed by the Phase 4 captive portal (2026-08-31)
 
 `add_user()` (`/users/add`) and `reset_password()` (`/users/reset-password`)
 in `dashboard/dashboard.py` both call `auth.hash_password(password)` and
 store the result in `users.password_hash`. Before 2026-08-30 this was the
 credential each family member configured in their device's proxy settings,
-checked by Squid on every request; that mechanism is gone (§3) —
-`users.password_hash` is written but nothing verifies it today. It exists
-now for the Phase 4 captive portal's eventual kid-facing login (see
-RoadMap.md), which will check it the same way the dashboard admin login
-checks `settings.admin_password_hash`, once that portal is built.
+checked by Squid on every request; that mechanism is gone (§3), and
+`users.password_hash` went unverified by anything for about a day.
+
+**As of 2026-08-31, this is a real, live-verified auth surface**:
+`dashboard/captive_portal_server.py` (Phase 4 milestone 3 -- see
+`docs/architecture/overview.md`) checks a submitted username/password
+against it with the exact same `auth.verify_password()` call the
+dashboard admin login uses against `settings.admin_password_hash` --
+one shared, already-reviewed PBKDF2-SHA256 implementation
+(`common/auth.py`), not a second credential-checking code path. A
+successful check flips `devices.is_authenticated` for whichever device
+the request's own source IP resolves to (`common/device_identity.py`'s
+new `resolve_device()`) -- DNS-tier access only, never `bump_enabled`.
+
+This is a genuinely new externally-reachable-eventually surface (per
+this doc's own §7 LAN-only caveats, and the standing security-by-design
+practice that flagged this exact risk before any Phase 4 code existed):
+unlike the admin login (behind HTTP Basic auth, `/`-scoped, requires
+already knowing the admin credential), the captive-portal login form is
+reachable by ANY device nftables has classified `unauthenticated_v4` --
+by design, since it exists specifically to be reachable by a device that
+has never logged in before. Two things this needed, both built
+alongside the login form itself rather than retrofitted (see §6 below
+for the general policy this matches): a per-source-IP rate limiter (5
+failed attempts / 60s, in-memory, blocking a request outright --
+including one with the CORRECT password -- once tripped, so an attacker
+can't use up the limiter's budget on wrong guesses and slip the right
+one in unrestricted at the end), and `Cache-Control: no-store` on every
+response (this is per-device, per-moment login state, never something a
+browser or an OS's own captive-portal prober should cache).
 
 ---
 
@@ -465,18 +490,36 @@ exposure that `bump` mode inherently carries.
 
 ## 6. Rate-limiting, lockout, brute-force protection
 
-**There is none, anywhere in this codebase**, and this is worth an extending
-agent knowing explicitly before pointing any part of this system at the
-internet:
+**Correction, 2026-08-31**: this section used to say "there is none,
+anywhere in this codebase" — that's no longer true as of Phase 4
+milestone 3. `dashboard/captive_portal_server.py`'s login form (§1's
+`users.password_hash` entry above has the full writeup) has a real,
+in-memory, per-source-IP limiter: 5 failed attempts / 60s, and a
+tripped limiter blocks the NEXT attempt outright regardless of whether
+its password is actually correct, closing the obvious "use up the
+budget on wrong guesses, slip the right one in last" gap a naive
+per-failure-only counter would leave open. This was built alongside the
+login form itself, not retrofitted, per this project's own standing
+security-by-design practice. It resets on a dashboard process restart
+(in-memory, no new DB table for a first pass) and would need revisiting
+if this surface is ever exposed beyond the LAN (Phase 6) — but for a
+LAN-scoped captive-portal login, an attacker who already needs local
+network access to even reach it is a meaningfully smaller threat model
+than an internet-facing one.
+
+Still true, and still worth an extending agent knowing explicitly
+before pointing any part of this system at the internet:
 
 - **Dashboard admin login** (`require_admin` / `_check_admin_auth` in
   `dashboard/dashboard.py`): no failed-attempt counter, no delay, no
   lockout, no CAPTCHA. An attacker with network access to the dashboard port
   can attempt unlimited HTTP Basic credential guesses. PBKDF2 at 260,000
   iterations (§1) raises the cost of guessing per attempt, but nothing caps
-  the number of attempts.
-- **No IP-based throttling** anywhere in `common/squid_helper.py`,
-  `matching.py`, or `dashboard.py`.
+  the number of attempts. Unlike the captive portal above, this one still
+  has no rate limiting at all -- worth closing the same way if this doc's
+  own §7 LAN-only assumption ever changes.
+- **No IP-based throttling** anywhere in `common/squid_helper.py` or
+  `matching.py`.
 - **Squid's side has no login left to brute-force at all** (§3) — a
   meaningfully *different* risk now, not a smaller version of the old one:
   identity is granted to whoever's traffic arrives from a bump-enabled
@@ -485,11 +528,12 @@ internet:
   and "is treated as that device's assigned user" — see §7's LAN-trust
   discussion for why this is accepted rather than mitigated.
 
-The only two mitigating factors present are architectural, not
-brute-force-specific: (a) `_check_admin_auth`'s password comparison is
-constant-time (`hmac.compare_digest` inside `verify_password`), removing a
-timing side-channel, and (b) the LAN-scoping described in §7, which — while
-it is *not itself authentication* and is explicitly not one — currently
+For the admin login and Squid's IP-based identity, the only mitigating
+factors present are architectural, not brute-force-specific: (a)
+`_check_admin_auth`'s password comparison is constant-time
+(`hmac.compare_digest` inside `verify_password`), removing a timing
+side-channel, and (b) the LAN-scoping described in §7, which — while it
+is *not itself authentication* and is explicitly not one — currently
 limits who can even reach the dashboard's login prompt, or spoof a
 bump-enabled device's IP, to begin with in the intended LAN-only
 deployment. If this system is ever deployed such that the dashboard is

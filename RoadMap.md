@@ -2051,6 +2051,93 @@ pending card, Status badges, and the full Bypass round-trip (device
 leaves the pending list, `bypass_login` flips to `1`) all confirmed
 exactly as designed.
 
+**Milestone 3 (the actual forcing mechanism -- captive-portal probe
+interception): done and verified 2026-08-31.** Real, useful finding
+*before* any code was written: the nftables side of this needed ZERO
+changes -- `phase3/nftables-manager/internal/nft/knftables_adapter.go`'s
+`baselineRules` has carried
+`ip saddr @unauthenticated_v4 tcp dport 80 redirect to :3131` since
+Phase 3 was first designed, with a `# -> future portal` comment in the
+original design doc. This milestone is that future portal.
+
+**Design decision, resolved by looking up how OS captive-portal
+detection actually works** (Apple `captive.apple.com/hotspot-detect.html`
+expects the literal string "Success"; Android/Chrome
+`.../generate_204` expects a bare 204; Windows
+`www.msftconnecttest.com/connecttest.txt` expects "Microsoft Connect
+Test"; Firefox `detectportal.firefox.com/success.txt` expects
+"success" -- see [Apple's own forum](https://developer.apple.com/forums/thread/747798),
+[a maintained captive-portal-URL reference](https://gist.github.com/mortonfox/c31de2b3ac967edb089e9bbd3dbe23a2),
+and [Mozilla's own captive-portal docs](https://firefox-source-docs.mozilla.org/networking/captive_portals.html)):
+since nftables redirects by source IP + destination PORT, not by
+hostname, EVERY one of these different-hostname probes lands on the
+same server -- and getting anything other than each one's exact
+expected response is already what every one of them treats as "there's
+a captive portal," at which point each opens (or offers to open)
+exactly the probe URL it just tried in a real browser/webview, which
+lands right back here again and renders whatever HTML comes back. That
+means one handler returning the SAME login page for every GET
+regardless of path/Host is enough to trigger every major OS's native
+sign-in UI AND show the form to a device manually browsing -- no
+per-OS response-shape special-casing needed at all.
+
+Built `dashboard/captive_portal_server.py` (started from
+`dashboard/dashboard.py`'s `main()`, same `network_mode: host` process
+as `block_page_server.py`, so `:3131` is reachable at the host's real
+LAN address with no docker-compose changes -- `--CAPTIVE_PORTAL_DISABLED`
+is an operator kill switch). A successful login (checked against
+`users.password_hash` via the same `auth.verify_password()` the admin
+dashboard login already uses) flips `is_authenticated` for whichever
+device the request's own source IP resolves to
+(`common/device_identity.py`'s new `resolve_device()`, the write-side
+counterpart to that module's existing `resolve_user()`) -- DNS-tier
+access only, never `bump_enabled`, `COALESCE`d so an admin's own prior
+`user_id` assignment is never overwritten. Self-resolving success path,
+not something this module has to handle itself: once
+`controller/main.py`'s next reconcile cycle moves the device's IP into
+`authenticated_v4` in the real kernel ruleset, its port-80 traffic
+simply stops being redirected here at all, so the OS's own routine
+re-probe reaches the real Apple/Google/Microsoft server directly and
+the OS dismisses its own captive-portal UI on its own.
+
+**Built alongside the login form, not retrofitted, per this project's
+own standing security-by-design practice**: a per-source-IP rate
+limiter (5 failed attempts/60s, in-memory) that blocks the NEXT attempt
+outright once tripped -- including one with the actually-correct
+password, closing the gap a naive failures-only counter would leave
+open (use up the budget on wrong guesses, slip the right one in
+unrestricted at the end) -- and `Cache-Control: no-store` on every
+response, since this is per-device, per-moment login state that must
+never be cached by a browser or an OS's own prober. This also let a
+stale, now-corrected claim in `docs/security/overview.md` §6 be fixed
+("there is none, anywhere in this codebase" was true when written,
+isn't anymore).
+
+**Known, deliberate limitation, not an oversight**: no interception for
+HTTPS (tcp/443) -- matches virtually every real commercial captive
+portal (there's no cert this project's own CA can present that an
+ungated device already trusts, same reasoning
+`block_page_server.py` already established for AdGuard's hard-deny
+case), and correctly triggers the OS-native flow for the overwhelming
+majority of real usage anyway, since the OS's own automatic probe uses
+plain HTTP specifically for this reason. A technically determined user
+who notices the redirect and never completes an HTTP request could
+evade the prompt indefinitely -- tracked here as a possible future
+hardening item (e.g. dropping tcp/udp 443 for `unauthenticated_v4` too)
+rather than added now without verifying it doesn't also break the OS's
+own captive-portal-assistant webview, which sometimes needs its own
+auxiliary HTTPS requests to render correctly.
+
+22 new tests across two new files
+(`tests/test_captive_portal_server.py`, following
+`tests/test_block_page_server.py`'s own real-integration-test pattern
+exactly, and `tests/test_device_identity.py`, a first dedicated test
+file for a previously-untested module). Also visually and interactively
+verified in a live browser against `dashboard/dev_server.py`: rendered
+the real login page, completed a real login through the actual form
+(not just a raw `fetch()`), and confirmed `is_authenticated` flipped in
+the real on-disk dev DB afterward.
+
 ## Original design sketch (2026-08-30, not started at the time)
 
 Force all internet through the system regardless of per-device

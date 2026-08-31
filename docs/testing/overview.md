@@ -305,11 +305,42 @@ the Status column's badges, and the Bypass action's full round trip
 (disappears from the pending list, `bypass_login` flips to `yes`) all
 confirmed exactly as designed.
 
+**Same night, fifth follow-up**: Phase 4 milestone 3 (the captive-portal
+login server, `dashboard/captive_portal_server.py` -- see
+docs/architecture/overview.md) added two new test files.
+`tests/test_captive_portal_server.py` follows
+`tests/test_block_page_server.py`'s own established pattern exactly --
+a real integration test binding an ephemeral port and making real HTTP
+requests, since a stdlib `http.server` handler has no pure logic worth
+mocking in isolation -- covering: every GET/HEAD gets the identical
+login page regardless of path or Host header (the design's own core
+claim: nftables redirects by source IP and destination port, not
+hostname, so this alone must be what triggers every major OS's
+captive-portal-detected UI); a successful POST login flips
+`is_authenticated` for whichever device the request's real source IP
+(`127.0.0.1`, since these are genuine loopback HTTP requests) resolves
+to, never `bump_enabled`, and never overwrites an existing `user_id`
+assignment; a wrong password, an unknown username, and a request from
+an IP with no active binding all fail closed with an honest message
+rather than a crash; and the per-source-IP rate limiter (5 failed
+attempts/60s, built alongside the login form rather than retrofitted --
+see docs/security/overview.md §6) blocks the next attempt outright,
+including one with the actually-correct password, and resets on a
+genuine success. `tests/test_device_identity.py` is a new file for a
+previously-untested module (`resolve_user` only ever had incidental
+coverage via `tests/test_helpers_protocol.py`) -- covers the new
+`resolve_device()` directly plus retroactive direct coverage for
+`resolve_user()`. Also visually and interactively verified in a live
+browser against `dashboard/dev_server.py`: the login page render,
+completing a real login through the actual rendered form (not just
+`fetch()`), and confirming `is_authenticated` flipped in the real
+on-disk dev DB afterward.
+
 Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (505 as of 2026-08-31 -- `AF_UNIX`-only files still
+authoritative total (527 as of 2026-08-31 -- `AF_UNIX`-only files still
 skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
-of the same suite at this commit collects 475 passed, 30 skipped, while
-Linux collects all 505) rather than trusting the sum of this table.
+of the same suite at this commit collects 497 passed, 30 skipped, while
+Linux collects all 527) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

@@ -58,3 +58,28 @@ def resolve_user(conn: sqlite3.Connection, client_ip: str) -> sqlite3.Row | None
         """,
         (client_ip,),
     ).fetchone()
+
+
+def resolve_device(conn: sqlite3.Connection, client_ip: str) -> sqlite3.Row | None:
+    """The `devices` row for whoever currently holds this source IP, or
+    None if there's no active device_bindings row for it at all.
+
+    Unlike resolve_user() above, this returns the device itself
+    regardless of whether it already has a user_id assigned --
+    dashboard/captive_portal_server.py (Phase 4 milestone 3) needs the
+    device_id itself to actually grant access (flipping
+    is_authenticated), not just whichever user, if any, already owns
+    it. A device with device_id NULL never matches here at all (the
+    JOIN requires a real devices row) -- see common/identity.py's
+    record_binding docstring for why that should be rare going forward
+    (Phase 4 milestone 1 auto-creates one for a genuinely new MAC).
+    """
+    return conn.execute(
+        """
+        SELECT d.* FROM device_bindings b
+        JOIN devices d ON d.id = b.device_id
+        WHERE b.ipv4_address = ? AND b.active = 1
+        ORDER BY b.last_seen_at DESC LIMIT 1
+        """,
+        (client_ip,),
+    ).fetchone()

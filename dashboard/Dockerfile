@@ -6,7 +6,7 @@ COPY dashboard/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY common/*.py /app/
-COPY dashboard/dashboard.py dashboard/block_page_server.py /app/
+COPY dashboard/dashboard.py dashboard/block_page_server.py dashboard/captive_portal_server.py /app/
 COPY dashboard/static /app/static
 
 # Port 80 (block_page_server.py, started only when DASHBOARD_URL is set)
@@ -34,6 +34,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin \
 RUN mkdir -p /config && chown -R proxy:proxy /config /app
 USER proxy
 
-EXPOSE 8787 80
+EXPOSE 8787 80 3131
 
 CMD ["python3", "dashboard.py"]
