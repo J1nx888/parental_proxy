@@ -51,6 +51,7 @@ class GenerationApplied:
 class HeartbeatAck:
     sequence: int
     sent_counters: dict[str, int]
+    consecutive_send_failures: int = 0
 
 
 class WorkerClient:
@@ -119,7 +120,9 @@ class WorkerClient:
         reply = self._request({"v": PROTOCOL_VERSION, "op": "heartbeat", "sequence": sequence})
         self._expect_op(reply, "heartbeat_ack")
         return HeartbeatAck(
-            sequence=reply["sequence"], sent_counters=reply.get("sent_counters") or {}
+            sequence=reply["sequence"],
+            sent_counters=reply.get("sent_counters") or {},
+            consecutive_send_failures=reply.get("consecutive_send_failures") or 0,
         )
 
     def shutdown(self, reason: str) -> None:

@@ -65,12 +65,19 @@ type GenerationApplied struct {
 }
 
 // HeartbeatAck is the worker->controller reply to a heartbeat,
-// carrying per-target sent-packet counters for observability.
+// carrying per-target sent-packet counters plus a global
+// consecutive-send-failure count for observability -- the latter
+// (added 2026-08-31) is what lets the controller escalate a sustained
+// ARP-transmission failure (e.g. the bound interface going down) into
+// a real fail_open report instead of that only ever being visible as a
+// local worker log line (see worker.Worker.ConsecutiveSendFailures's
+// own doc comment).
 type HeartbeatAck struct {
-	V            int               `json:"v"`
-	Op           string            `json:"op"`
-	Sequence     uint64            `json:"sequence"`
-	SentCounters map[string]uint64 `json:"sent_counters"`
+	V                       int               `json:"v"`
+	Op                      string            `json:"op"`
+	Sequence                uint64            `json:"sequence"`
+	SentCounters            map[string]uint64 `json:"sent_counters"`
+	ConsecutiveSendFailures uint64            `json:"consecutive_send_failures"`
 }
 
 // Fault is an unsolicited worker->controller message reporting a

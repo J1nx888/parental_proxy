@@ -214,3 +214,69 @@ func TestApplyGeneration_NilOnSendErrorIsSafe(t *testing.T) {
 	time.Sleep(15 * time.Millisecond)
 	w.Shutdown() // must not panic
 }
+
+// TestConsecutiveSendFailures_IncrementsOnFailure guards the fix for
+// the health-visibility gap confirmed live 2026-08-31 (a NIC-down test
+// against a properly-isolated veth harness): a sustained run of send
+// failures was completely invisible to the controller -- only ever a
+// local log line via OnSendError, nothing the heartbeat_ack could ever
+// carry. This is what the controller now reads to escalate a sustained
+// failure into a real fail_open report.
+func TestConsecutiveSendFailures_IncrementsOnFailure(t *testing.T) {
+	fs := &fakeSender{replyErr: errors.New("simulated: network is down")}
+	selfMAC := mustMAC("02:00:00:00:00:01")
+	cfg := Config{Interval: 5 * time.Millisecond, CorrectiveRepeats: 1, CorrectiveSpacing: time.Millisecond}
+	w := New(fs, selfMAC, cfg)
+
+	gw := Target{IP: net.ParseIP("192.168.1.1"), MAC: mustMAC("02:00:00:00:00:02")}
+	target := Target{IP: net.ParseIP("192.168.1.22"), MAC: mustMAC("02:00:00:00:00:04")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if got := w.ConsecutiveSendFailures(); got != 0 {
+		t.Fatalf("expected 0 before any sends, got %d", got)
+	}
+
+	w.ApplyGeneration(ctx, Generation{ID: 1, Gateway: gw, Targets: []Target{target}})
+	time.Sleep(20 * time.Millisecond)
+	w.Shutdown()
+
+	if got := w.ConsecutiveSendFailures(); got == 0 {
+		t.Error("expected ConsecutiveSendFailures to be nonzero after a sender that always fails")
+	}
+}
+
+// TestConsecutiveSendFailures_ResetsToZeroOnSuccess guards the reset
+// half of the same behavior -- a transient failure that later recovers
+// (the realistic case: the bound interface comes back up) must not
+// leave a stale nonzero count that permanently looks unhealthy.
+func TestConsecutiveSendFailures_ResetsToZeroOnSuccess(t *testing.T) {
+	fs := &fakeSender{replyErr: errors.New("simulated: network is down")}
+	selfMAC := mustMAC("02:00:00:00:00:01")
+	cfg := Config{Interval: 5 * time.Millisecond, CorrectiveRepeats: 1, CorrectiveSpacing: time.Millisecond}
+	w := New(fs, selfMAC, cfg)
+
+	gw := Target{IP: net.ParseIP("192.168.1.1"), MAC: mustMAC("02:00:00:00:00:02")}
+	target := Target{IP: net.ParseIP("192.168.1.22"), MAC: mustMAC("02:00:00:00:00:04")}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w.ApplyGeneration(ctx, Generation{ID: 1, Gateway: gw, Targets: []Target{target}})
+	time.Sleep(20 * time.Millisecond)
+
+	if got := w.ConsecutiveSendFailures(); got == 0 {
+		t.Fatal("expected a nonzero failure count before the sender recovers")
+	}
+
+	fs.mu.Lock()
+	fs.replyErr = nil // "the interface comes back up"
+	fs.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+	w.Shutdown()
+
+	if got := w.ConsecutiveSendFailures(); got != 0 {
+		t.Errorf("expected ConsecutiveSendFailures to reset to 0 after a successful send, got %d", got)
+	}
+}

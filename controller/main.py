@@ -63,6 +63,19 @@ from reconcile import AppliedState, DesiredState, reconcile
 
 log = logging.getLogger("controller")
 
+# How many consecutive ARP send failures (worker.Worker.
+# ConsecutiveSendFailures, reported via heartbeat_ack -- see
+# run()'s arp_send_health) before run_cycle treats the pipeline as
+# fail_open rather than running, even though the controller<->worker
+# socket itself is perfectly healthy. The worker attempts a send for
+# every active target on every poison tick (Config.Interval, 2s
+# default) -- 3 needs no more than a couple of ticks' worth of genuine,
+# sustained failure (the realistic case is the whole bound interface
+# going down, which fails every send at once) to trip, while still
+# tolerating one merely-transient dropped frame without flapping
+# fail_open on every send.
+ARP_SEND_FAILURE_THRESHOLD = 3
+
 
 def placeholder_desired_state() -> DesiredState:
     """The default when --db-path isn't given. See
@@ -231,10 +244,25 @@ def run(
     signal.signal(signal.SIGTERM, _request_stop)
     signal.signal(signal.SIGINT, _request_stop)
 
+    # Written by _send_heartbeat below (heartbeat-pacer thread), read by
+    # run_cycle (main thread) once per reconcile cycle -- a plain dict
+    # rather than a lock is enough here since CPython's GIL makes a
+    # single dict-item assignment/read atomic, matching this file's own
+    # heartbeat_worker_dead precedent for cross-thread signaling without
+    # a full lock. Added 2026-08-31 to close a real, confirmed gap: a
+    # NIC-down test against a properly-isolated veth harness showed
+    # interception_runtime staying "running" throughout a sustained real
+    # ARP-send-failure window, because nothing upstream of
+    # worker.Worker.ConsecutiveSendFailures (added the same day) existed
+    # to carry that signal from the worker to here. See run_cycle's own
+    # docstring for how this gets turned into a fail_open report.
+    arp_send_health = {"consecutive_failures": 0}
+
     def _send_heartbeat() -> None:
         nonlocal sequence
         sequence += 1
-        client.heartbeat(sequence)
+        ack = client.heartbeat(sequence)
+        arp_send_health["consecutive_failures"] = ack.consecutive_send_failures
         sdnotify.watchdog()  # a successful heartbeat round-trip IS this process's own liveness signal
 
     # Set by the heartbeat pacer's own error callback below when a
@@ -320,7 +348,10 @@ def run(
                 _reconnect("detected via a failed heartbeat")
             else:
                 try:
-                    applied = run_cycle(client, desired_state_provider, applied, health_conn, policy_conn)
+                    applied = run_cycle(
+                        client, desired_state_provider, applied, health_conn, policy_conn,
+                        arp_send_health["consecutive_failures"],
+                    )
                 except WorkerConnectionError as exc:
                     _reconnect(str(exc))
             time.sleep(poll_interval)
@@ -347,6 +378,7 @@ def run_cycle(
     applied: AppliedState | None,
     health_conn: sqlite3.Connection | None,
     policy_conn: sqlite3.Connection | None,
+    consecutive_send_failures: int = 0,
 ) -> AppliedState | None:
     """One reconcile+health+policy cycle, pulled out of run()'s loop
     specifically so it's independently testable against a fake worker
@@ -361,6 +393,20 @@ def run_cycle(
     variable) can actually reconnect; this function has no way to hand
     its caller a replacement client. Returns the (possibly unchanged)
     AppliedState for the caller to pass back in next cycle.
+
+    consecutive_send_failures (added 2026-08-31) is the most recent
+    value of worker.Worker.ConsecutiveSendFailures, read from run()'s
+    own arp_send_health (populated by the heartbeat pacer, which runs
+    independently of this cycle) -- NOT re-fetched here, so this
+    function stays the single writer of health_conn's mode/
+    fail_open_reason columns rather than racing the heartbeat thread
+    for that write. A reconcile cycle can succeed completely (the
+    controller<->worker socket is fine, desired state was computed and
+    sent) while the worker's actual packet transmission is failing --
+    the whole point of this parameter is making that distinction
+    visible instead of unconditionally reporting healthy whenever the
+    socket itself is fine. See ARP_SEND_FAILURE_THRESHOLD's own comment
+    for why 3.
     """
     try:
         desired = desired_state_provider()
@@ -384,7 +430,14 @@ def run_cycle(
             write_desired_policy(policy_conn, compute_desired_policy(policy_conn))
 
         if health_conn is not None:
-            health.report_healthy(health_conn, applied.generation if applied else 0)
+            if consecutive_send_failures >= ARP_SEND_FAILURE_THRESHOLD:
+                health.report_fail_open(
+                    health_conn,
+                    f"arp-worker: {consecutive_send_failures} consecutive ARP send "
+                    "failures (the bound network interface is likely down)",
+                )
+            else:
+                health.report_healthy(health_conn, applied.generation if applied else 0)
     except WorkerConnectionError:
         raise  # let run() handle reconnection -- see this function's own docstring
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, see run()'s own docstring

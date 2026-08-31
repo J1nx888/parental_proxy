@@ -150,6 +150,7 @@ func (h *controllerHandler) HandleHeartbeat(m ipc.Heartbeat) []any {
 	return []any{ipc.HeartbeatAck{
 		V: ipc.ProtocolVersion, Op: "heartbeat_ack",
 		Sequence: m.Sequence, SentCounters: h.worker.SentCounters(),
+		ConsecutiveSendFailures: h.worker.ConsecutiveSendFailures(),
 	}}
 }
 

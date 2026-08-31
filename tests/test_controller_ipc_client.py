@@ -104,6 +104,50 @@ def test_heartbeat_round_trip():
         worker_sock.close()
 
 
+def test_heartbeat_parses_consecutive_send_failures():
+    # worker.Worker.ConsecutiveSendFailures, added 2026-08-31 to close
+    # the health-visibility gap a NIC-down test found: a sustained ARP
+    # send failure used to be invisible to the controller entirely.
+    client, worker_sock = _make_pair()
+    try:
+        def fake_worker():
+            _read_line(worker_sock)
+            _send_line(worker_sock, {
+                "v": 1, "op": "heartbeat_ack", "sequence": 1,
+                "sent_counters": {}, "consecutive_send_failures": 7,
+            })
+
+        t = threading.Thread(target=fake_worker)
+        t.start()
+        result = client.heartbeat(1)
+        t.join(timeout=2)
+
+        assert result.consecutive_send_failures == 7
+    finally:
+        client.close()
+        worker_sock.close()
+
+
+def test_heartbeat_defaults_consecutive_send_failures_to_zero_when_absent():
+    # An older worker binary that predates this field must not break
+    # the controller -- missing key, not a malformed reply.
+    client, worker_sock = _make_pair()
+    try:
+        def fake_worker():
+            _read_line(worker_sock)
+            _send_line(worker_sock, {"v": 1, "op": "heartbeat_ack", "sequence": 1, "sent_counters": {}})
+
+        t = threading.Thread(target=fake_worker)
+        t.start()
+        result = client.heartbeat(1)
+        t.join(timeout=2)
+
+        assert result.consecutive_send_failures == 0
+    finally:
+        client.close()
+        worker_sock.close()
+
+
 def test_fault_reply_raises_workererror():
     client, worker_sock = _make_pair()
     try:

@@ -459,3 +459,92 @@ def test_run_with_enable_rtnetlink_populates_device_bindings_on_a_separate_threa
     ).fetchone()
     assert row is not None, "expected the rtnetlink listener to have recorded the fake binding"
     assert row["mac_address"] == "aa:bb:cc:dd:ee:88"
+
+
+def test_run_reports_fail_open_when_heartbeat_reports_sustained_arp_send_failures(
+    tmp_path, conn, restore_signal_handlers
+):
+    """End-to-end version of test_controller_run_cycle.py's
+    consecutive_send_failures test: this one drives it through the
+    REAL heartbeat pacer thread (main.py's arp_send_health dict) into
+    run_cycle's reconciliation loop, rather than passing the value
+    directly as a parameter -- exercising the actual cross-thread
+    wiring added 2026-08-31 to close the health-visibility gap a
+    NIC-down test against a real veth harness found. The fake worker
+    behaves perfectly normally for replace_targets (reconciliation
+    itself succeeds) but reports a high consecutive_send_failures on
+    every heartbeat_ack, matching what a real worker would report
+    while its bound interface is down.
+    """
+    sock_path = str(tmp_path / "worker.sock")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(sock_path)
+    server.listen(1)
+    server.settimeout(0.5)
+
+    stop_server = threading.Event()
+
+    def serve():
+        try:
+            conn_sock, _ = server.accept()
+        except socket.timeout:
+            return
+        conn_sock.settimeout(2)
+        try:
+            while not stop_server.is_set():
+                try:
+                    req = _read_line(conn_sock)
+                except (ConnectionError, socket.timeout):
+                    break
+                if req["op"] == "replace_targets":
+                    _send_line(conn_sock, {
+                        "v": 1, "op": "generation_applied",
+                        "generation": req["generation"],
+                        "target_count": len(req["targets"]),
+                        "resolution_failures": [],
+                    })
+                elif req["op"] == "heartbeat":
+                    _send_line(conn_sock, {
+                        "v": 1, "op": "heartbeat_ack",
+                        "sequence": req["sequence"], "sent_counters": {},
+                        "consecutive_send_failures": 10,
+                    })
+                elif req["op"] == "shutdown":
+                    break
+        except (ConnectionError, OSError, socket.timeout):
+            pass
+        finally:
+            conn_sock.close()
+
+    server_thread = threading.Thread(target=serve)
+    server_thread.start()
+
+    def send_sigterm_after_delay():
+        time.sleep(0.4)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    timer_thread = threading.Thread(target=send_sigterm_after_delay)
+    timer_thread.start()
+
+    try:
+        run(
+            sock_path,
+            _desired_state_provider,
+            heartbeat_interval=0.05,
+            poll_interval=0.05,
+            health_conn=conn,
+            policy_conn=None,
+        )
+    finally:
+        stop_server.set()
+        server_thread.join(timeout=3)
+        timer_thread.join(timeout=3)
+        server.close()
+
+    row = conn.execute("SELECT mode, fail_open_reason FROM interception_runtime WHERE singleton_id = 1").fetchone()
+    assert row is not None
+    assert row["mode"] == "fail_open", (
+        "expected sustained heartbeat-reported send failures to be visible as fail_open, "
+        "even though the controller<->worker socket itself was perfectly healthy throughout"
+    )
+    assert "consecutive ARP send" in row["fail_open_reason"]

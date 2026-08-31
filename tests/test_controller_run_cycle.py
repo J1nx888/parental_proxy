@@ -170,6 +170,73 @@ def test_worker_connection_error_propagates_uncaught(conn):
         client.close()
 
 
+def test_sustained_arp_send_failures_report_fail_open_even_though_the_socket_is_fine(conn):
+    """A reconcile cycle can succeed completely -- the controller<->worker
+    socket is healthy, generation_applied comes back clean -- while the
+    worker's actual ARP transmission is failing (the bound interface is
+    down). Closes the health-visibility gap a NIC-down test against a
+    real veth harness found 2026-08-31: interception_runtime stayed
+    "running" throughout a sustained real send-failure window because
+    nothing surfaced that distinction before this."""
+    from main import ARP_SEND_FAILURE_THRESHOLD
+
+    client, worker_sock = _make_client()
+    try:
+        def fake_worker():
+            req = _read_line(worker_sock)
+            _send_line(worker_sock, {
+                "v": 1, "op": "generation_applied", "generation": req["generation"],
+                "target_count": 1, "resolution_failures": [],
+            })
+
+        t = threading.Thread(target=fake_worker)
+        t.start()
+        applied = run_cycle(
+            client, _placeholder_desired_state, None, health_conn=conn, policy_conn=None,
+            consecutive_send_failures=ARP_SEND_FAILURE_THRESHOLD,
+        )
+        t.join(timeout=2)
+
+        assert applied is not None, "reconciliation itself still succeeded -- only health reporting changes"
+        row = _runtime_row(conn)
+        assert row["mode"] == "fail_open"
+        assert "consecutive ARP send" in row["fail_open_reason"]
+        assert row["applied_generation"] == 1, "the last successfully-applied generation is still true"
+    finally:
+        client.close()
+        worker_sock.close()
+
+
+def test_below_threshold_arp_send_failures_still_report_healthy(conn):
+    """A single transient dropped frame (or a count under the
+    threshold) must not flap the pipeline to fail_open."""
+    from main import ARP_SEND_FAILURE_THRESHOLD
+
+    client, worker_sock = _make_client()
+    try:
+        def fake_worker():
+            req = _read_line(worker_sock)
+            _send_line(worker_sock, {
+                "v": 1, "op": "generation_applied", "generation": req["generation"],
+                "target_count": 1, "resolution_failures": [],
+            })
+
+        t = threading.Thread(target=fake_worker)
+        t.start()
+        run_cycle(
+            client, _placeholder_desired_state, None, health_conn=conn, policy_conn=None,
+            consecutive_send_failures=ARP_SEND_FAILURE_THRESHOLD - 1,
+        )
+        t.join(timeout=2)
+
+        row = _runtime_row(conn)
+        assert row["mode"] == "running"
+        assert row["fail_open_reason"] is None
+    finally:
+        client.close()
+        worker_sock.close()
+
+
 def test_none_conns_mean_no_db_writes_at_all(conn):
     """health_conn=None and policy_conn=None (run()'s default when no
     --db-path is given) must leave interception_runtime completely

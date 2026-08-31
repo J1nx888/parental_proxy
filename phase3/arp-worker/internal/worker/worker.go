@@ -21,6 +21,21 @@ type Worker struct {
 	rg *runningGen // nil if nothing is currently running
 
 	sentCounters sync.Map // ip.String() -> *uint64
+
+	// consecutiveSendFailures counts ARPSender.Reply() failures since
+	// the most recent success, across every target/direction combined
+	// -- reset to 0 on any successful send, incremented on any failed
+	// one. Reported to the controller in "heartbeat_ack" messages (see
+	// ConsecutiveSendFailures below) so a sustained failure (the
+	// realistic case: the whole bound interface going down, which
+	// fails every send regardless of target) surfaces as real
+	// controller-visible health data instead of only a local log line
+	// -- closing the gap sendGratuitousReply's own TODO comment used
+	// to flag, confirmed live 2026-08-31 via a NIC-down test against a
+	// properly-isolated veth harness: interception_runtime stayed
+	// "running" throughout a real, sustained send-failure window
+	// because nothing upstream of this field existed yet to report it.
+	consecutiveSendFailures uint64
 }
 
 // runningGen tracks the one active generation's goroutine so
@@ -117,16 +132,36 @@ func (w *Worker) runGeneration(ctx context.Context, stopped chan struct{}, gen G
 
 func (w *Worker) sendGratuitousReply(senderIP net.IP, senderMAC net.HardwareAddr, dstIP net.IP, dstMAC net.HardwareAddr) {
 	if err := w.sender.Reply(senderIP, senderMAC, dstIP, dstMAC); err != nil {
+		atomic.AddUint64(&w.consecutiveSendFailures, 1)
 		if w.cfg.OnSendError != nil {
 			w.cfg.OnSendError(err)
 		}
-		// TODO(Milestone 2 hardening): a single dropped frame
-		// shouldn't tear down the whole generation (unchanged --
-		// still true, still the right call), but SUSTAINED failure
-		// should still escalate to a controller "fault" IPC message
-		// (internal/ipc/protocol.go), not just a log line. Needs a
-		// failure-rate/consecutive-failure counter, not built here.
+		return
 	}
+	// A single dropped frame doesn't tear down the whole generation (a
+	// single successful send elsewhere in the same tick still resets
+	// this to 0, which is deliberate -- see ConsecutiveSendFailures'
+	// own doc comment for why a global, not per-target, counter is the
+	// right granularity for what this is used for).
+	atomic.StoreUint64(&w.consecutiveSendFailures, 0)
+}
+
+// ConsecutiveSendFailures returns how many ARPSender.Reply() calls
+// have failed in a row since the most recent success, across every
+// target/direction combined -- reported to the controller in
+// "heartbeat_ack" messages (see cmd/pp-arp-worker/main.go's
+// HandleHeartbeat) so it can escalate a sustained run of failures (the
+// realistic case is the whole bound interface going down, which fails
+// every send regardless of target) into a real fail_open report,
+// rather than this only ever being visible as a local log line. A
+// global rather than per-target counter is the right granularity here:
+// the motivating failure mode (an interface going down) fails every
+// send at once, and this field only needs to answer "is ARP
+// transmission broken right now," not diagnose which specific target
+// is affected -- ipc.GenerationApplied's own ResolutionFailures already
+// covers per-target reporting at generation-apply time.
+func (w *Worker) ConsecutiveSendFailures() uint64 {
+	return atomic.LoadUint64(&w.consecutiveSendFailures)
 }
 
 // correctiveSet is what sendCorrective actually restores: a gateway
