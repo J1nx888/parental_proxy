@@ -485,8 +485,9 @@ entirely in the policy-computation and enforcement layers:
       requests a real friendly page via AdGuard's `$dnsrewrite` modifier
       (HTTPS deliberately excluded — see that module's own docstring;
       the live-verification section below has the full writeup).
-- [ ] **Captive portal (Phase 4) — not started**, but now has concrete
-      shape from this session's discussion: gate any newly-seen MAC
+- [ ] **Captive portal (Phase 4) — begun 2026-08-31** (user: "let's
+      begin Phase 4"), concrete shape from this session's discussion:
+      gate any newly-seen MAC
       not already registered as bypass/ignore; a kid-facing login that
       grants `is_authenticated` (DNS-tier) only, never `bump_enabled`;
       an admin-facing quick-add path at first sight of a new device
@@ -1283,8 +1284,15 @@ silently-swallowed ARP send failure, a dead-worker-connection case only
 a heartbeat could ever detect, a missing `iproute2` dependency) and the
 fixes for each.
 
-- [ ] **1. Topology probe** — passive discovery, full Orbi attachment
-      matrix, PCAP corpus.
+- [x] **1. Topology probe** — passive discovery, full Orbi attachment
+      matrix, PCAP corpus. **Struck as not needed, 2026-08-31** (user
+      decision): predates the pivot to ARP-spoofing-based interception,
+      and every later milestone's discovery/identity work
+      (`controller/discovery.py`, `rtnetlink_listener.py`,
+      `active_scan.py`, the live veth-harness poisoning proofs) already
+      covers what this item was meant to de-risk, without ever needing
+      a full Orbi attachment matrix or a standalone PCAP corpus. Not
+      attempted, not blocking anything downstream.
 - [x] **2. ARP worker MVP** — static targets, half-duplex, corrective
       restoration on shutdown, unit-tested packet serialization.
       **Scaffold written 2026-08-29** in `phase3/arp-worker/` (Go): the
@@ -1951,10 +1959,14 @@ fixes for each.
       the project owner's call on when to begin (deploying an
       ARP-spoofing daemon to the live LAN is exactly the kind of step
       this project's own testing discipline says shouldn't happen
-      without them directly involved). Everything upstream of this
-      (Milestones 1–9) is ready to support a soak test whenever that's
-      wanted; nothing else can be done to move Milestone 10 forward
-      before then.
+      without them directly involved). **Explicitly gated on two things
+      the user confirmed 2026-08-31**: pushing this stack to the real
+      production box, and shutting down the household's current Bark
+      Home setup (the thing this project replaces) — both are the
+      user's own infrastructure decisions, not something to plan around
+      autonomously. Everything upstream of this (Milestones 1–9) is
+      ready to support a soak test whenever those two things happen;
+      nothing else can be done to move Milestone 10 forward before then.
 
 Milestones 1–9 above (all but the soak test) have real, tested — several
 functionally verified against real nftables/real sockets/real subprocess
@@ -1973,7 +1985,42 @@ container so far, never on the real production Beelink box).
 
 ---
 
-## Phase 4 — Captive-portal forced enrollment (design sketch, not started)
+## Phase 4 — Captive-portal forced enrollment (begun 2026-08-31)
+
+**Foundational gap found while scoping the first real milestone, before
+any code was written**: today, a genuinely brand-new MAC (one
+`common/identity.py`'s `record_binding()` has never seen
+before) gets a `device_bindings` row with `device_id = NULL` --
+deliberate, per Milestone 4's "never auto-merge devices solely by
+hostname/vendor" rule. But `controller/desired_state.py`'s
+`db_backed_desired_state()` `JOIN`s `device_bindings` to `devices` on
+that same `device_id` -- a `NULL` device_id produces no row at all in
+that query, so a brand-new device isn't merely "not yet gated," it is
+**not an ARP-poisoning target of any kind**, meaning it gets full,
+unfiltered internet access, invisible to this project's own
+interception layer entirely, until a human manually creates and
+associates its `devices` row from the dashboard. Even if a `devices`
+row existed, `devices.is_authenticated` defaults to `1` in the schema
+("no login gate yet to fail" -- `common/policy_class.py`'s own
+docstring), which would classify it `AUTHENTICATED`, not `PREAUTH` --
+the opposite of "gated by default."
+
+This makes the actual first Phase 4 milestone **auto-creating a real,
+unassociated `devices` row (`is_authenticated = 0`, `ignored = 0`, no
+`user_id`) the moment any discovery source observes a genuinely new
+MAC**, rather than leaving it a dangling `device_id = NULL` binding --
+this is a new devices row created fresh for a MAC nothing has ever
+seen, not merging a MAC into an *existing* devices row by any kind of
+heuristic guess, so it doesn't conflict with Milestone 4's
+never-auto-merge rule; it resolves the never-auto-merge rule's own
+loose end (an association that previously required a human, indefinitely).
+Doing this correctly makes such a device classify as `PREAUTH`
+immediately, land in nftables' `unauthenticated_v4` set on the very
+next reconcile cycle (DNS-tier visibility/control from the moment it's
+first seen), and become gate-able by the portal login flow below --
+without this, the portal has nothing to gate in the first place.
+
+## Original design sketch (2026-08-30, not started at the time)
 
 Force all internet through the system regardless of per-device
 configuration, hijacking OS captive-portal-detection probes (Apple/
