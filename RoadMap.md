@@ -1449,6 +1449,63 @@ fixes for each.
       kernel's neighbor-cache state machine" technique to keep the
       controller unprivileged, versus asking the ARP worker itself to
       do it) rather than a mechanical build.
+
+      **TODO, next session — concrete plan, written up 2026-08-31 end
+      of night so this can start with minimal re-derivation:**
+
+      1. **Design decision to make first** (this is the one genuine
+         judgment call, not mechanical): how does the controller
+         trigger a fresh ARP resolution for a stale/onboarding device
+         without CAP_NET_RAW (deliberately withheld from it -- only
+         `phase3/arp-worker` holds that)? Two real options:
+         - **UDP-nudge** (controller stays unprivileged): open a UDP
+           socket and `sendto()` a closed port on the target IP. The
+           kernel attempts to resolve the IP at the routing layer as a
+           side effect, even though the "connection" itself fails
+           (ICMP port-unreachable) — no raw socket needed. Confirm this
+           genuinely nudges a `STALE`/absent neighbor entry toward
+           re-resolution on real Linux before committing to it (quick
+           to check directly on the smoke-test VM: delete/observe an
+           `ip neigh` entry, `sendto` a closed UDP port, check whether
+           the kernel re-resolves it).
+         - **Ask the worker to do it**: extend the IPC protocol with a
+           new op (e.g. `"probe"` — see `phase3/arp-worker/internal/ipc/protocol.go`
+           and `dispatch.go` for the existing message-type pattern) that
+           tells the worker to send a real ARP *request* (not just its
+           usual gratuitous *replies*) for a specific IP, since it
+           already holds `CAP_NET_RAW` and the raw socket. More
+           "correct" architecturally (matches "arp-worker owns all raw
+           packet I/O") but bigger — a new protocol message, a new Go
+           handler, a new Python IPC client method.
+         - Leaning UDP-nudge for a first cut: keeps the controller/
+           worker responsibility split unchanged, much smaller diff.
+           Worth 10 minutes of live confirmation on the VM before
+           committing, though, per this project's own "verify against
+           the real thing" discipline — don't assume the kernel
+           behavior, check it.
+      2. **Rate limiting**: the design doc's own phrase is "only when
+         stale or onboarding a new device" — needs a real definition of
+         "stale" (probably: an active `device_bindings` row whose
+         `last_seen_at` has exceeded some threshold, distinct from
+         `dashboard.py`'s own `HEALTH_STALE_AFTER_SECONDS` which is
+         about interception-runtime health, not device freshness) and
+         a genuine rate limit (a scan storm on a large household LAN is
+         a real, avoidable self-inflicted problem) — a `PeriodicTask`-
+         driven loop (matching `discovery.py`/`adguard_sync.py`'s own
+         shape) that scans at most N stale/pending devices per cycle is
+         probably right, not a scan-everything-every-cycle design.
+      3. **New module**: `controller/active_scan.py`, mirroring
+         `adguard_discovery.py`'s shape from tonight (a `scan_once()`
+         plus a `run_loop()`), wired into `controller/main.py` behind a
+         new optional CLI flag, matching the project's established
+         pattern (see `--adguard-discovery-interval`/
+         `--no-adguard-discovery` from tonight for the exact style to
+         copy).
+      4. **Tests**: unit tests for the rate-limiting/staleness-selection
+         logic (fully mockable, no real network needed) plus one live
+         VM confirmation that a real UDP-nudge (or worker-probe) against
+         a genuinely stale entry actually produces a fresh
+         `device_bindings` update end-to-end.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
       sets, atomic apply/rollback. **Scaffold written AND verified
       against real nftables 2026-08-29**, in `phase3/nftables-manager/`
@@ -1613,6 +1670,61 @@ fixes for each.
       unlikely — but that's still an assumption, not yet a result).
       Cheap to run whenever it's next worth doing, using the same
       throwaway setup.
+
+      **TODO, next session — exact reusable runbook** (condensed from
+      the two builds done tonight, so this doesn't need re-deriving;
+      all resources are throwaway and get deleted after, nothing here
+      touches the production `ppfaulttest`-based stack):
+      1. Bridge with **no IP conflicting with the gateway IP** (the
+         bridge needs SOME IP for `mdlayher/arp`'s client to bind, but
+         it must be disjoint from whatever IP the gateway stand-in
+         gets, or the bridge itself becomes an unwanted ARP-answering
+         L3 participant again — the exact bug this whole harness was
+         built to avoid):
+         `docker run --rm --network host --cap-add=NET_ADMIN alpine:3.20 sh -c 'apk add --no-cache iproute2; ip link add br-arptest type bridge; ip link set br-arptest up; ip addr add 10.7X.0.99/24 dev br-arptest'`
+      2. Two `--network none` containers (victim, gateway stand-in).
+         For each: `docker run -d --name pp-<role> --network none alpine:3.20 sleep 900`,
+         note its PID (`docker inspect --format '{{.State.Pid}}'`).
+      3. One veth pair per container, one end mastered into the bridge,
+         the other moved into that container's netns by PID, all from
+         one `--network host --pid=host --cap-add=NET_ADMIN` helper —
+         see tonight's exact commands in this session's history if the
+         condensed form here isn't enough; the technique is fully
+         proven, just mechanical to repeat.
+      4. Assign IPs inside each container via
+         `docker run --rm --network container:pp-<role> --cap-add=NET_ADMIN alpine:3.20 sh -c 'ip link set lo up; ip link set veth<X> up; ip addr add 10.7X.0.N/24 dev veth<X>'`.
+      5. Throwaway worker + controller, same production images, fresh
+         socket/DB volumes, pointed at the new bridge and the gateway
+         stand-in's real IP/MAC:
+         `docker run -d --name pp-test-worker --network host --cap-add=NET_RAW -v <sockvol>:/run/test parental_proxy-arp-worker:latest -iface=br-arptest -socket=/run/test/worker.sock -controller-uid=0`
+         then `docker run -d --name pp-test-controller --network host -v <sockvol>:/run/test -v <dbvol>:/testconfig parental_proxy-controller:latest --socket=/run/test/worker.sock --db-path=/testconfig/test.db --gateway-ip=<gw-ip> --gateway-mac=<gw-real-mac> --no-discovery --no-rtnetlink`.
+      6. Insert one real device/binding row for the victim directly via
+         `identity.record_binding(conn, mac, ip, source='snapshot')`
+         (see this session's own DB-insert snippets) so it becomes a
+         real poisoning target.
+      7. **For the gateway-reboot test specifically**: once poisoning
+         is confirmed live (victim resolves the worker's MAC), run
+         `docker stop pp-<gateway-role>` then `docker start pp-<gateway-role>`
+         a few seconds later. Watch `docker logs pp-test-worker`/
+         `pp-test-controller` throughout for anything unexpected
+         (crashes, IPC faults) — the expectation, not yet a confirmed
+         result, is "nothing happens" since poisoning doesn't depend on
+         the real gateway being reachable at all. Also confirm the
+         victim's own resolution behavior stays sane once the gateway
+         stand-in returns (a forced fresh resolution, same technique as
+         the NIC-down investigation, should show the real restored MAC
+         then get re-poisoned within one interval, same as every other
+         result tonight).
+      8. Use `nicolaka/netshoot` + `nsenter -t <PID> -n ip neigh ...`
+         for any real inspection/manipulation of a container's ARP
+         table from outside it — Alpine's own `iproute2` package is
+         just a busybox-applet shim with no real `neigh del` support,
+         confirmed the hard way tonight.
+      9. Clean up after: `docker rm -f` every throwaway container,
+         `docker volume rm` both volumes, `ip link del br-arptest` (via
+         the same privileged-helper technique). Confirm the production
+         stack's `/health` is still green before and after, same as
+         every other test tonight.
 
       **Follow-up the same night: isolated the NIC-down/up question from
       a deeper, more consequential one, and found real cause for doubt
