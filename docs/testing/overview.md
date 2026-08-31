@@ -256,11 +256,39 @@ smoke-test VM separately, before any of this code was written -- not
 re-verified by these mocked tests, which only exercise this module's
 own logic.
 
+**Same night, third follow-up**: scoping Phase 4's first real milestone
+(gating a genuinely new device by default -- see
+docs/architecture/overview.md's "Auto-gating new devices" entry) found
+that `common/identity.py`'s `record_binding()` needed to auto-create a
+pending `devices` row for a MAC never seen before, rather than leaving
+it a dangling `device_id = NULL` binding invisible to
+`controller/desired_state.py`'s own `JOIN`. This is a real behavior
+change to a function nearly every other test file in this suite already
+calls, so most existing tests needed no changes at all (they already
+pre-create a `devices` row via their own `_add_device` helper before
+calling `record_binding`, so the new auto-create path never triggers for
+them) -- only `tests/test_identity_bindings.py`'s own tests that
+deliberately exercised the "brand-new, unassociated MAC" case needed
+updating to expect a real `device_id` and a `device_auto_created` event
+instead of `None`/`binding_pending_association`. Two new tests there
+cover the one-time-only condition (a MAC's second-ever binding reuses
+the same auto-created device, never creates a second one) and the
+explicit "no retroactive backfill" product decision (an
+already-known-but-unassociated MAC from before this shipped, simulated
+by inserting a `device_id = NULL` row directly, stays unassociated even
+across a later DHCP renewal). Two more new tests, in
+`tests/test_controller_desired_state.py` and
+`tests/test_controller_policy_state.py`, are the actual end-to-end proof
+of the fix: calling `record_binding()` alone, with no `devices` row
+pre-created at all, now produces a real poisoning target that lands in
+nftables' `unauthenticated_v4` set -- which is exactly the "invisible to
+interception entirely" gap this change closes.
+
 Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (494 as of 2026-08-31 -- `AF_UNIX`-only files still
+authoritative total (498 as of 2026-08-31 -- `AF_UNIX`-only files still
 skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
-of the same suite at this commit collects 464 passed, 30 skipped, while
-Linux collects all 494) rather than trusting the sum of this table.
+of the same suite at this commit collects 468 passed, 30 skipped, while
+Linux collects all 498) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

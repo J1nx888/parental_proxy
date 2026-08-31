@@ -169,6 +169,20 @@ take effect everywhere.
   Rate-limited (`--active-scan-limit` bindings per `--active-scan-interval`,
   only bindings older than `--active-scan-stale-after`) to avoid a scan
   storm on a large LAN.
+- **Auto-gating new devices** (`common/identity.py`'s `record_binding()`,
+  added 2026-08-31, Phase 4's first milestone) -- a MAC genuinely never
+  seen before now gets a brand-new, unassociated `devices` row
+  auto-created for it (`is_authenticated = 0`, landing it in
+  `common/policy_class.py`'s `PREAUTH`), rather than a dangling
+  `device_id = NULL` binding. Closes a real gap: previously such a
+  device was invisible to `controller/desired_state.py`'s own `JOIN`
+  and got no interception of any kind (full, unfiltered access) until
+  a human manually created its `devices` row via the dashboard. Only
+  fires the first time a MAC is ever recorded -- an already-known-but-
+  unassociated MAC from before this shipped is deliberately left alone
+  (no retroactive backfill, a 2026-08-31 product decision), even across
+  a later DHCP renewal. This is the foundation the captive-portal login
+  flow itself (not yet built) will sit on top of.
 
 ---
 

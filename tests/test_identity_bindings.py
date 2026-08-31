@@ -32,23 +32,81 @@ def _events(conn):
 
 # ------------------------------------------------------------- new bindings
 
-def test_new_mac_creates_pending_binding_and_event(conn):
+def test_new_mac_auto_creates_a_pending_devices_row_and_event(conn):
+    """Phase 4 addition, 2026-08-31: a genuinely brand-new MAC (no
+    devices row, no prior device_bindings row at all) gets a fresh,
+    unassociated devices row auto-created for it, is_authenticated=0
+    (PREAUTH) -- see record_binding's own docstring for why this
+    closes a real gap (an unassociated device previously got NO
+    interception at all, invisible to desired_state.py's own JOIN)."""
     identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink", seen_at="2026-08-29T00:00:00Z")
 
     rows = _bindings(conn)
     assert len(rows) == 1
-    assert rows[0]["device_id"] is None
+    assert rows[0]["device_id"] is not None
     assert rows[0]["mac_address"] == MAC_A
     assert rows[0]["ipv4_address"] == IP_1
     assert rows[0]["first_seen_at"] == "2026-08-29T00:00:00Z"
     assert rows[0]["last_seen_at"] == "2026-08-29T00:00:00Z"
     assert rows[0]["active"] == 1
 
+    device = conn.execute(
+        "SELECT * FROM devices WHERE id = ?", (rows[0]["device_id"],)
+    ).fetchone()
+    assert device["mac_address"] == MAC_A
+    assert device["is_authenticated"] == 0, "must override the schema's own default of 1"
+    assert device["ignored"] == 0
+    assert device["user_id"] is None
+
     events = _events(conn)
     assert len(events) == 1
-    assert events[0]["event_type"] == "binding_pending_association"
-    assert events[0]["device_id"] is None
+    assert events[0]["event_type"] == "device_auto_created"
+    assert events[0]["device_id"] == rows[0]["device_id"]
     assert events[0]["mac_address"] == MAC_A
+
+
+def test_new_mac_on_a_second_ever_binding_still_does_not_auto_associate(conn):
+    """The auto-create only ever fires on a MAC's first-ever binding --
+    a second, brand-new binding for an ALREADY-known MAC (e.g. two IPs
+    briefly both seen before conflict resolution reconciles them, or a
+    caller building rows directly) must reuse the same devices row, not
+    create a second one."""
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink", seen_at="2026-08-29T00:00:00Z")
+    first_device_id = _bindings(conn)[0]["device_id"]
+
+    identity.record_binding(conn, MAC_A, IP_2, source="rtnetlink", seen_at="2026-08-29T00:05:00Z")
+
+    device_ids = {row["device_id"] for row in _bindings(conn)}
+    assert device_ids == {first_device_id}, "must reuse the same auto-created device, not create a second"
+    assert conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"] == 1
+
+
+def test_an_already_known_unassociated_mac_is_never_retroactively_auto_created(conn):
+    """Grandfather clause, per the explicit 2026-08-31 product decision
+    (no retroactive backfill -- see record_binding's own docstring): a
+    MAC that already had a device_bindings row (even an inactive,
+    long-superseded one) BEFORE this feature shipped must never get a
+    devices row auto-created for it later, even across a normal DHCP
+    renewal -- only a MAC with NO prior binding at all qualifies."""
+    # Simulates a pre-existing, already-known-but-unassociated binding,
+    # as if written by a version of this code before the auto-create
+    # fix existed: a real device_bindings row with device_id NULL.
+    conn.execute(
+        "INSERT INTO device_bindings "
+        "(device_id, mac_address, ipv4_address, first_seen_at, last_seen_at, source, active) "
+        "VALUES (NULL, ?, ?, '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z', 'snapshot', 0)",
+        (MAC_A, IP_1),
+    )
+
+    # A later DHCP renewal for the SAME already-known MAC, onto a new IP.
+    identity.record_binding(conn, MAC_A, IP_2, source="rtnetlink", seen_at="2026-08-31T00:00:00Z")
+
+    row = conn.execute(
+        "SELECT device_id FROM device_bindings WHERE ipv4_address = ?", (IP_2,)
+    ).fetchone()
+    assert row["device_id"] is None, "a MAC already known before this feature shipped stays unassociated"
+    assert conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"] == 0
+    assert {e["event_type"] for e in _events(conn)} == {"binding_pending_association"}
 
 
 def test_known_mac_associates_device_id_without_a_pending_event(conn):
@@ -86,14 +144,14 @@ def test_ip_reassigned_deactivates_old_binding_and_logs_event(conn):
     rows = {r["mac_address"]: r for r in _bindings(conn)}
     assert rows[MAC_A]["active"] == 0, "the old MAC_A/IP_1 binding must be deactivated"
     assert rows[MAC_B]["active"] == 1
-    assert rows[MAC_B]["device_id"] is None  # MAC_B itself is still unassociated
+    assert rows[MAC_B]["device_id"] is not None  # MAC_B auto-got a fresh, pending devices row
 
     # Two events, not one: the conflict itself ("ip_reassigned"), plus
-    # MAC_B's own "binding_pending_association" since MAC_B has never
-    # been seen before and isn't associated with any devices row either
-    # -- the two are independent facts about this single observation.
+    # MAC_B's own "device_auto_created" since MAC_B has never been seen
+    # before -- the two are independent facts about this single
+    # observation.
     events = {e["event_type"]: e for e in _events(conn)}
-    assert set(events) == {"ip_reassigned", "binding_pending_association"}
+    assert set(events) == {"ip_reassigned", "device_auto_created"}
 
     reassigned = events["ip_reassigned"]
     assert reassigned["device_id"] == device_a["id"]
@@ -101,9 +159,10 @@ def test_ip_reassigned_deactivates_old_binding_and_logs_event(conn):
     assert reassigned["ipv4_address"] == IP_1
     assert json.loads(reassigned["payload_json"]) == {"new_mac_address": MAC_B}
 
-    pending = events["binding_pending_association"]
-    assert pending["mac_address"] == MAC_B
-    assert pending["ipv4_address"] == IP_1
+    auto_created = events["device_auto_created"]
+    assert auto_created["device_id"] == rows[MAC_B]["device_id"]
+    assert auto_created["mac_address"] == MAC_B
+    assert auto_created["ipv4_address"] == IP_1
 
 
 def test_device_ip_changed_deactivates_old_binding_and_logs_event(conn):

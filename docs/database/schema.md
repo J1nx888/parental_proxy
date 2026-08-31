@@ -382,18 +382,24 @@ than overwriting in place, with `active` marking which one to trust right
 now. Written exclusively through `common/identity.py`'s
 `record_binding()`, which handles both conflict shapes (IP reassigned to a
 new MAC; a device's own IP changing) by deactivating the stale row and
-logging a `network_events` row. `device_id` is nullable and deliberately
-never auto-associated from network data alone (no hostname/vendor
-guessing) -- a brand-new MAC gets a pending (`device_id` NULL) binding
-awaiting a human association via the dashboard. **Freshness caveat**: the
-only thing that calls `record_binding()` today is
-`controller/discovery.py`'s `snapshot_once()`, a periodic `ip neigh show`
-poll -- wired into an actual running loop as of 2026-08-30
-(`discovery.run_loop()`, started from `controller/main.py`), so staleness
-is now bounded by that loop's interval (`--discovery-interval`, default
-30s) rather than unbounded. The higher-precedence live rtnetlink-event
-listener still doesn't exist -- see `docs/security/overview.md` §3 for
-the concrete consequence this still has for identity resolution.
+logging a `network_events` row. `device_id` is never auto-associated with
+an *existing* `devices` row from network data alone (no hostname/vendor
+guessing) -- but as of 2026-08-31 (Phase 4), a MAC genuinely never seen
+before (no prior `device_bindings` row of any kind for it) gets a brand
+new, unassociated `devices` row auto-created (`is_authenticated = 0`,
+PREAUTH) rather than a dangling `device_id = NULL` binding: this closes a
+real gap where such a device was invisible to `desired_state.py`'s own
+join and got no interception at all. An already-known-but-unassociated
+MAC from before this shipped is deliberately left alone (no retroactive
+backfill) even across a later DHCP renewal -- see `record_binding()`'s own
+docstring for the exact one-time-only condition. **Freshness caveat**:
+`record_binding()` is called from `controller/discovery.py`'s
+`snapshot_once()` (a periodic `ip neigh show` poll, wired into a running
+loop since 2026-08-30 via `discovery.run_loop()`) and the higher-
+precedence live `controller/rtnetlink_listener.py` (wired in by default
+alongside `--db-path`, see `--no-rtnetlink`) -- see
+`docs/security/overview.md` §3 for how these two sources bound the
+remaining DHCP-renewal staleness window.
 Indexed on `device_id` and on `(ipv4_address, active)`.
 
 ### `interception_runtime`
@@ -428,7 +434,7 @@ This is the "outbox events" RoadMap.md's Milestone 4 refers to. Written by
 | Column         | Type    | Constraints |
 |---|---|---|
 | `id`            | INTEGER | PRIMARY KEY |
-| `event_type`    | TEXT    | NOT NULL, free-text (e.g. `ip_reassigned`, `ip_changed`, `binding_pending_association`) |
+| `event_type`    | TEXT    | NOT NULL, free-text (e.g. `ip_reassigned`, `ip_changed`, `device_auto_created`, `binding_pending_association`) |
 | `device_id`     | INTEGER | REFERENCES `devices(id)` ON DELETE SET NULL, nullable |
 | `mac_address`   | TEXT    | nullable |
 | `ipv4_address`  | TEXT    | nullable |

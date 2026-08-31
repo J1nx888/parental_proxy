@@ -92,6 +92,21 @@ def test_bump_enabled_but_ignored_device_is_excluded_from_bump(conn):
     assert policy["bump"] == []
 
 
+def test_brand_new_mac_with_no_pre_existing_devices_row_lands_in_unauthenticated(conn):
+    """End-to-end proof of the Phase 4 gap fix, 2026-08-31: a MAC with
+    NO devices row created ahead of time (unlike every other test in
+    this file, which pre-creates one via _add_device) still ends up
+    gated in the unauthenticated_v4 set on its very first observation,
+    since identity.record_binding() now auto-creates a PREAUTH devices
+    row for it -- not silently excluded from every set the way a
+    device_id = NULL binding used to be."""
+    identity.record_binding(conn, "aa:bb:cc:dd:ee:99", "192.168.1.99", source="rtnetlink")
+    policy = compute_desired_policy(conn)
+    assert policy["unauthenticated"] == ["192.168.1.99"]
+    assert policy["authenticated"] == []
+    assert policy["bypass"] == []
+
+
 def test_device_with_no_binding_is_excluded_from_every_set(conn):
     _add_device(conn, "aa:bb:cc:dd:ee:01")
     policy = compute_desired_policy(conn)

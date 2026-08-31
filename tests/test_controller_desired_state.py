@@ -103,6 +103,20 @@ def test_device_with_two_simultaneously_active_bindings_contributes_only_the_fre
     assert desired.targets == (Target(ip="192.168.1.22", mac="aa:bb:cc:dd:ee:01"),)
 
 
+def test_brand_new_mac_with_no_pre_existing_devices_row_still_becomes_a_target(conn):
+    """Regression test for the real gap found scoping Phase 4, 2026-08-31
+    (see RoadMap.md and identity.record_binding's own docstring): before
+    the auto-create fix, a MAC observed with no devices row ever created
+    for it got device_id = NULL, invisible to this module's own JOIN --
+    full, unfiltered access, not merely "ungated." record_binding() now
+    auto-creates a fresh, unassociated (PREAUTH) devices row the first
+    time a MAC is ever seen, which is what makes it show up here at all."""
+    identity.record_binding(conn, "aa:bb:cc:dd:ee:99", "192.168.1.99", source="rtnetlink")
+
+    desired = db_backed_desired_state(conn, GATEWAY)
+    assert desired.targets == (Target(ip="192.168.1.99", mac="aa:bb:cc:dd:ee:99"),)
+
+
 def test_full_duplex_flag_passed_through(conn):
     desired = db_backed_desired_state(conn, GATEWAY, full_duplex=True)
     assert desired.full_duplex is True

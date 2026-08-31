@@ -38,13 +38,40 @@ def record_binding(
       - Device moved: this mac_address was actively bound to a
         DIFFERENT ipv4_address (e.g. a normal DHCP lease renewal).
 
-    Never auto-associates a brand-new binding with a `devices` row
-    beyond reusing whatever device_id (if any) an existing binding for
-    the same mac_address already carries, or a `devices` row whose
-    mac_address already matches -- a MAC seen for the very first time
-    gets a pending (device_id NULL) binding, requiring a human
-    association, per the roadmap's "never auto-merge devices solely by
-    hostname/vendor" rule.
+    Reuses whatever device_id (if any) an existing binding for the same
+    mac_address already carries, or a `devices` row whose mac_address
+    already matches -- this is never a heuristic guess (hostname/vendor
+    matching, which the roadmap's "never auto-merge devices solely by
+    hostname/vendor" rule forbids), only an exact mac_address match.
+
+    **Phase 4 addition, 2026-08-31**: a MAC this function has genuinely
+    NEVER seen before (no `devices` row, and no `device_bindings` row
+    of any kind -- active or inactive -- has ever existed for it
+    either) gets a brand-new, unassociated `devices` row auto-created
+    for it (`is_authenticated = 0`, `ignored = 0`, no `user_id`) rather
+    than being left with a dangling `device_id = NULL` binding
+    requiring a human to notice and manually associate it. This closes
+    a real gap `controller/desired_state.py`'s own docstring didn't
+    used to have to think about: a `device_id = NULL` binding is
+    invisible to that module's `JOIN`, so a brand-new device previously
+    got NO interception of any kind (full, unfiltered access) until
+    someone happened to visit the dashboard and create it manually --
+    the opposite of Phase 4's "gate any newly-seen MAC by default."
+    `is_authenticated = 0` (not the `devices` table's own schema
+    default of `1`) is deliberate: that default exists for a device an
+    admin creates directly through today's dashboard (an admin manually
+    adding a device already implies trust), not for a MAC nobody has
+    looked at yet -- see `common/policy_class.py`'s `classify_device()`,
+    which puts a device with `is_authenticated = 0` into `PREAUTH`.
+
+    This auto-create only ever fires the FIRST time a given MAC is ever
+    recorded -- once any `device_bindings` row exists for a MAC (even
+    an inactive, long-superseded one), this function never auto-creates
+    a `devices` row for it again, so an already-known-but-unassociated
+    device from before this feature shipped is deliberately left alone
+    (per an explicit 2026-08-31 product decision: no retroactive
+    backfill, only newly-observed MACs going forward) even across a
+    later DHCP renewal.
     """
     seen_at = seen_at or db.now_iso()
 
@@ -102,13 +129,34 @@ def record_binding(
     if device_id is None:
         device_id = _existing_device_id_for_mac(conn, mac_address)
 
+    auto_created = False
+    if device_id is None and not _mac_has_any_prior_binding(conn, mac_address):
+        # Genuinely never seen before -- see this function's own
+        # docstring for why this is the one case that auto-creates a
+        # devices row, and why an already-known-but-unassociated MAC
+        # (any prior binding at all, even inactive) deliberately does
+        # NOT hit this path.
+        device_id = _create_pending_device(conn, mac_address, seen_at)
+        auto_created = True
+
     conn.execute(
         "INSERT INTO device_bindings "
         "(device_id, mac_address, ipv4_address, first_seen_at, last_seen_at, source, confidence, active) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
         (device_id, mac_address, ipv4_address, seen_at, seen_at, source, confidence),
     )
-    if device_id is None:
+    if auto_created:
+        _record_event(
+            conn,
+            "device_auto_created",
+            device_id=device_id,
+            mac_address=mac_address,
+            ipv4_address=ipv4_address,
+            source=source,
+            observed_at=seen_at,
+            payload=None,
+        )
+    elif device_id is None:
         _record_event(
             conn,
             "binding_pending_association",
@@ -124,6 +172,38 @@ def record_binding(
 def _existing_device_id_for_mac(conn: sqlite3.Connection, mac_address: str) -> int | None:
     row = conn.execute("SELECT id FROM devices WHERE mac_address = ?", (mac_address,)).fetchone()
     return row["id"] if row is not None else None
+
+
+def _mac_has_any_prior_binding(conn: sqlite3.Connection, mac_address: str) -> bool:
+    """Whether ANY device_bindings row -- active or inactive -- has ever
+    existed for this mac_address. Deliberately broader than the
+    active=1 check record_binding() already does for its own conflict
+    handling above: this is what makes the auto-create-a-devices-row
+    behavior a one-time, first-observation-only thing rather than
+    something that could fire again later (e.g. on a DHCP renewal) for
+    a MAC that was already known before this feature shipped, per the
+    explicit "new MACs only, no retroactive backfill" product decision.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM device_bindings WHERE mac_address = ? LIMIT 1", (mac_address,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _create_pending_device(conn: sqlite3.Connection, mac_address: str, seen_at: str) -> int:
+    """Auto-creates a brand-new, unassociated `devices` row for a MAC
+    genuinely never seen before -- see record_binding()'s own docstring
+    for the full reasoning. `is_authenticated = 0` deliberately
+    overrides the `devices` table's own schema default of `1`.
+    """
+    cur = conn.execute(
+        "INSERT INTO devices (mac_address, is_authenticated, ignored, created_at) "
+        "VALUES (?, 0, 0, ?)",
+        (mac_address, seen_at),
+    )
+    return cur.lastrowid
 
 
 def active_binding_ip(conn: sqlite3.Connection, device_id: int) -> str | None:
