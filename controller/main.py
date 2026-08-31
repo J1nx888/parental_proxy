@@ -435,6 +435,7 @@ def run_cycle(
                     health_conn,
                     f"arp-worker: {consecutive_send_failures} consecutive ARP send "
                     "failures (the bound network interface is likely down)",
+                    applied_generation=applied.generation if applied else 0,
                 )
             else:
                 health.report_healthy(health_conn, applied.generation if applied else 0)
