@@ -46,7 +46,8 @@ def compute_desired_policy(conn: sqlite3.Connection) -> dict[str, list[str]]:
 
     rows = conn.execute(
         """
-        SELECT d.ignored, d.quarantined_at, d.is_authenticated, d.bump_enabled, b.ipv4_address
+        SELECT d.ignored, d.quarantined_at, d.is_authenticated, d.bump_enabled,
+               d.bypass_login, b.ipv4_address
         FROM devices d
         JOIN device_bindings b ON b.device_id = d.id AND b.active = 1
         """

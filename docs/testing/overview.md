@@ -353,11 +353,41 @@ as expected; that part was checked separately by driving a real browser
 and overriding `window.confirm` to simulate both Cancel (checkbox
 reverts to unchecked) and OK (stays checked).
 
+**Same night, seventh follow-up**: building the portal-side admin
+action (docs/architecture/overview.md) surfaced a real bug --
+`common/policy_class.py`'s `classify_device()` never consulted
+`bypass_login` at all, so it had zero effect on real nftables policy
+despite existing documentation claiming otherwise. Two new regression
+tests in `tests/test_policy_class.py` (a `bypass_login` device
+classifies `AUTHENTICATED` even while `is_authenticated = 0`; it does
+NOT also short-circuit quarantine the way `ignored` does) and one true
+end-to-end proof in `tests/test_controller_policy_state.py`
+(`compute_desired_policy()` -- which needed its own fix, a missing
+`bypass_login` column in the query -- puts such a device in the real
+`"authenticated"` set). `tests/test_auth.py` gained 6 tests for the new
+`verify_admin_credentials()` (accepts right creds, rejects wrong
+username/password, fails closed with no expected username/hash/empty
+hash) -- one function now shared by both the dashboard's HTTP-Basic
+admin login and the new portal action, tested once rather than through
+each caller separately. 11 new tests in
+`tests/test_captive_portal_server.py` cover the admin section itself:
+rendered only when relevant (no group dropdown with zero groups),
+Bypass and assign-to-group both work end-to-end (including that
+assign-to-group correctly clears a prior `user_id`, satisfying the
+table's own mutual-exclusivity `CHECK`), wrong admin credentials (or a
+kid's own credentials) are rejected, a nonexistent group is rejected,
+and the admin action genuinely shares the kid-login rate limiter rather
+than getting its own separate budget. Also visually and interactively
+verified in a live browser: opened the collapsed admin section, filled
+in real credentials, selected a real group from the live dropdown, and
+confirmed the device's `group_id`/`is_authenticated` actually changed
+in the dev DB afterward.
+
 Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (531 as of 2026-08-31 -- `AF_UNIX`-only files still
+authoritative total (551 as of 2026-08-31 -- `AF_UNIX`-only files still
 skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
-of the same suite at this commit collects 501 passed, 30 skipped, while
-Linux collects all 531) rather than trusting the sum of this table.
+of the same suite at this commit collects 521 passed, 30 skipped, while
+Linux collects all 551) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

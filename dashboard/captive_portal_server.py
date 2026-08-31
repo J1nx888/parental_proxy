@@ -61,9 +61,27 @@ dropping tcp/udp 443 for unauthenticated_v4 too) rather than something
 silently added here without verifying it doesn't also break the OS's
 own captive-portal-assistant webview, which sometimes needs its own
 auxiliary HTTPS requests to render correctly.
+
+**Portal-side admin action, added 2026-08-31**: the design sketch's
+admin-facing quick-add path (RoadMap.md) originally offered two ways to
+handle a gated device -- "the same portal screen, or a separate device
+with real dashboard access." Only the latter existed until now
+(Milestone 2's dashboard Bypass/Manage actions). This adds the former,
+for when an admin is physically at the gated device itself: a
+collapsed `<details>` section on the same login page, asking for the
+SAME admin credentials `dashboard/dashboard.py`'s HTTP-Basic login
+checks (`common/auth.py`'s `verify_admin_credentials()`, factored out
+of `dashboard.py`'s own `_check_admin_auth` so there's exactly one
+admin-credential check, not two), offering **Bypass** (identical effect
+to the dashboard's own `/devices/bypass_login`) or **assign to a
+group**. Shares this module's own per-IP rate limiter with the kid
+login form above -- a wrong admin-password guess counts against the
+same budget, which is the more conservative choice given this surface
+grants strictly more than the kid login ever does.
 """
 from __future__ import annotations
 
+import html
 import logging
 import sqlite3
 import threading
@@ -128,10 +146,16 @@ h1{{font-size:1.15rem;margin:0 0 .5rem;}}
 p{{font-size:.92rem;opacity:.75;}}
 .error{{color:#dc2626;font-size:.85rem;margin:0 0 .75rem;}}
 form{{display:flex;flex-direction:column;gap:.6rem;margin-top:1.25rem;}}
-input{{font-size:1rem;padding:.55rem .7rem;border-radius:8px;border:1px solid #94a3b8;
+input,select{{font-size:1rem;padding:.55rem .7rem;border-radius:8px;border:1px solid #94a3b8;
 background:transparent;color:inherit;}}
 button{{font-size:1rem;padding:.6rem;border-radius:8px;border:none;background:#2f6fed;
 color:white;cursor:pointer;}}
+details{{margin-top:1.75rem;text-align:left;}}
+summary{{cursor:pointer;font-size:.85rem;opacity:.65;}}
+details form{{margin-top:.75rem;}}
+.group-row{{display:flex;gap:.4rem;}}
+.group-row select{{flex:1;}}
+.group-row button{{background:#475569;flex:none;}}
 </style></head><body>
 <div class='icon'>
 <svg width='28' height='28' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2.2'
@@ -147,7 +171,28 @@ stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l8 3.5v5.2c0 4.7-3.
   <button type="submit">Sign in</button>
 </form>
 <p>Not your login? Ask a parent to bypass or assign this device from the dashboard instead.</p>
+<details>
+<summary>Parent or admin? Handle this device directly</summary>
+<form method="post" action="/admin">
+  {admin_error}
+  <input type="text" name="admin_username" placeholder="Admin username" autocapitalize="none" autocorrect="off" required>
+  <input type="password" name="admin_password" placeholder="Admin password" required>
+  <button type="submit" name="action" value="bypass">Let this device online without logging in</button>
+{group_row}
+</form>
+</details>
 </body></html>
+"""
+
+# Only rendered when at least one group already exists (dashboard
+# /groups) -- a device an admin wants group-based rules for, without
+# needing a personal login, matching the design sketch's own "assign
+# to a device group" phrasing.
+_GROUP_ROW_TEMPLATE = """\
+  <div class="group-row">
+    <select name="group_id">{options}</select>
+    <button type="submit" name="action" value="assign_group">Assign to group</button>
+  </div>\
 """
 
 _SUCCESS_TEMPLATE = """\
@@ -185,10 +230,48 @@ _BUMP_REMINDER_HTML = (
     "to do the same for this one if you need it here too.</p>"
 )
 
+_ADMIN_ACTION_SUCCESS_TEMPLATE = """\
+<!doctype html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Done</title>
+<style>
+:root{{color-scheme:light dark;}}
+body{{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:24rem;margin:4rem auto;
+padding:0 1.25rem;text-align:center;color:#1e293b;}}
+@media (prefers-color-scheme:dark){{body{{color:#e5eaf3;}}}}
+h1{{font-size:1.15rem;margin:0 0 .5rem;}}
+p{{font-size:.92rem;opacity:.75;}}
+</style></head><body>
+<h1>Done.</h1>
+<p>{message} It can take up to about 10 seconds for this device's
+internet access to actually open up.</p>
+</body></html>
+"""
 
-def _render(username_error: str | None = None) -> bytes:
-    error_html = f'<p class="error">{username_error}</p>' if username_error else ""
-    return _PAGE_TEMPLATE.format(error=error_html).encode("utf-8")
+
+def _render_admin_success(message: str) -> bytes:
+    return _ADMIN_ACTION_SUCCESS_TEMPLATE.format(message=html.escape(message)).encode("utf-8")
+
+
+def _fetch_groups(conn: sqlite3.Connection) -> list:
+    return conn.execute("SELECT id, name FROM groups ORDER BY name").fetchall()
+
+
+def _render(
+    username_error: str | None = None, admin_error: str | None = None, groups: list | None = None
+) -> bytes:
+    error_html = f'<p class="error">{html.escape(username_error)}</p>' if username_error else ""
+    admin_error_html = f'<p class="error">{html.escape(admin_error)}</p>' if admin_error else ""
+    if groups:
+        options = "".join(
+            f'<option value="{g["id"]}">{html.escape(g["name"])}</option>' for g in groups
+        )
+        group_row = _GROUP_ROW_TEMPLATE.format(options=options)
+    else:
+        group_row = ""
+    return _PAGE_TEMPLATE.format(
+        error=error_html, admin_error=admin_error_html, group_row=group_row
+    ).encode("utf-8")
 
 
 def _render_success(show_bump_reminder: bool) -> bytes:
@@ -217,8 +300,16 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's own naming convention
         # Deliberately the SAME response regardless of path/Host -- see
         # this module's own docstring for why that alone is enough to
-        # trigger every major OS's captive-portal-detected UI.
-        self._send_html(200, _render())
+        # trigger every major OS's captive-portal-detected UI. Groups
+        # DO need a real DB read (unlike the rest of this response,
+        # which is static) so the admin section's dropdown reflects
+        # whatever groups actually exist right now.
+        conn = db.get_conn()
+        try:
+            groups = _fetch_groups(conn)
+        finally:
+            conn.close()
+        self._send_html(200, _render(groups=groups))
 
     def do_HEAD(self) -> None:  # noqa: N802
         self.send_response(200)
@@ -229,12 +320,20 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw_body = self.rfile.read(length) if length else b""
         fields = parse_qs(raw_body.decode("utf-8", errors="replace"))
-        username = (fields.get("username") or [""])[0].strip()
-        password = (fields.get("password") or [""])[0]
+        path = self.path.split("?", 1)[0]
 
         conn = db.get_conn()
         try:
-            self._handle_login(conn, username, password)
+            if path == "/admin":
+                self._handle_admin_action(conn, fields)
+            else:
+                # Every other path is the kid-login form -- matching
+                # do_GET's own "same response regardless of path"
+                # design, POST only branches on the one path the admin
+                # section's own form actually targets.
+                username = (fields.get("username") or [""])[0].strip()
+                password = (fields.get("password") or [""])[0]
+                self._handle_login(conn, username, password)
         finally:
             conn.close()
 
@@ -243,7 +342,7 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
         if _is_rate_limited(client_ip):
             log.warning("rate-limited login attempt from %s", client_ip)
             self._send_html(
-                200, _render("Too many attempts -- wait a minute before trying again.")
+                200, _render("Too many attempts -- wait a minute before trying again.", groups=_fetch_groups(conn))
             )
             return
 
@@ -258,7 +357,11 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
             # rather than silently retrying.
             log.warning("login attempt from %s but no active binding was found", client_ip)
             self._send_html(
-                200, _render("We couldn't identify your device on the network yet -- try again shortly.")
+                200,
+                _render(
+                    "We couldn't identify your device on the network yet -- try again shortly.",
+                    groups=_fetch_groups(conn),
+                ),
             )
             return
 
@@ -266,7 +369,7 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
         if user is None or not auth.verify_password(password, user["password_hash"]):
             _record_failed_attempt(client_ip)
             log.info("failed login for username=%r from device %s", username, device["mac_address"])
-            self._send_html(200, _render("Incorrect username or password."))
+            self._send_html(200, _render("Incorrect username or password.", groups=_fetch_groups(conn)))
             return
 
         _clear_failed_attempts(client_ip)
@@ -293,6 +396,95 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
             (user["id"], device["id"]),
         ).fetchone() is not None
         self._send_html(200, _render_success(has_bump_elsewhere))
+
+    def _handle_admin_action(self, conn: sqlite3.Connection, fields: dict) -> None:
+        client_ip = self.client_address[0]
+        admin_username = (fields.get("admin_username") or [""])[0].strip()
+        admin_password = (fields.get("admin_password") or [""])[0]
+        action = (fields.get("action") or [""])[0]
+
+        # Shares the kid-login form's own rate limiter above rather
+        # than a separate budget -- see this module's own docstring for
+        # why that's the more conservative choice (this surface grants
+        # strictly more than the kid login ever does).
+        if _is_rate_limited(client_ip):
+            log.warning("rate-limited admin action attempt from %s", client_ip)
+            self._send_html(
+                200,
+                _render(
+                    admin_error="Too many attempts -- wait a minute before trying again.",
+                    groups=_fetch_groups(conn),
+                ),
+            )
+            return
+
+        expected_user = db.get_setting(conn, "admin_username")
+        expected_hash = db.get_setting(conn, "admin_password_hash")
+        if not auth.verify_admin_credentials(admin_username, admin_password, expected_user, expected_hash):
+            _record_failed_attempt(client_ip)
+            log.info("failed portal admin action attempt from %s", client_ip)
+            self._send_html(
+                200,
+                _render(admin_error="Incorrect admin username or password.", groups=_fetch_groups(conn)),
+            )
+            return
+
+        _clear_failed_attempts(client_ip)
+
+        device = resolve_device(conn, client_ip)
+        if device is None:
+            log.warning("admin action from %s but no active binding was found", client_ip)
+            self._send_html(
+                200,
+                _render(
+                    admin_error="We couldn't identify this device on the network yet -- try again shortly.",
+                    groups=_fetch_groups(conn),
+                ),
+            )
+            return
+
+        if action == "bypass":
+            # Identical effect to dashboard.py's own
+            # /devices/bypass_login -- only ever touches this one
+            # column, same reasoning as that route's own docstring.
+            conn.execute("UPDATE devices SET bypass_login = 1 WHERE id = ?", (device["id"],))
+            conn.commit()
+            log.info("device %s bypassed via portal admin action", device["mac_address"])
+            self._send_html(200, _render_admin_success("This device no longer needs to log in."))
+            return
+
+        if action == "assign_group":
+            group_id = (fields.get("group_id") or [""])[0]
+            group = conn.execute("SELECT id, name FROM groups WHERE id = ?", (group_id,)).fetchone()
+            if group is None:
+                self._send_html(
+                    200,
+                    _render(admin_error="That group no longer exists -- refresh and try again.",
+                            groups=_fetch_groups(conn)),
+                )
+                return
+            # group_id/user_id are mutually exclusive (devices' own
+            # CHECK constraint) -- clearing user_id here is required,
+            # not just tidy, or this UPDATE would violate it whenever
+            # the device already had a personal owner. is_authenticated
+            # is set explicitly rather than relying on
+            # common/policy_class.py's bypass_login fallback (2026-08-31
+            # fix) -- both are true here, which is fine, but a group
+            # assignment reads more clearly as "this device is now
+            # authenticated, and governed by this group" than as a
+            # bypass side effect.
+            conn.execute(
+                "UPDATE devices SET group_id = ?, user_id = NULL, is_authenticated = 1 WHERE id = ?",
+                (group["id"], device["id"]),
+            )
+            conn.commit()
+            log.info(
+                "device %s assigned to group %r via portal admin action", device["mac_address"], group["name"]
+            )
+            self._send_html(200, _render_admin_success(f"Assigned to the {group['name']} group."))
+            return
+
+        self._send_html(200, _render(admin_error="Unknown action.", groups=_fetch_groups(conn)))
 
 
 def start(host: str = "0.0.0.0", port: int = 3131) -> ThreadingHTTPServer:

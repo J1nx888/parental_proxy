@@ -2185,6 +2185,52 @@ action for when an admin is physically at the gated device itself
 rather than on a separate device -- a possible future nice-to-have, not
 a gap in what was actually planned.
 
+**Portal-side admin action: done and verified 2026-08-31** (user: "yes
+please build the portal side admin action"), closing that one
+nice-to-have. `dashboard/captive_portal_server.py`'s login page gained
+a collapsed `<details>` section asking for the same admin credentials
+`dashboard.py`'s HTTP-Basic login checks, offering **Bypass** (identical
+effect to `/devices/bypass_login`) or **assign to a group** (clears any
+prior `user_id` -- required, not just tidy, since `devices.group_id`/
+`user_id` are mutually exclusive per the table's own `CHECK`
+constraint -- and sets `is_authenticated = 1` directly). Shares the kid
+login form's own per-IP rate limiter rather than a separate budget, the
+more conservative choice given this surface grants strictly more.
+Factored `verify_admin_credentials()` out into `common/auth.py`
+(`dashboard.py`'s own `_check_admin_auth` now delegates to it too) so
+there's exactly one admin-credential check shared by both surfaces,
+not two.
+
+**Real bug found and fixed while building this**: `common/policy_class.py`'s
+`classify_device()` never consulted `bypass_login` at all -- despite
+the dashboard's own hint text and this very design sketch both
+describing it as exempting a device from the captive-portal gate, a
+`bypass_login` device was, in reality, staying stuck in `PREAUTH`
+forever, still redirected to the portal on every request. This means
+Milestone 2's own dashboard Bypass button was *also* a no-op at the
+network-policy level the whole time it existed -- fail-closed (the
+device stayed gated rather than being wrongly exposed), so not a
+security hole, but a real functional gap between what the UI claimed
+and what actually happened in the kernel. Fixed: `classify_device()`
+now treats `is_authenticated OR bypass_login` as sufficient for
+`AUTHENTICATED` (still distinct from `ignored`/`BYPASS` -- it only
+skips the login requirement, quarantine still takes precedence over
+it). `controller/policy_state.py`'s own query needed a companion fix --
+it never even `SELECT`ed `bypass_login` in the first place, so
+`classify_device()` could not have honored it regardless of its own
+logic. 3 new regression tests, including one true end-to-end proof
+through `compute_desired_policy()` itself, not just the pure
+`classify_device()` unit.
+
+20 new tests total across four files
+(`tests/test_policy_class.py`, `tests/test_controller_policy_state.py`,
+`tests/test_auth.py`, `tests/test_captive_portal_server.py`). Also
+visually and interactively verified in a live browser: opened the
+collapsed admin section, entered real admin credentials, picked a real
+group from the live dropdown (populated from a real DB read, not a
+static list), submitted, and confirmed the device's `group_id`/
+`is_authenticated` actually changed in the dev DB afterward.
+
 ## Original design sketch (2026-08-30, not started at the time)
 
 Force all internet through the system regardless of per-device

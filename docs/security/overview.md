@@ -121,6 +121,44 @@ one in unrestricted at the end), and `Cache-Control: no-store` on every
 response (this is per-device, per-moment login state, never something a
 browser or an OS's own captive-portal prober should cache).
 
+### The portal-side admin action — a higher-stakes surface on the same page (2026-08-31)
+
+`dashboard/captive_portal_server.py`'s login page also carries a
+collapsed admin action (a `<details>` disclosure -- see
+`docs/architecture/overview.md`) that grants strictly more than the kid
+login above: **Bypass** or **assign to a group**, either of which
+moves the requesting device out of `PREAUTH` entirely. It checks the
+SAME credentials as the dashboard's own HTTP-Basic admin login
+(`common/auth.py`'s `verify_admin_credentials()`, one shared check, not
+a second implementation), and **shares the kid-login form's own rate
+limiter rather than a separate one** -- a deliberate choice, not an
+oversight: a lower, easier-to-exhaust budget on the higher-value target
+would be the wrong direction; sharing means an attacker's wrong
+guesses against either credential draw from the same pool.
+
+This does widen the practical blast radius of a leaked/guessed admin
+password beyond what existed before 2026-08-31: previously, admin
+credentials were only useful via the dashboard's own HTTP-Basic prompt
+(reachable at the dashboard's own bind address/port); now they are also
+directly actionable from `:3131` on ANY device nftables has classified
+`unauthenticated_v4` -- which, by this feature's own design, includes
+every not-yet-logged-in device on the LAN. This is an accepted
+tradeoff for a LAN-scoped household tool (the same §7 LAN-trust
+reasoning the rest of this doc already applies elsewhere), not a gap
+introduced without noticing it: if this system is ever exposed beyond
+the LAN, this specific surface is one of the first things worth
+revisiting.
+
+A real, unrelated bug was found and fixed while building this (see
+`docs/architecture/overview.md`'s own dated entry for the full trace):
+`common/policy_class.py`'s `classify_device()` never actually consulted
+`bypass_login` before now, so both this new action's own Bypass button
+and Milestone 2's pre-existing dashboard one were, in practice, no-ops
+at the network-policy level -- fail-closed (the device stayed gated,
+not exposed), so not a security hole, but worth recording here since it
+means any earlier session's use of "Bypass" before this fix genuinely
+did not exempt the device from anything.
+
 ---
 
 ## 2. Dashboard CSRF protection

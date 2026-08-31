@@ -10,11 +10,14 @@ import identity
 from policy_state import compute_desired_policy, write_desired_policy
 
 
-def _add_device(conn, mac_address, ignored=0, quarantined_at=None, is_authenticated=1, bump_enabled=0):
+def _add_device(
+    conn, mac_address, ignored=0, quarantined_at=None, is_authenticated=1, bump_enabled=0, bypass_login=0
+):
     conn.execute(
-        "INSERT INTO devices (mac_address, ignored, quarantined_at, is_authenticated, bump_enabled, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (mac_address, ignored, quarantined_at, is_authenticated, bump_enabled, db.now_iso()),
+        "INSERT INTO devices "
+        "(mac_address, ignored, quarantined_at, is_authenticated, bump_enabled, bypass_login, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (mac_address, ignored, quarantined_at, is_authenticated, bump_enabled, bypass_login, db.now_iso()),
     )
     conn.commit()
     return conn.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_address,)).fetchone()
@@ -49,6 +52,19 @@ def test_unauthenticated_device_goes_in_unauthenticated_set(conn):
     _bind(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21")
     policy = compute_desired_policy(conn)
     assert policy["unauthenticated"] == ["192.168.1.21"]
+
+
+def test_bypass_login_device_lands_in_authenticated_set_end_to_end(conn):
+    """Regression test for a real bug found 2026-08-31: this query
+    never even SELECTed bypass_login, so classify_device() could never
+    have honored it regardless of its own logic -- a bypass_login
+    device stayed stuck in 'unauthenticated' forever. Full pipeline
+    proof, not just the pure classify_device() unit test."""
+    _add_device(conn, "aa:bb:cc:dd:ee:01", is_authenticated=0, bypass_login=1)
+    _bind(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21")
+    policy = compute_desired_policy(conn)
+    assert policy["authenticated"] == ["192.168.1.21"]
+    assert policy["unauthenticated"] == []
 
 
 def test_ignored_device_goes_in_bypass_set_even_if_unauthenticated(conn):

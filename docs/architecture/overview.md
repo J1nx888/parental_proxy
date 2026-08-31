@@ -222,6 +222,38 @@ take effect everywhere.
   for CA-cert-installed confirmation before actually checking
   `bump_enabled`, so an admin doesn't accidentally flip it before the
   cert is in place.
+- **Portal-side admin action** (added 2026-08-31) -- the design
+  sketch's other quick-add path, for an admin physically at the gated
+  device itself rather than on a separate device with dashboard access.
+  A collapsed `<details>` section on the same login page asks for the
+  SAME admin credentials `dashboard.py`'s HTTP-Basic login checks
+  (`common/auth.py`'s new `verify_admin_credentials()`, factored out of
+  `dashboard.py`'s own `_check_admin_auth` so there's exactly one
+  admin-credential check shared by both surfaces), then offers
+  **Bypass** (identical effect to `/devices/bypass_login`) or
+  **assign to a group** (clears any prior `user_id`, since
+  `group_id`/`user_id` are mutually exclusive per the `devices` table's
+  own `CHECK` constraint, and sets `is_authenticated = 1` directly --
+  group assignment shouldn't depend on the `bypass_login` fallback
+  below to actually take effect). Shares the kid-login form's own
+  per-IP rate limiter rather than a separate budget, the more
+  conservative choice given this surface grants strictly more.
+
+  **Real bug found and fixed building this, 2026-08-31**:
+  `common/policy_class.py`'s `classify_device()` never consulted
+  `bypass_login` at all, despite the dashboard's own hint text and this
+  design sketch both describing it as exempting a device from the
+  captive-portal gate -- a device an admin marked `bypass_login` (via
+  Milestone 2's dashboard button, or this new portal action) was, in
+  reality, staying stuck in `PREAUTH` forever, still redirected to the
+  portal on every request. Fixed: `classify_device()` now treats
+  `is_authenticated OR bypass_login` as sufficient for `AUTHENTICATED`
+  (still distinct from `ignored`/`BYPASS` -- `bypass_login` only skips
+  the login requirement, not the whole policy system, so quarantine
+  still takes precedence over it). `controller/policy_state.py`'s own
+  query also needed a fix -- it never even `SELECT`ed `bypass_login` in
+  the first place, so `classify_device()` could not have honored it
+  regardless of its own logic.
 
 ---
 

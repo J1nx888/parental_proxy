@@ -345,10 +345,21 @@ unassigned); `bump_enabled` = this device is one of the curated set that
 gets Squid/SSL-Bump refinement on top of DNS-tier protection, independent
 of (and layered on top of) `is_authenticated` -- see
 `common/policy_class.py`'s `bump_eligible()` and RoadMap.md's "two
-independent axes" section, locked 2026-08-30; `bypass_login` = exempted
-from the future captive-portal gate (Phase 4, not built); `is_authenticated`
-= the eventual captive-portal gate's flag, defaulting to 1 since there's no
-login gate yet to fail; `quarantined_at` = Milestone 8's operator-triggered
+independent axes" section, locked 2026-08-30; `is_authenticated` = the
+captive-portal gate's own flag, live as of Phase 4 (`dashboard/captive_portal_server.py`,
+2026-08-31) -- the schema default of 1 is still correct for a device an
+admin creates directly through the dashboard (implies trust), but
+`common/identity.py`'s `record_binding()` now overrides it to 0 for a
+genuinely new, auto-discovered MAC (Phase 4 milestone 1), landing it in
+`PolicyClass.PREAUTH` until it logs in; `bypass_login` = exempts a
+device from the LOGIN requirement specifically (not from interception
+or policy generally, unlike `ignored`) -- **real bug found and fixed
+2026-08-31**: `classify_device()` never actually consulted this column
+before that date, so setting it had no effect on real nftables policy
+at all despite the dashboard's own hint text claiming otherwise; now
+fixed, `is_authenticated OR bypass_login` is sufficient for
+`AUTHENTICATED`, see `docs/architecture/overview.md`'s dated entry for
+the full trace; `quarantined_at` = Milestone 8's operator-triggered
 isolation state, nothing sets it yet (no dashboard control exists).
 Indexed on `user_id` and `group_id`.
 

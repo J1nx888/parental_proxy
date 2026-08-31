@@ -84,6 +84,34 @@ def _add_user(conn, username, password, display_name=None):
     return conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()["id"]
 
 
+def _set_admin_credentials(conn, username="admin", password="adminpw"):
+    db.set_setting(conn, "admin_username", username)
+    db.set_setting(conn, "admin_password_hash", auth.hash_password(password))
+
+
+def _add_group(conn, name):
+    conn.execute("INSERT INTO groups (name, created_at) VALUES (?, ?)", (name, db.now_iso()))
+    conn.commit()
+    return conn.execute("SELECT id FROM groups WHERE name = ?", (name,)).fetchone()["id"]
+
+
+def _post_admin(server, admin_username, admin_password, action, group_id=None):
+    fields = {"admin_username": admin_username, "admin_password": admin_password, "action": action}
+    if group_id is not None:
+        fields["group_id"] = group_id
+    body = urlencode(fields)
+    http_conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+    try:
+        http_conn.request(
+            "POST", "/admin", body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body))},
+        )
+        resp = http_conn.getresponse()
+        return resp.status, resp.read().decode("utf-8")
+    finally:
+        http_conn.close()
+
+
 # ============================================================
 # GET/HEAD -- always the same login page, regardless of path/Host
 # ============================================================
@@ -246,7 +274,9 @@ def test_login_from_an_ip_with_no_active_binding_fails_gracefully(server, conn):
     status, body = _post(server, "kid1", "correcthorse")
 
     assert status == 200
-    assert "couldn't identify your device" in body
+    # html.escape() turns the apostrophe into &#x27; -- match on a
+    # substring either side of it rather than the raw literal string.
+    assert "identify your device" in body
 
 
 def test_login_ip_is_looked_up_independent_of_which_device_it_belongs_to(server, conn):
@@ -323,3 +353,142 @@ def test_a_successful_login_clears_the_failure_count(server, conn):
     assert "signed in" in body.lower(), "one attempt below the limit must still succeed with the right password"
 
     assert captive_portal_server._is_rate_limited(IP_1) is False
+
+
+# ============================================================
+# Portal-side admin action -- the design sketch's "same portal screen"
+# alternative to Milestone 2's dashboard-based admin path, for an
+# admin physically at the gated device itself.
+# ============================================================
+
+def test_login_page_shows_the_admin_section(server):
+    _, body, _ = _get(server)
+    assert "Admin username" in body
+    assert 'action="/admin"' in body
+
+
+def test_login_page_has_no_group_dropdown_when_no_groups_exist(server):
+    _, body, _ = _get(server)
+    assert "assign_group" not in body
+
+
+def test_login_page_shows_a_group_dropdown_when_groups_exist(server, conn):
+    _add_group(conn, "Gaming Computers")
+    _, body, _ = _get(server)
+    assert "Gaming Computers" in body
+    assert "assign_group" in body
+
+
+def test_admin_bypass_sets_bypass_login_and_lands_the_device_in_authenticated(server, conn):
+    """End-to-end proof, not just the DB flag: after the fix to
+    common/policy_class.py's classify_device() (2026-08-31), bypass_login
+    alone is enough to actually leave PREAUTH."""
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _set_admin_credentials(conn)
+
+    status, body = _post_admin(server, "admin", "adminpw", "bypass")
+
+    assert status == 200
+    assert "no longer needs to log in" in body
+    row = conn.execute("SELECT bypass_login FROM devices WHERE mac_address = ?", (MAC_A,)).fetchone()
+    assert row["bypass_login"] == 1
+
+    from policy_class import PolicyClass, classify_device
+    full_row = conn.execute("SELECT * FROM devices WHERE mac_address = ?", (MAC_A,)).fetchone()
+    assert classify_device(full_row) == PolicyClass.AUTHENTICATED
+
+
+def test_admin_assign_group_sets_group_and_authenticates_the_device(server, conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _set_admin_credentials(conn)
+    group_id = _add_group(conn, "IoT")
+
+    status, body = _post_admin(server, "admin", "adminpw", "assign_group", group_id=group_id)
+
+    assert status == 200
+    assert "IoT" in body
+    row = conn.execute("SELECT group_id, user_id, is_authenticated FROM devices WHERE mac_address = ?", (MAC_A,)).fetchone()
+    assert row["group_id"] == group_id
+    assert row["user_id"] is None
+    assert row["is_authenticated"] == 1
+
+
+def test_admin_assign_group_clears_a_prior_user_assignment(server, conn):
+    """devices.user_id/group_id are mutually exclusive (the table's own
+    CHECK constraint) -- assigning a group must clear any prior
+    personal-user assignment, not just add a group on top of it."""
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    device_id = conn.execute("SELECT device_id FROM device_bindings WHERE ipv4_address = ?", (IP_1,)).fetchone()["device_id"]
+    user_id = _add_user(conn, "kid1", "correcthorse")
+    conn.execute("UPDATE devices SET user_id = ? WHERE id = ?", (user_id, device_id))
+    conn.commit()
+    _set_admin_credentials(conn)
+    group_id = _add_group(conn, "IoT")
+
+    _post_admin(server, "admin", "adminpw", "assign_group", group_id=group_id)
+
+    row = conn.execute("SELECT group_id, user_id FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["group_id"] == group_id
+    assert row["user_id"] is None
+
+
+def test_admin_action_with_wrong_admin_password_is_rejected(server, conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _set_admin_credentials(conn)
+
+    status, body = _post_admin(server, "admin", "wrongpassword", "bypass")
+
+    assert status == 200
+    assert "incorrect admin" in body.lower()
+    row = conn.execute("SELECT bypass_login FROM devices WHERE mac_address = ?", (MAC_A,)).fetchone()
+    assert row["bypass_login"] == 0
+
+
+def test_admin_action_cannot_be_done_with_kid_credentials(server, conn):
+    """The admin action must check the SAME admin credentials the
+    dashboard's own HTTP-Basic login uses -- a kid's own
+    users.password_hash must never work here."""
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _set_admin_credentials(conn)
+    _add_user(conn, "kid1", "correcthorse")
+
+    status, body = _post_admin(server, "kid1", "correcthorse", "bypass")
+
+    assert "incorrect admin" in body.lower()
+
+
+def test_admin_action_shares_the_kid_logins_rate_limiter(server, conn):
+    """The more conservative design choice (see module docstring): a
+    wrong admin-password guess counts against the SAME per-IP budget
+    the kid login form uses, not a separate, easier-to-exhaust one."""
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _set_admin_credentials(conn)
+
+    for _ in range(captive_portal_server._MAX_ATTEMPTS):
+        _post_admin(server, "admin", "wrongpassword", "bypass")
+
+    status, body = _post_admin(server, "admin", "adminpw", "bypass")  # correct password this time
+    assert "too many attempts" in body.lower()
+    row = conn.execute("SELECT bypass_login FROM devices WHERE mac_address = ?", (MAC_A,)).fetchone()
+    assert row["bypass_login"] == 0
+
+
+def test_admin_assign_group_rejects_a_nonexistent_group(server, conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _set_admin_credentials(conn)
+
+    status, body = _post_admin(server, "admin", "adminpw", "assign_group", group_id="999999")
+
+    assert status == 200
+    assert "no longer exists" in body
+    row = conn.execute("SELECT group_id FROM devices WHERE mac_address = ?", (MAC_A,)).fetchone()
+    assert row["group_id"] is None
+
+
+def test_admin_action_from_an_ip_with_no_active_binding_fails_gracefully(server, conn):
+    _set_admin_credentials(conn)
+
+    status, body = _post_admin(server, "admin", "adminpw", "bypass")
+
+    assert status == 200
+    assert "identify this device" in body

@@ -6,12 +6,13 @@ import pytest
 from policy_class import PolicyClass, bump_eligible, classify_device, to_set_name
 
 
-def _row(ignored=0, quarantined_at=None, is_authenticated=1, bump_enabled=0):
+def _row(ignored=0, quarantined_at=None, is_authenticated=1, bump_enabled=0, bypass_login=0):
     return {
         "ignored": ignored,
         "quarantined_at": quarantined_at,
         "is_authenticated": is_authenticated,
         "bump_enabled": bump_enabled,
+        "bypass_login": bypass_login,
     }
 
 
@@ -31,6 +32,24 @@ def test_authenticated_device_with_no_overrides():
 
 def test_unauthenticated_device_is_preauth():
     assert classify_device(_row(is_authenticated=0)) == PolicyClass.PREAUTH
+
+
+def test_bypass_login_device_is_authenticated_even_when_not_logged_in():
+    """Regression test for a real bug found 2026-08-31: classify_device()
+    never consulted bypass_login at all, so a device an admin marked
+    bypass_login stayed stuck in PREAUTH forever -- still redirected to
+    the captive portal on every request -- contradicting both the
+    dashboard's own hint text and RoadMap.md's design sketch, both of
+    which describe bypass_login as exempting a device from the gate."""
+    row = _row(is_authenticated=0, bypass_login=1)
+    assert classify_device(row) == PolicyClass.AUTHENTICATED
+
+
+def test_bypass_login_is_not_the_same_as_ignored():
+    """bypass_login only skips the LOGIN requirement -- it must not
+    also short-circuit quarantine the way `ignored` (BYPASS) does."""
+    row = _row(quarantined_at="2026-08-29T00:00:00Z", is_authenticated=0, bypass_login=1)
+    assert classify_device(row) == PolicyClass.QUARANTINE
 
 
 def test_bypass_beats_quarantine():

@@ -77,3 +77,38 @@ def test_tampered_digest_rejected():
     algorithm, iterations, salt, _ = encoded.split("$", 3)
     tampered = f"{algorithm}${iterations}${salt}$" + "0" * 64
     assert auth.verify_password("hunter2", tampered) is False
+
+
+# ============================================================
+# verify_admin_credentials -- factored out 2026-08-31 so
+# dashboard.py's HTTP-Basic admin login and
+# captive_portal_server.py's portal-side admin action share exactly
+# one admin-credential check instead of each keeping its own copy.
+# ============================================================
+
+def test_verify_admin_credentials_accepts_the_right_username_and_password():
+    expected_hash = auth.hash_password("correcthorse")
+    assert auth.verify_admin_credentials("admin", "correcthorse", "admin", expected_hash) is True
+
+
+def test_verify_admin_credentials_rejects_the_wrong_password():
+    expected_hash = auth.hash_password("correcthorse")
+    assert auth.verify_admin_credentials("admin", "wrongpassword", "admin", expected_hash) is False
+
+
+def test_verify_admin_credentials_rejects_the_wrong_username():
+    expected_hash = auth.hash_password("correcthorse")
+    assert auth.verify_admin_credentials("notadmin", "correcthorse", "admin", expected_hash) is False
+
+
+def test_verify_admin_credentials_fails_closed_with_no_expected_username():
+    expected_hash = auth.hash_password("correcthorse")
+    assert auth.verify_admin_credentials("admin", "correcthorse", None, expected_hash) is False
+
+
+def test_verify_admin_credentials_fails_closed_with_no_expected_hash():
+    assert auth.verify_admin_credentials("admin", "correcthorse", "admin", None) is False
+
+
+def test_verify_admin_credentials_fails_closed_with_an_empty_string_expected_hash():
+    assert auth.verify_admin_credentials("admin", "correcthorse", "admin", "") is False

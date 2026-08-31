@@ -64,19 +64,37 @@ def classify_device(device_row) -> PolicyClass:
                           isolation; NULL means not quarantined -- no
                           dashboard control exists to set this yet,
                           see db.py's schema comment).
-      3. AUTHENTICATED / PREAUTH -- `is_authenticated` (the eventual
-                          captive-portal gate's flag; defaults to 1
-                          today since there's no login gate yet to fail).
+      3. AUTHENTICATED / PREAUTH -- `is_authenticated` OR `bypass_login`
+                          (the captive-portal gate's own flags; `is_authenticated`
+                          defaulted to 1 before Phase 4 existed since there was
+                          no login gate yet to fail -- Phase 4 milestone 1 now
+                          creates new devices with it 0). `bypass_login` is a
+                          SEPARATE way into AUTHENTICATED, added here
+                          2026-08-31 fixing a real bug: this function never
+                          consulted it at all before, despite the dashboard's
+                          own device-detail hint text (and RoadMap.md's design
+                          sketch) claiming "bypass_login exempts a device from
+                          the captive-portal gate" -- a device an admin marked
+                          bypass_login was, in reality, staying stuck in PREAUTH
+                          forever, still redirected to the portal on every
+                          request, since nothing here ever looked at that
+                          column. `bypass_login` is deliberately NOT the same
+                          as `ignored`/BYPASS: it only skips the LOGIN
+                          requirement, not the whole interception/policy
+                          system -- the device still gets DNS-tier
+                          AUTHENTICATED treatment (and whatever group/user
+                          assignment governs its domain access), it just never
+                          has to actually log in to get there.
 
-    `device_row` needs `ignored`, `quarantined_at`, and
-    `is_authenticated` keys -- works with a sqlite3.Row or any
+    `device_row` needs `ignored`, `quarantined_at`, `is_authenticated`,
+    and `bypass_login` keys -- works with a sqlite3.Row or any
     Mapping-like object providing those.
     """
     if device_row["ignored"]:
         return PolicyClass.BYPASS
     if device_row["quarantined_at"]:
         return PolicyClass.QUARANTINE
-    if device_row["is_authenticated"]:
+    if device_row["is_authenticated"] or device_row["bypass_login"]:
         return PolicyClass.AUTHENTICATED
     return PolicyClass.PREAUTH
 

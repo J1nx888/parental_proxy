@@ -120,9 +120,11 @@ def _check_admin_auth(basic_auth) -> bool:
         expected_hash = db.get_setting(conn, "admin_password_hash")
     finally:
         conn.close()
-    if not expected_user or not expected_hash:
-        return False
-    return basic_auth.username == expected_user and auth.verify_password(basic_auth.password, expected_hash)
+    # Shared with dashboard/captive_portal_server.py's own portal-side
+    # admin action (added 2026-08-31) -- see auth.verify_admin_credentials's
+    # own docstring for why this one check lives in common/auth.py rather
+    # than being duplicated.
+    return auth.verify_admin_credentials(basic_auth.username, basic_auth.password, expected_user, expected_hash)
 
 
 def require_admin(view):
