@@ -1336,6 +1336,29 @@ def test_update_device_sets_flags_and_assigns_to_a_kid(client, db_conn):
     assert row["bypass_login"] == 0
 
 
+def test_device_detail_page_reminds_about_the_ca_cert_before_bump_enable(client, db_conn):
+    """RoadMap.md's design sketch: an admin should confirm the CA cert
+    is actually installed before flipping bump_enabled, so a device
+    never ends up bump-enabled while still showing confusing
+    certificate warnings. Client-side only (a plain confirm(), matching
+    this app's own established no-framework convention -- see the
+    group-delete button's identical pattern) -- this just checks the
+    reminder is actually wired to the checkbox, not that JS ran."""
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:31"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:31'").fetchone()[0]
+
+    resp = client.get(f"/devices/{device_id}", headers=_auth_header())
+
+    body = resp.data.decode()
+    assert "CA certificate already been installed" in body
+    assert 'name="bump_enabled"' in body
+    # The confirm() must be on the SAME checkbox, not just present
+    # somewhere else on the page.
+    checkbox_start = body.index('name="bump_enabled"')
+    checkbox_tag = body[max(0, checkbox_start - 200):checkbox_start + 200]
+    assert "confirm(" in checkbox_tag
+
+
 def test_delete_device_removes_row(client, db_conn):
     client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:04"}, headers=_auth_header())
     device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]

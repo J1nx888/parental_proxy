@@ -161,17 +161,39 @@ padding:0 1.25rem;text-align:center;color:#1e293b;}}
 @media (prefers-color-scheme:dark){{body{{color:#e5eaf3;}}}}
 h1{{font-size:1.15rem;margin:0 0 .5rem;}}
 p{{font-size:.92rem;opacity:.75;}}
+.note{{background:#fef3c7;color:#92400e;border-radius:8px;padding:.6rem .8rem;
+text-align:left;margin-top:1.25rem;}}
+@media (prefers-color-scheme:dark){{.note{{background:#3f2d0a;color:#fcd34d;}}}}
 </style></head><body>
 <h1>You're signed in.</h1>
 <p>It can take up to about 10 seconds for this device's internet access to
 actually open up. Try reloading whatever page you were on.</p>
+{bump_reminder}
 </body></html>
 """
+
+# Shown on the success page only when this same user already has a
+# DIFFERENT device with SSL-Bump enabled -- see this module's own
+# docstring's design-sketch reference (RoadMap.md): the login flow
+# only ever grants DNS-tier access, so a kid whose usual device has
+# full SSL-Bump refinement logging in from a NEW device here would
+# otherwise have no idea why something that works on their other
+# device doesn't work on this one.
+_BUMP_REMINDER_HTML = (
+    '<p class="note">Heads up: this is only basic (DNS-level) access. '
+    "Your other device has extra access set up by a parent -- ask them "
+    "to do the same for this one if you need it here too.</p>"
+)
 
 
 def _render(username_error: str | None = None) -> bytes:
     error_html = f'<p class="error">{username_error}</p>' if username_error else ""
     return _PAGE_TEMPLATE.format(error=error_html).encode("utf-8")
+
+
+def _render_success(show_bump_reminder: bool) -> bytes:
+    reminder_html = _BUMP_REMINDER_HTML if show_bump_reminder else ""
+    return _SUCCESS_TEMPLATE.format(bump_reminder=reminder_html).encode("utf-8")
 
 
 class _CaptivePortalHandler(BaseHTTPRequestHandler):
@@ -260,7 +282,17 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
         )
         conn.commit()
         log.info("device %s authenticated as %s", device["mac_address"], username)
-        self._send_html(200, _SUCCESS_TEMPLATE.encode("utf-8"))
+
+        # Does this same user already have a DIFFERENT device with
+        # SSL-Bump enabled? If so, this login -- DNS-tier only, always
+        # -- is a real step down from what they're used to elsewhere,
+        # worth explaining rather than leaving them to wonder why
+        # something that works on their other device doesn't work here.
+        has_bump_elsewhere = conn.execute(
+            "SELECT 1 FROM devices WHERE user_id = ? AND bump_enabled = 1 AND id != ? LIMIT 1",
+            (user["id"], device["id"]),
+        ).fetchone() is not None
+        self._send_html(200, _render_success(has_bump_elsewhere))
 
 
 def start(host: str = "0.0.0.0", port: int = 3131) -> ThreadingHTTPServer:

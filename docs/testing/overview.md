@@ -336,11 +336,28 @@ completing a real login through the actual rendered form (not just
 `fetch()`), and confirming `is_authenticated` flipped in the real
 on-disk dev DB afterward.
 
+**Same night, sixth follow-up**: closed out the design sketch's
+"reminder screen" bullet from both directions (see
+docs/architecture/overview.md). 3 new tests in
+`tests/test_captive_portal_server.py` cover the success page's bump
+reminder: shown when the same `user_id` has a different
+`bump_enabled` device, absent when they have none, and correctly
+scoped to that SAME user (a different user's bump-enabled device must
+never trigger it). One new test in `tests/test_dashboard.py` checks
+the device-detail page's CA-cert `confirm()` is actually wired to the
+`bump_enabled` checkbox specifically (asserting the checkbox's own
+surrounding HTML contains `confirm(`, not just that the string appears
+somewhere on the page) -- a plain client-side reminder, so this can
+only verify the wiring exists, not that a real browser's dialog behaves
+as expected; that part was checked separately by driving a real browser
+and overriding `window.confirm` to simulate both Cancel (checkbox
+reverts to unchecked) and OK (stays checked).
+
 Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (527 as of 2026-08-31 -- `AF_UNIX`-only files still
+authoritative total (531 as of 2026-08-31 -- `AF_UNIX`-only files still
 skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
-of the same suite at this commit collects 497 passed, 30 skipped, while
-Linux collects all 527) rather than trusting the sum of this table.
+of the same suite at this commit collects 501 passed, 30 skipped, while
+Linux collects all 531) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

@@ -211,7 +211,17 @@ take effect everywhere.
   module's own docstring for why that's a deliberate, industry-standard
   limitation (matching real commercial captive portals) rather than an
   oversight, and RoadMap.md for the follow-up hardening option this
-  leaves open.
+  leaves open. The success page also closes the design sketch's
+  "reminder screen" bullet from both sides (added 2026-08-31): a kid
+  logging in here sees a note if their own `user_id` already has a
+  DIFFERENT `bump_enabled` device, since this login only ever grants
+  DNS-tier access and they might otherwise wonder why something that
+  works on their usual device doesn't work here; separately,
+  `dashboard/dashboard.py`'s device-detail page now prompts (a plain
+  `confirm()`, matching this app's existing no-framework convention)
+  for CA-cert-installed confirmation before actually checking
+  `bump_enabled`, so an admin doesn't accidentally flip it before the
+  cert is in place.
 
 ---
 

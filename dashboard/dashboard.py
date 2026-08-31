@@ -1733,7 +1733,9 @@ DEVICE_DETAIL_BODY = """
   <input type="hidden" name="device_id" value="{{ d.id }}">
   <input type="text" name="label" value="{{ d.label or '' }}" placeholder="Label, e.g. Alex's iPad">
 """ + DEVICE_ASSIGNMENT_SELECT + """
-  <label><input type="checkbox" name="bump_enabled" {{ 'checked' if d.bump_enabled }}> SSL-Bump enabled</label>
+  <label><input type="checkbox" name="bump_enabled" {{ 'checked' if d.bump_enabled }}
+    onchange="if(this.checked && !confirm('Has the CA certificate already been installed on this device? Until it has, SSL-Bump will show it certificate warnings instead of working normally.')){this.checked=false;}"
+    > SSL-Bump enabled</label>
   <label><input type="checkbox" name="bypass_login" {{ 'checked' if d.bypass_login }}> Bypass login</label>
   <button class="add" type="submit">Save</button>
 </form>
@@ -1743,16 +1745,19 @@ DEVICE_DETAIL_BODY = """
   enabled</strong> marks this as one of the small, deliberately curated devices
   that will get full path/show-level rules on bump-mode domains -- everything
   else will fall back to whole-domain treatment once the DNS/interception tier
-  exists. <strong>Bypass login</strong> is for a device that can never complete
-  a login flow (a smart TV, Echo, thermostat) -- it'll be exempted from the
-  future captive-portal gate and fall back to its assignment above instead of
-  a personal login. <strong>SSL-Bump enabled</strong> and the device's user/
-  group assignment are now real, enforced settings once Phase 3's ARP-spoof
-  + nftables + Squid-intercept stack (see RoadMap.md) is actually running --
+  exists. Checking it prompts a reminder to install the CA certificate (Users
+  page download link) first -- an un-installed cert means this device sees a
+  certificate warning instead of working normally, not a silent failure, but
+  still worth avoiding. <strong>Bypass login</strong> is for a device that can
+  never complete a login flow (a smart TV, Echo, thermostat) -- it's exempted
+  from the captive-portal gate (`dashboard/captive_portal_server.py`, live as
+  of 2026-08-31) and falls back to its assignment above instead of a personal
+  login. <strong>SSL-Bump enabled</strong> and the device's user/group
+  assignment are now real, enforced settings once Phase 3's ARP-spoof +
+  nftables + Squid-intercept stack (see RoadMap.md) is actually running --
   that stack is fully built and tested but has not yet been deployed against
   a real household network (Milestone 10, a deliberate, owner-only decision,
-  is still pending). <strong>Bypass login</strong>'s captive-portal gate
-  itself is still Phase 4, not yet built at all.
+  is still pending).
 </p>
 </div>
 """

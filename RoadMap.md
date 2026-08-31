@@ -485,20 +485,23 @@ entirely in the policy-computation and enforcement layers:
       requests a real friendly page via AdGuard's `$dnsrewrite` modifier
       (HTTPS deliberately excluded — see that module's own docstring;
       the live-verification section below has the full writeup).
-- [ ] **Captive portal (Phase 4) — begun 2026-08-31** (user: "let's
-      begin Phase 4"), concrete shape from this session's discussion:
-      gate any newly-seen MAC
-      not already registered as bypass/ignore; a kid-facing login that
-      grants `is_authenticated` (DNS-tier) only, never `bump_enabled`;
-      an admin-facing quick-add path at first sight of a new device
-      (add to bypass, assign to a group, or full dashboard access from
-      another device); and a reminder screen for an account that's
-      meant to have both DNS and Squid but hasn't had the one-time CA
-      cert install done yet. Recommendation, not yet confirmed: an
-      admin should only flip `bump_enabled` *after* confirming the CA
-      cert is actually installed, so there's no window where a device
-      is bump-enabled but showing confusing certificate warnings
-      instead of a clean "ask a parent" experience.
+- [x] **Captive portal (Phase 4) — begun 2026-08-31, every design-sketch
+      bullet done and verified the same day** (user: "let's begin Phase
+      4"): gate any newly-seen MAC not already registered as
+      bypass/ignore (Milestone 1); a kid-facing login that grants
+      `is_authenticated` (DNS-tier) only, never `bump_enabled`
+      (Milestone 3); an admin-facing quick-add path at first sight of a
+      new device (add to bypass, assign to a group -- Milestone 2's
+      Bypass/Manage actions, satisfying the sketch's own "or full
+      dashboard access from another device" alternative); and a
+      reminder screen for an account that's meant to have both DNS and
+      Squid but hasn't had the one-time CA cert install done yet (both
+      directions -- see the dated entry below). The recommendation this
+      bullet originally flagged as "not yet confirmed" (admin should
+      only flip `bump_enabled` after confirming the CA cert is actually
+      installed) is now built as a real `confirm()` prompt, not just a
+      recommendation. See the dated milestone entries under "Phase 4"
+      below for the full build/verification trail of each piece.
 
 ### The core architectural claim, verified live end-to-end (2026-08-30)
 
@@ -2136,7 +2139,51 @@ file for a previously-untested module). Also visually and interactively
 verified in a live browser against `dashboard/dev_server.py`: rendered
 the real login page, completed a real login through the actual form
 (not just a raw `fetch()`), and confirmed `is_authenticated` flipped in
-the real on-disk dev DB afterward.
+the real on-disk dev DB afterward. **Also rebuilt and redeployed the
+real production `dashboard` container on the smoke-test VM** (not just
+the local dev server): confirmed it starts clean with all three servers
+(dashboard/block-page/captive-portal) listening, and a real `curl`
+against `:3131`'s Apple/Google probe paths returns 200 with the actual
+login page -- caught a real Dockerfile gap doing this that a redeploy
+would otherwise have hit silently: `dashboard/Dockerfile`'s `COPY` line
+names each dashboard `.py` file individually rather than a wildcard, so
+the new module needed adding there explicitly or the container would
+have failed to start with an `ImportError`.
+
+**Reminder screen (the design sketch's fourth bullet): done and
+verified 2026-08-31**, closing it from both directions. Kid-facing: the
+captive-portal success page shows a note when the logging-in user
+already has a DIFFERENT device with `bump_enabled = 1` elsewhere --
+since this login only ever grants DNS-tier access, a kid whose usual
+device has full SSL-Bump refinement would otherwise have no idea why
+something that works there doesn't work here. Admin-facing:
+`dashboard/dashboard.py`'s device-detail page now prompts a plain
+`confirm()` (matching this app's own established no-framework
+convention, same pattern as the group-delete button) asking whether the
+CA certificate is already installed before actually checking
+`bump_enabled` -- reverts to unchecked if declined. Deliberately a
+client-side reminder, not a server-side gate (per the design sketch's
+own wording, "reminder," not "block") -- `update_device()` still
+accepts either value regardless. 4 new tests; the `confirm()` behavior
+itself (not just that it's wired up) was additionally verified live in
+a real browser by overriding `window.confirm` to simulate both Cancel
+(checkbox correctly reverts) and OK (stays checked).
+
+**With this, every bullet in the original 2026-08-30 design sketch
+below is now built and verified**: gate a new MAC by default (Milestone
+1), the kid-facing login path (Milestone 3), the admin-facing path
+(Milestone 2's Bypass/Manage actions -- the design sketch's own text
+offered "the same portal screen, OR a separate device with real
+dashboard access"; the dashboard path was built, satisfying that
+bullet), and the reminder screen (this entry). Phase 4's remaining open
+question from 2026-08-30 (MAC-randomization/login-frequency tuning) was
+never a build item -- it's an inherent property of how OSes rotate
+private addresses, noted for awareness, not something this codebase can
+control. What Phase 4 does NOT yet have, and was never in the original
+sketch: a portal-side (as opposed to dashboard-side) admin quick-add
+action for when an admin is physically at the gated device itself
+rather than on a separate device -- a possible future nice-to-have, not
+a gap in what was actually planned.
 
 ## Original design sketch (2026-08-30, not started at the time)
 

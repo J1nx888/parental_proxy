@@ -142,6 +142,48 @@ def test_successful_login_authenticates_the_device_and_shows_success(server, con
     assert row["user_id"] == user_id
 
 
+def test_success_page_has_no_bump_reminder_for_a_kid_with_no_other_devices(server, conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _add_user(conn, "kid1", "correcthorse")
+
+    _, body = _post(server, "kid1", "correcthorse")
+
+    assert "extra access" not in body
+
+
+def test_success_page_shows_a_bump_reminder_when_the_same_user_has_a_bump_enabled_device_elsewhere(server, conn):
+    """Design sketch (RoadMap.md): logging in here only ever grants
+    DNS-tier access -- a kid whose usual device has full SSL-Bump
+    refinement would otherwise have no idea why this new device is more
+    limited."""
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    user_id = _add_user(conn, "kid1", "correcthorse")
+    conn.execute(
+        "INSERT INTO devices (mac_address, user_id, bump_enabled, created_at) VALUES (?,?,1,?)",
+        ("aa:bb:cc:dd:ee:77", user_id, db.now_iso()),
+    )
+    conn.commit()
+
+    _, body = _post(server, "kid1", "correcthorse")
+
+    assert "extra access" in body
+
+
+def test_success_page_bump_reminder_ignores_a_different_users_bump_enabled_device(server, conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _add_user(conn, "kid1", "correcthorse")
+    other_user_id = _add_user(conn, "kid2", "somethingelse")
+    conn.execute(
+        "INSERT INTO devices (mac_address, user_id, bump_enabled, created_at) VALUES (?,?,1,?)",
+        ("aa:bb:cc:dd:ee:78", other_user_id, db.now_iso()),
+    )
+    conn.commit()
+
+    _, body = _post(server, "kid1", "correcthorse")
+
+    assert "extra access" not in body
+
+
 def test_login_never_sets_bump_enabled(server, conn):
     """Phase 4's own design sketch: the login flow grants DNS-tier
     access ONLY, never bump_enabled -- that stays a separate, deliberate

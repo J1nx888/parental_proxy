@@ -379,7 +379,12 @@ actual captive-portal login screen itself is still Phase 4, not built).
 - `GET /devices/<int:device_id>` -> `device_detail()` -- one device's
   editable assignment, `bump_enabled`, and `bypass_login` checkboxes.
   Renders `DEVICE_DETAIL_BODY`. Redirects to `devices` with an error flash
-  if the device id doesn't exist.
+  if the device id doesn't exist. Since 2026-08-31, checking
+  `bump_enabled` triggers a client-side `confirm()` reminding the admin
+  to have installed the CA certificate first (RoadMap.md's Phase 4
+  design sketch) -- unchecks itself if declined; purely a reminder, not
+  a server-side gate (`update_device()` below still accepts either
+  value regardless).
 - `POST /devices/update` -> `update_device()` -- form fields `device_id`,
   `label`, `assignment`, `bump_enabled` (checkbox), `bypass_login`
   (checkbox). Updates the row. Redirects to `device_detail`.
