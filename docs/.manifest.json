@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "last_run": "2026-08-31T00:00:00Z",
+  "last_run": "2026-08-31T01:00:00Z",
   "sections": {
     "architecture": {
       "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "adguard/", "defaults/", "dashboard/", "controller/", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile"],
-      "fingerprint": "ee8cb1c0ddb9b935f12c19770f464b67689a679425539142e4d5868d85eca7a1",
+      "fingerprint": "39f6b1da345de006024310b27b70b74d117c2ac938d6c76f06bf5e33d1603b68",
       "doc_path": "docs/architecture/overview.md",
-      "last_updated": "2026-08-31T00:00:00Z"
+      "last_updated": "2026-08-31T01:00:00Z"
     },
     "dashboard": {
       "source_paths": ["dashboard/", "common/db.py", "common/matching.py"],
@@ -34,9 +34,9 @@
     },
     "testing": {
       "source_paths": ["tests/", "pytest.ini", "requirements-dev.txt", ".github/workflows/tests.yml"],
-      "fingerprint": "e0515e98667a552c4501bd6ef508ca56303cf16b3747b1a3d3c8048bf4d26c85",
+      "fingerprint": "be8f366b6c5d4ead5a618aa640db2e4f3265d212ec57716de715b94a09d596cf",
       "doc_path": "docs/testing/overview.md",
-      "last_updated": "2026-08-31T00:00:00Z"
+      "last_updated": "2026-08-31T01:00:00Z"
     }
   }
 }

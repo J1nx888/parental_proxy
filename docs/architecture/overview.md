@@ -131,7 +131,21 @@ take effect everywhere.
   `adguard/entrypoint.sh` -- see RoadMap.md's live-verification section
   for which lists and why (not the whole uAssets repo -- most of it is
   browser-extension-only cosmetic/scriptlet rules a DNS server can't
-  apply).
+  apply). Since 2026-08-31, also a discovery source in the other
+  direction: `controller/adguard_discovery.py` periodically reads
+  AdGuard's own `/control/querylog` (via `common/adguard_client.py`'s
+  `get_query_log`) to refresh `device_bindings.last_seen_at` for
+  already-known IPs -- it can only ever confirm an existing binding is
+  still active (DNS carries no MAC/link-layer information), never
+  discover a new one.
+- **Controller startup readiness** (`controller/readiness.py`, added
+  2026-08-31) -- `wait_for_worker`/`wait_for_adguard` retry connecting to
+  the ARP worker's Unix socket and AdGuard's API for a bounded timeout
+  before `controller/main.py`'s `run()` proceeds, rather than failing (or
+  silently degrading) on the very first attempt. The worker socket wait
+  still raises past its timeout (Docker's `restart: unless-stopped`
+  remains the fallback); the AdGuard wait never raises -- AdGuard isn't
+  required for the rest of `run()` to function.
 
 ---
 

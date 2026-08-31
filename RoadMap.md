@@ -1396,12 +1396,53 @@ fixes for each.
       without it installed at all -- `pyroute2` is Linux-only, no
       `AF_NETLINK` on Windows).
 
-      Still unbuilt: AdGuard query-log correlation and active ARP
-      scanning — the remaining two sources in the design doc's
-      precedence order. With both the snapshot and the live listener now
-      running, staleness is bounded by whichever is faster for a given
-      device (usually the live listener, sub-second) rather than by the
+      With both the snapshot and the live listener now running,
+      staleness is bounded by whichever is faster for a given device
+      (usually the live listener, sub-second) rather than by the
       snapshot's interval alone.
+
+      **AdGuard query-log correlation built and verified live
+      2026-08-31** (`controller/adguard_discovery.py`), closing one of
+      the two sources this line used to flag as unbuilt: the real
+      `/control/querylog` response shape was confirmed live against the
+      VM's running AdGuard instance first (generating real DNS queries
+      and reading the response back), matching this project's own
+      "never trust docs alone" discipline — and it surfaced a real
+      gotcha: AdGuard's `time` field carries variable-precision
+      (commonly 9-digit/nanosecond) fractional seconds
+      (`"2026-08-31T13:17:13.089285447Z"`), which compares unsafely as a
+      plain string against this project's own fractional-second-free
+      `db.now_iso()` timestamps — ASCII `.` sorts before `Z`, so a
+      same-second fractional timestamp can compare as "earlier" than a
+      whole-second one that's actually earlier in real time.
+      `common/adguard_client.py`'s new `normalize_query_log_time()`
+      truncates to whole seconds before anything is ever compared or
+      stored. Since AdGuard's query log has no MAC (DNS carries no
+      link-layer information), this source can only ever refresh an
+      already-known binding's `last_seen_at`
+      (`common/identity.py`'s new `touch_binding_by_ip`, never
+      regressing it backward) — never create a new one, exactly
+      matching this section's own "confirms active IP usage" wording.
+      Verified end-to-end against the real live stack: a throwaway
+      bridge-networked container's real DNS query through AdGuard was
+      correctly correlated back to its `device_bindings` row (source
+      became `adguard`, `last_seen_at` advanced to the query's real
+      truncated timestamp) — and, as an unplanned bonus, this same test
+      incidentally reconfirmed two OTHER pieces working correctly live
+      together for the first time: the real snapshot discovery loop
+      genuinely detected the throwaway container's actual MAC address
+      on its own, and `record_binding`'s IP-conflict resolution
+      correctly deactivated a synthetic test binding the moment the
+      real one appeared for the same IP.
+
+      Still unbuilt: active, rate-limited ARP scanning (the design
+      doc's final precedence-order source, "only when stale or
+      onboarding a new device") — deliberately not attempted this pass;
+      see this file's open items for why it needs a real design decision
+      (namely: whether to use the "connect a UDP socket to nudge the
+      kernel's neighbor-cache state machine" technique to keep the
+      controller unprivileged, versus asking the ARP worker itself to
+      do it) rather than a mechanical build.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
       sets, atomic apply/rollback. **Scaffold written AND verified
       against real nftables 2026-08-29**, in `phase3/nftables-manager/`
@@ -1426,7 +1467,7 @@ fixes for each.
       appends; fixed with a chain `Flush()` before re-adding, verified
       both against `knftables.Fake` and live against real nftables
       bootstrapped twice in a row).
-- [ ] **6. Service health** — Squid/AdGuard/controller readiness gates,
+- [x] **6. Service health** — Squid/AdGuard/controller readiness gates,
       systemd watchdog + restart limits. **Done and verified 2026-08-29**:
       `common/sdnotify.py` (stdlib-only systemd sd_notify client,
       READY=1/WATCHDOG=1) wired into the controller's heartbeat pacer;
@@ -1434,15 +1475,27 @@ fixes for each.
       `mode`/`last_healthy_at`/`fail_open_reason` — the first real use
       of that table since Milestone 4 added it. A failed reconcile
       cycle is now logged and reported as `fail_open` rather than
-      crashing the process. Squid/AdGuard readiness *gates* specifically
-      (blocking startup until those services answer) still aren't
-      built, but AdGuard Home itself IS now integrated into this repo
-      (`adguard/`, done 2026-08-30 — this line was stale, written before
-      that work), and the health-reporting mechanism those gates would
-      feed into is not only built and tested but now has a dashboard
-      view reading it (`/health`, see the "Dashboard 'interception
-      health' view" section above) -- readiness gates remain the one
-      real gap here, not the underlying plumbing.
+      crashing the process.
+
+      **Readiness gates built and verified live 2026-08-31**
+      (`controller/readiness.py`), closing the one real gap this line
+      used to flag: `wait_for_worker()` retries connecting to the ARP
+      worker's Unix socket for a bounded timeout (30s default) instead
+      of raising on the very first attempt, turning the ordinary
+      "arp-worker hasn't created its socket file yet" startup race
+      (docker-compose.yml's own comment already documented this as an
+      accepted one-restart-cycle gap) into a fast in-process retry
+      instead of a full container restart — genuinely raises past the
+      timeout, so a truly-broken worker still surfaces the same way it
+      always did. `wait_for_adguard()` is a bounded, best-effort gate
+      before starting the periodic sync loop; deliberately never raises
+      (AdGuard isn't required for the rest of `run()` to function, and
+      its own periodic sync already retries forever on its own
+      schedule) — a real application of this project's fail-open
+      philosophy to a startup concern, not just steady-state behavior.
+      Both wired behind new optional CLI flags
+      (`--worker-ready-timeout`/`--adguard-ready-timeout`) with no
+      change to callers that don't pass them.
 - [ ] **7. Authentication workflow** — toggling
       `devices.is_authenticated` updates policy without restarting
       spoofing. **Done and verified live end-to-end 2026-08-29** — see
@@ -1488,9 +1541,58 @@ fixes for each.
       `WorkerClient` had no lock, so the heartbeat-pacer thread and the
       main reconciliation loop could genuinely race on the same socket
       — fixed with a `threading.Lock`, verified with 40 concurrent
-      calls from 40 threads. **Not attempted, needs real hardware or a
-      network-namespace harness this session didn't build**: NIC
-      down/up, gateway reboot, OOM kill under real load.
+      calls from 40 threads.
+
+      **OOM kill: done and verified live 2026-08-31**, against
+      `nftables-manager` specifically (see the dated VM-verification
+      writeup earlier in this file) — a genuine kernel OOM kill,
+      confirmed via `docker events`, correctly auto-recovered by
+      `restart: unless-stopped`, with `/health` correctly showing
+      "stale" during the down window.
+
+      **NIC down/up: partially investigated 2026-08-31, real findings,
+      not fully resolved.** This line previously assumed toggling a
+      network interface needed real hardware or a network-namespace
+      harness this project didn't have — checked that assumption
+      directly instead of continuing to assert it: a plain
+      unprivileged VM account (no host sudo) CAN bring the sandbox
+      bridge interface down and up via `docker run --network host
+      --cap-add=NET_ADMIN alpine ip link set <iface> down/up` — Docker
+      group membership alone is enough, no host root needed. Toggling
+      it while `arp-worker` had a real active poisoning target (a
+      throwaway victim container, a real `devices`/`device_bindings`
+      row) produced a real, confirmed effect: `worker.Config.OnSendError`
+      fired for real (`"ARP send failed ... sendto: network is down"`,
+      the exact log line `cmd/pp-arp-worker/main.go` wires it to) —
+      proving that code path is real and observable, not silently
+      swallowed. What this pass could NOT conclusively confirm: whether
+      poisoning genuinely resumes once the interface returns. Checking
+      the victim's own ARP cache afterward showed the gateway IP still
+      resolving to the sandbox bridge's own real MAC, not the
+      configured spoofed `GATEWAY_MAC` — which may mean poisoning
+      hadn't yet resumed, or may just mean a Linux bridge's own
+      near-instantaneous ARP handling for its own gateway IP reliably
+      outraces an injected spoof reply in a virtualized Docker-bridge
+      network specifically, a fidelity question distinct from (and
+      more fundamental than) this fault test. **Also unconfirmed**:
+      whether the controller<->worker heartbeat itself (which continued
+      reporting "healthy" throughout, since it runs over the Unix
+      socket IPC, entirely independent of the poisoned network
+      interface) means a NIC-down condition is currently invisible to
+      `/health` even while real poisoning is failing — plausible given
+      what was observed, but not independently isolated from the
+      poisoning-fidelity question above. Left as a genuinely open,
+      tracked item rather than resolved either way; the next pass
+      should isolate these two questions (does poisoning provably
+      resume without a worker restart; is a NIC-down condition visible
+      anywhere in health reporting) with a purpose-built test rather
+      than an improvised one.
+
+      **Still not attempted, genuinely needs real hardware**: gateway
+      reboot (the sandbox's `GATEWAY_IP`/`GATEWAY_MAC` are purely
+      synthetic — no real device answers ARP for it at all today, so
+      there is nothing to "reboot" without first building out a real
+      stand-in gateway container, not done this pass).
 - [ ] **10. Soak test** — 7–14 days of mixed real household load,
       roaming, sleep/wake, with memory/FD/CPU trend monitoring. **Not
       startable autonomously** — needs the real household network

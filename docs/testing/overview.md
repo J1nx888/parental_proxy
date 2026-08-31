@@ -185,15 +185,43 @@ cases for `get_custom_rules()`'s handling of a `null` `user_rules` key
 non-dict response (which must still raise, not be silently swallowed --
 also a same-day code-review catch). Separately,
 `phase3/nftables-manager/internal/dbsource/sqlite_test.go` gained two
-`WriteHealth` regression tests that are, as of this writing, UNVERIFIED
--- this dev sandbox has no Go toolchain (see AGENTS.md's "Environment
-notes"); see RoadMap.md's fault-campaign TODO for running them once the
-smoke-test VM is back online. Run `pytest --collect-only -q` against
-`tests/` for a live, authoritative total (447 as of 2026-08-30 --
-`AF_UNIX`-only files still skip on Windows, where `socket.AF_UNIX`
-doesn't exist, so a Windows run of the same suite at this commit
-collects 425 passed, 22 skipped) rather than trusting the sum of this
-table.
+`WriteHealth` regression tests, written 2026-08-30 without a Go
+toolchain in this dev sandbox and **verified for real 2026-08-31** on
+the smoke-test VM (`go build`/`go vet`/`go test` clean, plus a
+`-count=10` flake check) -- see RoadMap.md's dated VM-verification
+writeup.
+
+**2026-08-31, Milestone 6/4 gap-closing session**: `tests/test_controller_readiness.py`
+(new file) covers `controller/readiness.py`'s two startup gates --
+`wait_for_worker` against a real listening `AF_UNIX` socket (matching
+`test_controller_run_integration.py`'s own reasoning for why a
+socketpair won't do), `wait_for_adguard` against a faked
+`adguard_client`. Worth its own callout: every test needing fake timing
+passes `sleep=`/`now=` **explicitly** to the function under test rather
+than monkeypatching `readiness.time.sleep`/`readiness.time.monotonic`
+-- an earlier version of this file did the latter and it silently
+didn't work, because `wait_for_worker`/`wait_for_adguard`'s own
+`sleep=time.sleep, now=time.monotonic` default arguments bind the real
+function objects at module-IMPORT time, before any monkeypatch can run.
+Three tests were quietly sleeping on real wall-clock time instead
+(masked because their assertions only checked eventual outcome, not
+speed) and a fourth genuinely failed once real `AF_UNIX` sockets made
+it collectable on Linux -- caught during the very VM verification pass
+that also confirmed the `WriteHealth` fix above, a good example of why
+a test written and only ever run on a platform that skips it isn't
+proven correct. `tests/test_controller_adguard_discovery.py` (new file)
+and additions to `tests/test_adguard_client.py`
+(`normalize_query_log_time`, `get_query_log`) and
+`tests/test_identity_bindings.py` (`touch_binding_by_ip`) cover the new
+AdGuard query-log discovery source, all fully verified live against the
+VM's real running AdGuard instance too (real DNS queries, real
+`/control/querylog` response shapes), not just against mocks.
+
+Run `pytest --collect-only -q` against `tests/` for a live,
+authoritative total (474 as of 2026-08-31 -- `AF_UNIX`-only files still
+skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
+of the same suite at this commit collects 449 passed, 25 skipped, while
+Linux collects all 474) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 
