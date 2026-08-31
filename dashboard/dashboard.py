@@ -434,18 +434,17 @@ def render(active: str, body: str) -> str:
     ).fetchone()["c"]
     # Sidebar alarm badge: only for an interception layer that's actually
     # enabled (a row exists) and either explicitly fail-open or stale (see
-    # health_page()'s _is_stale -- a crashed process can't self-report, so
-    # a frozen last_healthy_at is its own signal) -- a missing row just
+    # _subsystem_unhealthy -- a crashed process can't self-report, so a
+    # frozen last_healthy_at is its own signal) -- a missing row just
     # means the optional `interception` compose profile isn't running at
     # all, which is a normal, unremarkable deployment shape and shouldn't
-    # nag every page with a "!" badge.
-    runtime_row = conn.execute(
-        "SELECT mode, nft_mode, last_healthy_at, nft_last_healthy_at "
-        "FROM interception_runtime WHERE singleton_id = 1"
-    ).fetchone()
+    # nag every page with a "!" badge. Shares _get_runtime_row's one query
+    # and _subsystem_unhealthy's one predicate with health_page() itself,
+    # rather than each re-deriving "is this bad" independently.
+    runtime_row = _get_runtime_row(conn)
     interception_down = bool(runtime_row) and (
-        runtime_row["mode"] == "fail_open" or runtime_row["nft_mode"] == "fail_open"
-        or _is_stale(runtime_row["last_healthy_at"]) or _is_stale(runtime_row["nft_last_healthy_at"])
+        _subsystem_unhealthy(runtime_row["mode"], runtime_row["last_healthy_at"])
+        or _subsystem_unhealthy(runtime_row["nft_mode"], runtime_row["nft_last_healthy_at"])
     )
     return render_template_string(
         BASE, active=active, body=body, pending_count=pending_count,
@@ -2273,28 +2272,54 @@ def _is_stale(last_healthy_at: str | None) -> bool:
     return last_healthy_at < db.iso_secs_ago(HEALTH_STALE_AFTER_SECONDS)
 
 
-@app.route("/health")
-@require_admin
-def health_page():
-    conn = get_db()
-    runtime_row = conn.execute(
+def _subsystem_stale(mode: str, last_healthy_at: str | None) -> bool:
+    """True when this subsystem's last_healthy_at has gone stale -- but
+    only when it isn't ALREADY reporting fail_open, which is its own,
+    stronger, explicit signal with its own UI treatment (see
+    HEALTH_BODY's fail_open branch vs. its stale branch). A crashed or
+    crash-looping process can't write its own fail_open row: the
+    reporting call lives in the same process that died, so `mode`/
+    `nft_mode` stay frozen at whatever they were the moment it went
+    down, with an ever-more-outdated last_healthy_at -- confirmed live
+    2026-08-30 via a sustained OOM-kill test, see RoadMap.md's
+    fault-campaign notes. Only wall-clock staleness on last_healthy_at
+    itself can catch that; the mode column alone cannot, by
+    construction."""
+    return mode != "fail_open" and _is_stale(last_healthy_at)
+
+
+def _subsystem_unhealthy(mode: str, last_healthy_at: str | None) -> bool:
+    """True when this subsystem is either explicitly fail_open or stale
+    -- the one predicate both the sidebar alarm badge (render(), below)
+    and the health page itself (health_page()) need, expressed once
+    instead of independently in two different shapes that could drift
+    apart (found via code review 2026-08-30)."""
+    return mode == "fail_open" or _subsystem_stale(mode, last_healthy_at)
+
+
+def _get_runtime_row(conn):
+    """The interception_runtime singleton row, in full -- shared by
+    render() (which only needs a subset, for the sidebar alarm badge)
+    and health_page() (which needs all of it), so the row is only ever
+    queried once per request instead of twice against the same
+    `singleton_id = 1` primary-key lookup (found via code review
+    2026-08-30)."""
+    return conn.execute(
         "SELECT mode, last_healthy_at, fail_open_reason, applied_generation, "
         "nft_mode, nft_last_healthy_at, nft_fail_reason "
         "FROM interception_runtime WHERE singleton_id = 1"
     ).fetchone()
+
+
+@app.route("/health")
+@require_admin
+def health_page():
+    runtime_row = _get_runtime_row(get_db())
     nft_mode_badge_class = mode_badge_class = "mode-trusted"
     mode_stale = nft_mode_stale = False
     if runtime_row:
-        # A crashed or crash-looping process (e.g. sustained OOM-kill,
-        # confirmed live 2026-08-30 -- see RoadMap.md's fault-campaign
-        # notes) can't write its own fail_open row: the reporting call
-        # lives in the same process that died, so `mode`/`nft_mode` stay
-        # frozen at whatever they were the moment it went down, with an
-        # ever-more-outdated last_healthy_at. Only wall-clock staleness on
-        # last_healthy_at itself can catch this -- the mode column alone
-        # cannot, by construction.
-        mode_stale = runtime_row["mode"] != "fail_open" and _is_stale(runtime_row["last_healthy_at"])
-        nft_mode_stale = runtime_row["nft_mode"] != "fail_open" and _is_stale(runtime_row["nft_last_healthy_at"])
+        mode_stale = _subsystem_stale(runtime_row["mode"], runtime_row["last_healthy_at"])
+        nft_mode_stale = _subsystem_stale(runtime_row["nft_mode"], runtime_row["nft_last_healthy_at"])
         mode_badge_class = HEALTH_MODE_BADGE_CLASS.get(runtime_row["mode"], "mode-trusted")
         nft_mode_badge_class = HEALTH_MODE_BADGE_CLASS.get(runtime_row["nft_mode"], "mode-trusted")
     body = render_template_string(

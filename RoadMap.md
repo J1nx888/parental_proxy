@@ -892,6 +892,14 @@ design gaps from that same review, not fixed yet:
   not soak-tested"). Should probably be derived from a poll interval
   each writer persists into the DB itself, not assumed.
 
+A third finding from the same review WAS fixed the same evening (this
+one was mechanical, not a design judgment call like the two above):
+`render()` and `health_page()` were independently querying the same
+`interception_runtime` singleton row and independently re-deriving "is
+this subsystem unhealthy" in two different shapes that only agreed by
+De Morgan coincidence. Both now share one query (`_get_runtime_row()`)
+and one predicate (`_subsystem_unhealthy()`/`_subsystem_stale()`).
+
 **Milestone 9 fault-campaign progress, container-testable slice**: also
 used this session's containerization work (not available before it) to
 run two real fault-injection tests against the smoke-test VM's live
