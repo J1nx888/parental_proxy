@@ -5,6 +5,22 @@ wait_for_worker() is tested against a real listening AF_UNIX socket
 same reasoning as test_controller_run_integration.py. wait_for_adguard()
 fakes adguard_client, same as test_controller_adguard_sync.py, since it
 has no AF_UNIX dependency and should run on every platform.
+
+Every test that needs fake timing passes `sleep=`/`now=` EXPLICITLY to
+wait_for_worker()/wait_for_adguard() rather than monkeypatching
+readiness.time.sleep/readiness.time.monotonic -- those two functions'
+own `sleep=time.sleep, now=time.monotonic` defaults are bound to the
+real functions at module-IMPORT time (ordinary Python default-argument
+binding), so patching the `time` module's attributes afterward has no
+effect on a default that already captured the original function
+object. Found the hard way: an earlier version of this file did exactly
+that monkeypatch, which silently made three "fast" tests run on real
+wall-clock sleeps instead (masked because their assertions didn't
+depend on speed, just eventual outcome) and made a fourth
+(test_wait_for_worker_retries_until_the_socket_appears) genuinely fail
+on Linux, once real AF_UNIX sockets made the test collectable there --
+its side effect (creating the socket file) was wired to the fake
+sleep(), which was never actually being called.
 """
 from __future__ import annotations
 
@@ -61,10 +77,9 @@ def test_wait_for_worker_retries_until_the_socket_appears(tmp_path):
             server.listen(1)
             server_holder.append(server)
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(readiness.time, "sleep", fake_sleep)
-        mp.setattr(readiness.time, "monotonic", fake_now)
-        client = readiness.wait_for_worker(sock_path, timeout=5.0, poll_interval=0.5)
+    client = readiness.wait_for_worker(
+        sock_path, timeout=5.0, poll_interval=0.5, sleep=fake_sleep, now=fake_now
+    )
     assert isinstance(client, WorkerClient)
     assert sleep_calls[0] == 2
     client.close()
@@ -82,11 +97,10 @@ def test_wait_for_worker_gives_up_and_raises_after_timeout(tmp_path):
     def fake_sleep(seconds):
         fake_time[0] += seconds
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(readiness.time, "sleep", fake_sleep)
-        mp.setattr(readiness.time, "monotonic", fake_now)
-        with pytest.raises(OSError):
-            readiness.wait_for_worker(sock_path, timeout=2.0, poll_interval=0.5)
+    with pytest.raises(OSError):
+        readiness.wait_for_worker(
+            sock_path, timeout=2.0, poll_interval=0.5, sleep=fake_sleep, now=fake_now
+        )
 
 
 # ============================================================
@@ -109,10 +123,13 @@ def test_wait_for_adguard_retries_then_succeeds(monkeypatch):
 
     fake_time = [0.0]
     monkeypatch.setattr(readiness.adguard_client, "get_custom_rules", flaky)
-    monkeypatch.setattr(readiness.time, "sleep", lambda s: fake_time.__setitem__(0, fake_time[0] + s))
-    monkeypatch.setattr(readiness.time, "monotonic", lambda: fake_time[0])
 
-    assert readiness.wait_for_adguard("http://x", "a", "b", timeout=5.0, poll_interval=0.5) is True
+    result = readiness.wait_for_adguard(
+        "http://x", "a", "b", timeout=5.0, poll_interval=0.5,
+        sleep=lambda s: fake_time.__setitem__(0, fake_time[0] + s),
+        now=lambda: fake_time[0],
+    )
+    assert result is True
     assert calls["n"] == 3
 
 
@@ -122,7 +139,10 @@ def test_wait_for_adguard_gives_up_and_returns_false_after_timeout_without_raisi
 
     fake_time = [0.0]
     monkeypatch.setattr(readiness.adguard_client, "get_custom_rules", always_fails)
-    monkeypatch.setattr(readiness.time, "sleep", lambda s: fake_time.__setitem__(0, fake_time[0] + s))
-    monkeypatch.setattr(readiness.time, "monotonic", lambda: fake_time[0])
 
-    assert readiness.wait_for_adguard("http://x", "a", "b", timeout=2.0, poll_interval=0.5) is False
+    result = readiness.wait_for_adguard(
+        "http://x", "a", "b", timeout=2.0, poll_interval=0.5,
+        sleep=lambda s: fake_time.__setitem__(0, fake_time[0] + s),
+        now=lambda: fake_time[0],
+    )
+    assert result is False
