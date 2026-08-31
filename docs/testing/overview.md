@@ -284,11 +284,32 @@ pre-created at all, now produces a real poisoning target that lands in
 nftables' `unauthenticated_v4` set -- which is exactly the "invisible to
 interception entirely" gap this change closes.
 
+**Same night, fourth follow-up**: Phase 4 milestone 2 (dashboard
+visibility for the pending devices milestone 1 created -- see
+docs/dashboard/routes.md's `/devices`/`/devices/bypass_login` entries)
+added 7 new tests to `tests/test_dashboard.py`, following that file's
+own established convention of exercising the real Flask routes against
+a real (temp-file) SQLite DB rather than mocking anything: a pending
+device (a raw `INSERT` with `is_authenticated = 0`, mirroring what
+`record_binding()` would produce) appears in the highlighted card with
+a working **Bypass** action; an `ignored`/`bypass_login` device is
+correctly NOT treated as pending despite also having
+`is_authenticated = 0`; pending devices sort ahead of already-
+authenticated ones; and the new `bypass_login_device()` route only ever
+touches the one column it's supposed to (verified by setting a label
+first, then confirming it survives the bypass call intact) and requires
+admin auth like every other `/devices/*` route. Visually verified too,
+against this repo's own pre-existing `dashboard/dev_server.py` local
+launcher (not a new tool) rendered in a real browser: the pending card,
+the Status column's badges, and the Bypass action's full round trip
+(disappears from the pending list, `bypass_login` flips to `yes`) all
+confirmed exactly as designed.
+
 Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (498 as of 2026-08-31 -- `AF_UNIX`-only files still
+authoritative total (505 as of 2026-08-31 -- `AF_UNIX`-only files still
 skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
-of the same suite at this commit collects 468 passed, 30 skipped, while
-Linux collects all 498) rather than trusting the sum of this table.
+of the same suite at this commit collects 475 passed, 30 skipped, while
+Linux collects all 505) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

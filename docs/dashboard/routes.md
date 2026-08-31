@@ -351,13 +351,25 @@ Undocumented until this pass (2026-08-30) -- these routes predate the
 Squid intercept-mode change but were missing from this file entirely. This
 is where a device's `user_id`/`group_id`/`bump_enabled`/`bypass_login`
 assignment (consumed by `common/device_identity.py` and, once Phase 3 is
-deployed, `common/policy_class.py`/nftables) is actually set -- there is no
-captive-portal auto-registration yet (Phase 4, not built), so every device
-must be added here manually today.
+deployed, `common/policy_class.py`/nftables) is actually set.
+
+**2026-08-31 update**: a device no longer has to be added here manually to
+get *some* real state -- `common/identity.py`'s `record_binding()` (Phase
+4's first milestone) now auto-creates a pending `devices` row
+(`is_authenticated = 0`) for a genuinely new MAC, so this page is also
+where an admin now handles the result of that: a device that showed up on
+the network on its own, gated to DNS-only until someone logs in (the
+actual captive-portal login screen itself is still Phase 4, not built).
 
 - `GET /devices` -> `devices()` -- lists all `devices` rows (LEFT JOINed to
   `users`/`groups` for display), plus the add-device and add-group forms.
-  Renders `DEVICES_BODY`.
+  Renders `DEVICES_BODY`. Since 2026-08-31, also computes a `pending`
+  column per row (`ignored = 0 AND bypass_login = 0 AND is_authenticated = 0`)
+  and sorts pending rows first; when any exist, a highlighted "Devices
+  awaiting login" card (mirroring the Report page's own `pending-card`
+  convention for "Pending approval requests") lists them above the Groups
+  card with a one-click **Bypass** action alongside the existing **Manage**
+  link.
 - `POST /devices/add` -> `add_device()` -- form fields `mac_address`
   (validated/normalized via `normalize_mac()`), `label` (optional),
   `assignment` (parsed by `_parse_device_assignment()` into a `(user_id,
@@ -371,6 +383,13 @@ must be added here manually today.
 - `POST /devices/update` -> `update_device()` -- form fields `device_id`,
   `label`, `assignment`, `bump_enabled` (checkbox), `bypass_login`
   (checkbox). Updates the row. Redirects to `device_detail`.
+- `POST /devices/bypass_login` -> `bypass_login_device()` (added
+  2026-08-31) -- form field `device_id`. Sets `bypass_login = 1` and
+  nothing else -- deliberately a single-column `UPDATE`, not a wholesale
+  form resubmit like `update_device()`, so the "Bypass" quick-action
+  button in the pending-devices card can fire from a bare one-field form
+  without needing to also resubmit (and risk blanking) the device's
+  label/assignment/bump_enabled. Redirects to `devices`.
 - `POST /devices/delete` -> `delete_device()` -- form field `device_id`.
   Hard-deletes the row (`device_bindings`/`device_domains`/
   `network_events` referencing it fall back to `device_id = NULL` via `ON

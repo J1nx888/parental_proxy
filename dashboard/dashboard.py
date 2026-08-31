@@ -1538,6 +1538,38 @@ DEVICE_ASSIGNMENT_SELECT = """
 
 
 DEVICES_BODY = """
+{% set pending_devices = devices|selectattr('pending')|list %}
+{% if pending_devices %}
+<div class="card pending-card">
+<h2>Devices awaiting login ({{ pending_devices|length }})</h2>
+<p class="hint">
+  Seen on the network for the first time, gated to DNS-only access until
+  someone logs in -- the captive-portal login screen itself isn't built yet
+  (RoadMap.md Phase 4). Use <strong>Bypass</strong> for a device that will
+  never log in on its own (a TV, a thermostat), or <strong>Manage</strong>
+  to assign it to a kid or group directly instead of waiting on a login.
+</p>
+<div class="table-scroll">
+<table>
+  <tr><th>MAC address</th><th>First seen</th><th></th></tr>
+  {% for d in pending_devices %}
+  <tr>
+    <td><code>{{ d.mac_address }}</code></td>
+    <td>{{ d.created_at }}</td>
+    <td>
+      <a class="btn small" href="{{ url_for('device_detail', device_id=d.id) }}">Manage</a>
+      <form class="inline" method="post" action="{{ url_for('bypass_login_device') }}">
+        <input type="hidden" name="device_id" value="{{ d.id }}">
+        <button class="btn small" type="submit" title="Let this device online without ever needing to log in">Bypass</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+</div>
+{% endif %}
+
 <div class="card">
 <h2>Groups ({{ groups|length }})</h2>
 <p class="hint">A shared-device category (TVs, IoT, Gaming Computers) with its own domain allow-list -- assign devices to a group below, then manage what it can reach from its "Manage domains" link.</p>
@@ -1579,7 +1611,7 @@ DEVICES_BODY = """
 {% if devices %}<input type="search" data-filter-table="devicesTable" placeholder="Search devices&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">{% endif %}
 <div class="table-scroll">
 <table id="devicesTable">
-  <tr><th>MAC address</th><th>Label</th><th>Assigned to</th><th>SSL-Bump</th><th>Bypass login</th><th>Last seen</th><th></th></tr>
+  <tr><th>MAC address</th><th>Label</th><th>Assigned to</th><th>Status</th><th>SSL-Bump</th><th>Bypass login</th><th>Last seen</th><th></th></tr>
   {% for d in devices %}
   <tr>
     <td><code>{{ d.mac_address }}</code></td>
@@ -1590,12 +1622,23 @@ DEVICES_BODY = """
       {% elif d.group_name %}<span class="badge mode-trusted">{{ d.group_name }}</span>
       {% else %}<em>Unassigned</em>{% endif %}
     </td>
+    <td>
+      {% if d.pending %}<span class="badge pending" title="Seen on the network but nobody has logged in on it yet">Awaiting login</span>
+      {% elif d.ignored or d.bypass_login %}&mdash;
+      {% else %}<span class="badge allowed">Authenticated</span>{% endif %}
+    </td>
     <td>{% if d.bump_enabled %}<span class="badge mode-bump">yes</span>{% else %}<span class="badge mode-splice">no</span>{% endif %}</td>
     <td>{% if d.bypass_login %}<span class="badge pending">yes</span>{% else %}&mdash;{% endif %}</td>
     <td>{{ d.last_seen_at or 'Never' }}</td>
     <td>
       <a class="btn small" href="{{ url_for('device_detail', device_id=d.id) }}">Manage</a>
       <a class="btn small" href="{{ url_for('domains', device_id=d.id) }}">Domains</a>
+      {% if d.pending %}
+      <form class="inline" method="post" action="{{ url_for('bypass_login_device') }}">
+        <input type="hidden" name="device_id" value="{{ d.id }}">
+        <button class="btn small" type="submit" title="Let this device online without ever needing to log in">Bypass</button>
+      </form>
+      {% endif %}
       <form class="inline" method="post" action="{{ url_for('delete_device') }}">
         <input type="hidden" name="device_id" value="{{ d.id }}">
         <button class="danger small" type="submit" onclick="return confirm('Remove this device?')">Delete</button>
@@ -1603,7 +1646,7 @@ DEVICES_BODY = """
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="7"><em>No devices tracked yet.</em></td></tr>
+  <tr><td colspan="8"><em>No devices tracked yet.</em></td></tr>
   {% endfor %}
 </table>
 </div>
@@ -1622,10 +1665,12 @@ DEVICES_BODY = """
 def devices():
     conn = get_db()
     rows = conn.execute(
-        "SELECT d.*, u.display_name, g.name AS group_name FROM devices d "
+        "SELECT d.*, u.display_name, g.name AS group_name, "
+        "(d.ignored = 0 AND d.bypass_login = 0 AND d.is_authenticated = 0) AS pending "
+        "FROM devices d "
         "LEFT JOIN users u ON u.id = d.user_id "
         "LEFT JOIN groups g ON g.id = d.group_id "
-        "ORDER BY d.created_at DESC"
+        "ORDER BY pending DESC, d.created_at DESC"
     ).fetchall()
     all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
     all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
@@ -1661,6 +1706,22 @@ def add_device():
             return flash_redirect("devices", f"{mac} is already tracked.", error=True)
         raise
     return flash_redirect("devices", f"Added {mac}.")
+
+
+@app.route("/devices/bypass_login", methods=["POST"])
+@require_admin
+def bypass_login_device():
+    """Quick-action from the devices list for a device awaiting login
+    (Phase 4's admin-facing quick-add path, RoadMap.md): sets
+    bypass_login=1 without touching label/assignment/bump_enabled --
+    unlike update_device()'s wholesale form submit, this only ever
+    changes the one field, so it's safe to fire from a single button in
+    the list row without re-submitting the device's other settings."""
+    device_id = request.form.get("device_id", "")
+    conn = get_db()
+    conn.execute("UPDATE devices SET bypass_login = 1 WHERE id = ?", (device_id,))
+    conn.commit()
+    return flash_redirect("devices", "Device will no longer be asked to log in.")
 
 
 DEVICE_DETAIL_BODY = """

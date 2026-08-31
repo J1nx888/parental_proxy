@@ -2020,6 +2020,37 @@ next reconcile cycle (DNS-tier visibility/control from the moment it's
 first seen), and become gate-able by the portal login flow below --
 without this, the portal has nothing to gate in the first place.
 
+**Milestone 1 (auto-gate new devices): done and verified 2026-08-31**,
+`common/identity.py`'s `record_binding()` -- see the description above,
+which is the finished design, not just the plan. 4 new tests, two of
+which are true end-to-end proof (a bare `record_binding()` call with no
+`devices` row pre-created lands a real target in nftables'
+`unauthenticated_v4` set). Grandfather clause confirmed by its own
+dedicated test: an already-known-but-unassociated MAC from before this
+shipped stays untouched even across a later DHCP renewal.
+
+**Milestone 2 (dashboard visibility for the new PREAUTH state): done
+and verified 2026-08-31.** `dashboard/dashboard.py`'s `/devices` page
+now computes a `pending` flag per device (`ignored = 0 AND
+bypass_login = 0 AND is_authenticated = 0`) and sorts pending rows
+first; when any exist, a highlighted "Devices awaiting login" card
+appears above the Groups card -- same `.pending-card` visual convention
+the Report page's own "Pending approval requests" card already
+established, not a new pattern -- listing each one with a one-click
+**Bypass** action alongside the existing **Manage** link. The main
+devices table also gained a **Status** column (Awaiting login /
+Authenticated / `—` for ignored/bypassed) so the state is visible even
+outside the summary card. New `POST /devices/bypass_login` route
+(`bypass_login_device()`) deliberately only ever touches the one
+column -- unlike `update_device()`'s wholesale form resubmit, this lets
+the pending-card's single-button action fire without risking blanking
+a device's label/assignment. 7 new tests in `tests/test_dashboard.py`,
+plus a real visual/interactive check in a live browser against this
+repo's own pre-existing `dashboard/dev_server.py` local launcher: the
+pending card, Status badges, and the full Bypass round-trip (device
+leaves the pending list, `bypass_login` flips to `1`) all confirmed
+exactly as designed.
+
 ## Original design sketch (2026-08-30, not started at the time)
 
 Force all internet through the system regardless of per-device

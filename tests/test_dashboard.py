@@ -1371,6 +1371,110 @@ def test_devices_requires_admin_auth(client):
 
 
 # ============================================================
+# Devices: pending-login visibility (Phase 4 milestone 1's
+# auto-created, is_authenticated=0 devices -- see
+# common/identity.py's record_binding docstring for how these rows
+# come to exist in the first place; this is the dashboard-side
+# visibility for that new state)
+# ============================================================
+
+def _add_pending_device(db_conn, mac_address, created_at="2026-08-31T00:00:00Z"):
+    """Simulates a device auto-created by record_binding() for a
+    genuinely brand-new MAC -- is_authenticated=0, no user/group, not
+    ignored or bypass_login'd. A raw INSERT rather than calling
+    identity.record_binding() directly, matching this file's own
+    dashboard-level testing convention (exercise the HTTP routes and
+    the DB shape they read, not the controller-side code that produces
+    that shape)."""
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, is_authenticated, ignored, created_at) "
+        "VALUES (?, 0, 0, ?)",
+        (mac_address, created_at),
+    )
+    db_conn.commit()
+    return db_conn.execute(
+        "SELECT id FROM devices WHERE mac_address = ?", (mac_address,)
+    ).fetchone()["id"]
+
+
+def test_devices_page_shows_no_pending_card_when_nothing_is_pending(client, db_conn):
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:40"}, headers=_auth_header())
+    resp = client.get("/devices", headers=_auth_header())
+    assert b"Devices awaiting login" not in resp.data
+
+
+def test_devices_page_surfaces_a_pending_device_with_a_bypass_action(client, db_conn):
+    _add_pending_device(db_conn, "aa:bb:cc:dd:ee:41")
+
+    resp = client.get("/devices", headers=_auth_header())
+
+    assert b"Devices awaiting login (1)" in resp.data
+    assert b"aa:bb:cc:dd:ee:41" in resp.data
+    assert b"Awaiting login" in resp.data
+    assert b"Bypass" in resp.data
+
+
+def test_devices_page_does_not_treat_an_ignored_or_bypassed_device_as_pending(client, db_conn):
+    """is_authenticated=0 alone isn't enough -- ignored or bypass_login
+    already exempts a device from the future portal gate, so it must
+    not also show up as 'awaiting login'."""
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, is_authenticated, ignored, created_at) "
+        "VALUES ('aa:bb:cc:dd:ee:42', 0, 1, '2026-08-31T00:00:00Z')"
+    )
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, is_authenticated, bypass_login, created_at) "
+        "VALUES ('aa:bb:cc:dd:ee:43', 0, 1, '2026-08-31T00:00:00Z')"
+    )
+    db_conn.commit()
+
+    resp = client.get("/devices", headers=_auth_header())
+
+    assert b"Devices awaiting login" not in resp.data
+
+
+def test_pending_devices_are_sorted_ahead_of_already_authenticated_ones(client, db_conn):
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:44"}, headers=_auth_header())
+    _add_pending_device(db_conn, "aa:bb:cc:dd:ee:45")
+
+    resp = client.get("/devices", headers=_auth_header())
+    body = resp.data.decode()
+    assert body.index("aa:bb:cc:dd:ee:45") < body.index("aa:bb:cc:dd:ee:44")
+
+
+def test_bypass_login_sets_the_flag_without_touching_other_fields(client, db_conn):
+    device_id = _add_pending_device(db_conn, "aa:bb:cc:dd:ee:46")
+    db_conn.execute("UPDATE devices SET label = 'Roku' WHERE id = ?", (device_id,))
+    db_conn.commit()
+
+    resp = client.post("/devices/bypass_login", data={"device_id": device_id}, headers=_auth_header())
+    assert resp.status_code == 302
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["bypass_login"] == 1
+    assert row["label"] == "Roku", "must not clobber fields the pending-card form never submitted"
+    assert row["is_authenticated"] == 0, "bypass exempts the device, it doesn't authenticate it"
+
+
+def test_bypassed_device_no_longer_appears_in_the_pending_card(client, db_conn):
+    device_id = _add_pending_device(db_conn, "aa:bb:cc:dd:ee:47")
+
+    client.post("/devices/bypass_login", data={"device_id": device_id}, headers=_auth_header())
+
+    resp = client.get("/devices", headers=_auth_header())
+    assert b"Devices awaiting login" not in resp.data
+
+
+def test_bypass_login_requires_admin_auth(client, db_conn):
+    device_id = _add_pending_device(db_conn, "aa:bb:cc:dd:ee:48")
+    resp = client.post("/devices/bypass_login", data={"device_id": device_id})
+    assert resp.status_code == 401
+    assert db_conn.execute(
+        "SELECT bypass_login FROM devices WHERE id = ?", (device_id,)
+    ).fetchone()["bypass_login"] == 0
+
+
+# ============================================================
 # Devices: Ignore + Groups (assign to a shared-device category)
 # ============================================================
 
