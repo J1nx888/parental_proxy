@@ -1,18 +1,26 @@
 # Parental Proxy v2
 
-A from-scratch rewrite of the v1 Crunchyroll whitelist proxy. Same core
-idea (an SSL-bumping Squid proxy enforcing what gets through), rebuilt
-around three new features:
+A from-scratch rewrite of the v1 Crunchyroll whitelist proxy, now aimed at
+replacing a commercial whole-home filter (Bark Home) rather than just
+Crunchyroll. Same core idea (an SSL-bumping Squid proxy enforcing what
+gets through), rebuilt around four features:
 
 1. **Everything is configured from the dashboard** -- no files to hand-edit,
    no `squid -k reconfigure`, no restart for any rule change. Even the LAN
    IP range and the dashboard's own admin password are editable from the
    web UI after first boot (seeded from `.env` only once, on first run).
-2. **Multiple people, each with their own rules.** Every person gets their
-   own login (configured in their device's proxy settings), and site/show
-   permissions are assigned per person -- kid1 can reach `xyz.com` but not
-   `abc.com`; kid2 can reach both.
-3. **Reporting, with one-click approve -- and the kid can ask.** Every
+2. **Identity comes from the device, not a login.** Squid runs in native
+   intercept mode and resolves who's using it from the client's own IP via
+   a MAC-keyed `devices` table (DHCP-safe: identity survives an IP
+   change) -- there's no per-request Basic-Auth credential to manage
+   anymore. Site/show permissions are assigned per person -- kid1 can
+   reach `xyz.com` but not `abc.com`; kid2 can reach both.
+3. **DNS-tier ad/tracker/malware blocking (AdGuard Home).** Curated
+   uBlockOrigin/uAssets filter lists on top of AdGuard's own defaults,
+   with a weekly auto-refresh and an on-demand "check now" button from
+   Settings -- see "Ad-blocking" below. A separate, deliberately narrower
+   SSL-Bump tier gets path- and show-level rules (Crunchyroll today).
+4. **Reporting, with one-click approve -- and the kid can ask.** Every
    allow/block decision is logged with who, what, and when, filterable by
    kid and by date range (1/7/14/30 days) with at-a-glance graphs. A
    blocked entry gets Approve / Approve for everyone / Dismiss buttons, and
@@ -20,12 +28,17 @@ around three new features:
    need to know the dashboard exists for their request to show up as a
    pending alert an admin can act on immediately.
 
-This README describes the system **as it exists in code today**. A larger
-redesign -- network-level interception so filtering applies to every
-device on the LAN without per-device proxy setup, a captive-portal
-enrollment flow, and YouTube channel-level filtering -- is planned but not
-yet built; see [RoadMap.md](RoadMap.md) for the full plan and current
-status.
+This README describes the system **as it exists in code today**. Getting
+a device's traffic to Squid at all -- so #2/#3 work without configuring
+anything on the device itself -- is the job of a separate network-level
+interception layer (ARP-based redirect plus an `nftables` policy engine):
+it's built, containerized, and verified against a disposable test VM, but
+is an opt-in Docker Compose profile (`--profile interception`) and has not
+yet been run against a real household LAN. Until it is, or on a device you
+haven't added there, filtering will not apply. A captive-portal enrollment
+flow and YouTube channel-level filtering are designed but not yet built.
+See [RoadMap.md](RoadMap.md) for the full plan and current status of each
+piece.
 
 ## How it decides what to do with a site
 
@@ -87,6 +100,25 @@ against each user's individually-approved show list. This logic is
 Crunchyroll-specific and stays that way -- nothing else has an API to
 resolve "this URL belongs to this show," so it's not a generic feature.
 
+## Ad-blocking (AdGuard Home)
+
+Runs as its own container (`adguard/`), auto-bootstrapped on first start
+(no manual AdGuard setup) with a curated set of uBlockOrigin/uAssets
+filter lists layered on top of AdGuard's own default filter -- ads,
+malware/badware domains, tracking, and their matching exceptions list.
+Checks all subscribed lists for updates once a week by default
+(`ADGUARD_FILTERS_UPDATE_INTERVAL_HOURS` in `.env`); Settings has a "Check
+for filter updates now" button for whenever you don't want to wait.
+
+This also closes a gap the SSL-Bump tier alone can't: a device that isn't
+individually SSL-Bump-enabled still can't resolve a domain the household
+has marked `bump`-mode (Crunchyroll, or anything else) at all -- AdGuard
+returns a non-resolving answer for that specific device rather than
+letting the connection through unfiltered. See [RoadMap.md](RoadMap.md)
+for how the two enforcement tiers fit together, and this file's intro
+above for what still has to be true on the network for either tier to
+actually see a device's traffic today.
+
 ## The dashboard
 
 Server-rendered (Flask + Jinja2, no separate frontend build) but styled as
@@ -95,6 +127,18 @@ responsive down to phone width, and installable as a PWA (Add to Home
 Screen) -- that last part needs a secure context (`localhost`, or HTTPS
 once that's set up), so it won't offer to install over plain HTTP to a LAN
 IP, but everything else works everywhere.
+
+A collapsible left sidebar covers everything: **Report** (below), **Users**
+(add a person, set/reset their password, see their approved shows/sites),
+**Domains** (every domain's mode, global-vs-per-user access, per-domain
+allowed paths), **Devices** (MAC-based device tracking, user/group
+assignment, SSL-Bump toggle, group management), **Health** (only
+meaningful once the interception layer's compose profile is running --
+live status of the ARP/nftables pipeline, flagged as "stale" rather than
+a false "healthy" if a component has crashed and stopped reporting), and
+**Settings** (admin login, LAN CIDR, blocked-site experience, AdGuard
+connection + filter-refresh, stale-device cleanup, CA certificate
+download).
 
 **Report page:**
 
@@ -122,18 +166,32 @@ someone noticing it later in the log.
 ## Quickstart
 
 Requires [Docker](https://docs.docker.com/get-docker/) with the `docker
-compose` plugin.
+compose` plugin, on a native Linux host (not Docker Desktop -- see
+`docs/deployment/setup.md` for why).
 
 ```
-git clone https://github.com/J1nx888/crunchyroll_parentalcontrols
-cd crunchyroll_parentalcontrols   # or wherever this v2 tree lives
+git clone https://github.com/J1nx888/parental_proxy
+cd parental_proxy
 ./setup.sh
 ```
 
 The wizard asks for your LAN CIDR, an admin username/password, whether to
 expose the dashboard beyond this machine, and whether you want a friendly
-block page (needs this machine's LAN IP). Then it builds and starts both
-containers.
+block page (needs this machine's LAN IP). Then it builds and starts the
+three default containers: `proxy`, `dashboard`, and `adguard`.
+
+The network-level interception layer (ARP redirect + `nftables`, see the
+intro above) is a separate, opt-in profile, deliberately not started by
+`setup.sh` since it changes how traffic on the LAN is routed:
+
+```
+docker compose --profile interception up -d
+```
+
+It refuses to start without `ARP_WORKER_IFACE`/`GATEWAY_IP`/`GATEWAY_MAC`
+set in `.env` -- no defaults, on purpose. See
+[`docs/deployment/setup.md`](docs/deployment/setup.md) for the full
+variable reference.
 
 ## Setting up a person
 
@@ -192,14 +250,19 @@ a-URL flow, the defense-in-depth idea of a path allowlist independent of
 the show-level check, the CA-cert-download-from-the-dashboard onboarding
 flow.
 
-**New:** per-user logins and permissions (Squid Basic Auth against a
-`users` table), SQLite instead of JSON/text files, one unified decision
-engine instead of split static-file + script logic, the mode system
-(splice/bump/trusted) making the "decrypt everything or nothing" choice
-explicit and per-domain instead of an implicit whole-project default, the
-access log + reporting UI, click-to-approve, and live-editable settings
-(LAN CIDR, admin credentials) instead of baked into `squid.conf` at
-container start.
+**New:** per-user permissions against a `users` table (originally
+identified via Squid Basic Auth per person; since 2026-08-30, identity
+instead comes from the client's device -- see the intro above --
+permissions themselves are unchanged), SQLite instead of JSON/text files,
+one unified decision engine instead of split static-file + script logic,
+the mode system (splice/bump/trusted) making the "decrypt everything or
+nothing" choice explicit and per-domain instead of an implicit
+whole-project default, the access log + reporting UI, click-to-approve,
+live-editable settings (LAN CIDR, admin credentials) instead of baked
+into `squid.conf` at container start, and -- newer still -- DNS-tier
+ad-blocking (AdGuard Home) and a network-level interception layer
+designed around no per-device setup at all (opt-in, not yet run on a
+real household LAN -- see the intro above), both absent from v1 entirely.
 
 **Behavior change worth knowing:** v1 was already default-deny (a fixed
 final `deny all` in squid.conf) -- v2 doesn't change that philosophy, it
@@ -214,7 +277,9 @@ choice you make per-domain, not a blanket change.
 ## Architecture
 
 ```
-common/            shared by every component
+common/            shared Python, flat-copied into every Python container's
+                    image root (NOT a pip package) -- a change here means
+                    rebuilding every image that uses it.
   db.py              SQLite schema + connection helper
   auth.py            password hashing (PBKDF2, stdlib-only)
   cr_api.py           Crunchyroll CMS API client (unchanged from v1)
@@ -222,36 +287,62 @@ common/            shared by every component
   series_resolve.py   DB-backed object-id -> series-id cache
   matching.py         domain/path pattern matching, LAN CIDR check
   logging_util.py     deduped access-log writer
+  device_identity.py  resolve_user(conn, client_ip) -- Squid's identity
+                       source since intercept mode replaced per-login auth
+  identity.py         record_binding() etc. -- writes device_bindings rows
+  adguard_client.py   HTTP client for AdGuard Home's admin API
 
-proxy/
+proxy/              the Squid container (squid-openssl, not plain squid --
+                    Debian's default build can't SSL-Bump at all)
   sni_helper.py          Squid `external_acl_type` for the ssl_bump decision
                           (bump/trusted/splice, checked via SNI)
   authz_helper.py        Squid `external_acl_type` for the HTTP-layer
                           decision on bump-mode domains (paths + shows)
-  squid.conf.template    intercept-mode config (2026-08-30) -- see
-                          RoadMap.md's Squid intercept-mode section
+  squid.conf.template    native intercept-mode config -- no device
+                          configures a proxy setting; traffic is
+                          NAT-redirected to Squid's intercept ports
   entrypoint.sh
   Dockerfile
 
-dashboard/
-  dashboard.py    Flask app: users, domains, per-domain paths, per-user
-                  shows, report + approve, settings, CA cert download
+dashboard/          single-file Flask app, waitress-served
+  dashboard.py    users, domains, per-domain paths, per-user shows,
+                  devices/groups, health, report + approve, settings,
+                  CA cert download -- the only place an admin edits config
+  block_page_server.py   tiny HTTP-only server for the friendly
+                          AdGuard-blocked-domain landing page
   static/         CSS design system, vendored Chart.js, PWA manifest +
                   service worker, generated icon set
   dev_server.py   local-only launcher for previewing the dashboard
                   outside Docker (not used by the built image)
   Dockerfile
 
+adguard/            thin wrapper on adguard/adguardhome, auto-bootstrapped
+                    on first run (first-run config, curated uBlockOrigin/
+                    uAssets filter lists)
+
 defaults/
   seed_defaults.py   idempotent first-run seeding (infra domains,
                       Crunchyroll domain + paths, trusted CDN list)
+
+controller/         Phase 3 control loop (interception profile only) --
+                    Python; reconciles desired device policy into the DB,
+                    talks to the ARP worker over a Unix socket, syncs
+                    AdGuard's per-client hard-deny rules, reports health
+
+phase3/
+  arp-worker/         Go -- privileged ARP poisoning + corrective restore,
+                      gets a device's traffic to this host at all
+  nftables-manager/   Go -- reconciles kernel nftables sets against the
+                      DB-computed policy the controller writes
 ```
 
-One database (`/config/parental_proxy.db`, SQLite, WAL mode) shared by both
-containers via a Docker volume. Every helper script and the dashboard open
-it directly -- there's no caching layer to go stale, since `ttl=0` on every
-`external_acl_type` means Squid re-checks with the helper on every new
-connection rather than caching a verdict.
+**The one datastore is one SQLite file** (`/config/parental_proxy.db`, WAL
+mode) on a shared Docker volume -- every container that touches it opens
+it directly, no other IPC between the Python side and the Go side. There's
+no caching layer to go stale: `ttl=0` on every `external_acl_type` line
+means Squid re-checks with the helper on every new connection, and
+`nftables-manager` polls the same DB on its own interval rather than being
+told when to reconcile.
 
 ## Testing notes
 
@@ -310,6 +401,18 @@ per-show enforcement entirely, and a wrong assumption about Basic-auth
 percent-encoding) -- see `docs/review-2026-08-28.md` for the full writeup
 of each. The Squid `external_acl_type`/`ssl_bump`/Basic-Auth combination
 this project depends on is confirmed working as designed.
+
+**This section is a historical snapshot, not the current authoritative
+status** -- a lot has shipped and been live-verified since, including the
+whole `adguard`/`controller`/`phase3` stack above, running together as
+Docker containers against a disposable test VM (native intercept mode,
+AdGuard integration, the ARP/nftables interception layer end-to-end, and
+several real fault-injection tests: an ungraceful container crash, a
+sustained OOM-kill). See
+[`docs/testing/overview.md`](docs/testing/overview.md) for the current
+test-suite reference (what runs where, current test count) and
+[RoadMap.md](RoadMap.md) for what's been verified live vs. what still
+needs a real household LAN or real hardware.
 
 ## Backing up / moving to another machine
 
