@@ -217,11 +217,31 @@ AdGuard query-log discovery source, all fully verified live against the
 VM's real running AdGuard instance too (real DNS queries, real
 `/control/querylog` response shapes), not just against mocks.
 
+**Same night, follow-up**: closing the ARP send-failure visibility gap
+(see docs/architecture/overview.md) added `phase3/arp-worker/internal/worker/worker_test.go`
+cases for the new consecutive-send-failure counter (increments on
+failure, resets on success), `tests/test_controller_ipc_client.py`
+cases for parsing the new `heartbeat_ack` field (present, and absent
+for backward compatibility with an older worker binary),
+`tests/test_controller_run_cycle.py` cases for the new `fail_open`-at-
+threshold decision, one new `tests/test_controller_run_integration.py`
+case driving the same behavior through the real heartbeat-pacer thread
+rather than injecting the value directly, and
+`tests/test_controller_health.py` cases for `report_fail_open()`'s new
+optional `applied_generation` parameter -- added after that
+integration test, run for real on Linux, caught a genuine bug: a bare
+`report_fail_open()` on a brand-new row let `applied_generation`
+silently default to 0 instead of preserving the cycle's real, true
+value. All of it verified live end-to-end too: a real veth-harness
+NIC-down test showed `/health` flip to `fail_open` with a live-
+incrementing reason within 2 seconds of the interface going down, and
+correctly recover once it came back.
+
 Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (474 as of 2026-08-31 -- `AF_UNIX`-only files still
+authoritative total (482 as of 2026-08-31 -- `AF_UNIX`-only files still
 skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
-of the same suite at this commit collects 449 passed, 25 skipped, while
-Linux collects all 474) rather than trusting the sum of this table.
+of the same suite at this commit collects 452 passed, 30 skipped, while
+Linux collects all 482) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

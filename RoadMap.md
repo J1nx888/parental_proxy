@@ -1502,6 +1502,14 @@ fixes for each.
       Both wired behind new optional CLI flags
       (`--worker-ready-timeout`/`--adguard-ready-timeout`) with no
       change to callers that don't pass them.
+
+      **Health reporting extended 2026-08-31** to close a real gap a
+      Milestone 9 NIC-down test found: `interception_runtime` used to
+      stay `'running'` throughout a genuine, sustained ARP-send-failure
+      window, since it only ever tracked the controller↔worker
+      Unix-socket heartbeat, not the worker's actual packet
+      transmission. Full writeup, including the live before/during/
+      after `/health` proof, is under Milestone 9 below.
 - [ ] **7. Authentication workflow** — toggling
       `devices.is_authenticated` updates policy without restarting
       spoofing. **Done and verified live end-to-end 2026-08-29** — see
@@ -1725,11 +1733,54 @@ fixes for each.
         Unix-socket heartbeat, which the LAN-facing interface going
         down has no effect on whatsoever. `/health` would show fully
         green while the actual interception mechanism is completely
-        failing. This is real and worth fixing eventually (e.g. wiring
-        `OnSendError` into health reporting somehow) but is a distinct,
-        smaller gap than the mechanism-doesn't-work doubt this
-        investigation started with — that doubt is now resolved, and
-        resolved in the mechanism's favor.
+        failing. **Fixed and verified live the same night** — see
+        immediately below.
+
+      **Fixed the health-visibility gap above, verified live end-to-end
+      2026-08-31.** `worker.Worker` gained a global, atomic
+      `consecutiveSendFailures` counter (incremented on every failed
+      `ARPSender.Reply()`, reset to 0 on any success — global rather
+      than per-target, since the motivating failure fails every send at
+      once regardless of target), reported to the controller on every
+      `heartbeat_ack` via a new `HeartbeatAck.ConsecutiveSendFailures`
+      field — closing a gap `sendGratuitousReply`'s own long-standing
+      TODO comment had already named exactly ("SUSTAINED failure should
+      still escalate to a controller message... needs a
+      failure-rate/consecutive-failure counter, not built here"). The
+      controller's heartbeat pacer writes the latest value into a small
+      shared dict; `run_cycle` (the sole writer of
+      `interception_runtime`'s `mode`/`fail_open_reason` columns, kept
+      that way deliberately to avoid two threads racing on the same
+      write) reports `fail_open` instead of `running` once 3 or more
+      consecutive failures are seen, with a clear, specific reason
+      string. Caught and fixed one real bug along the way, via the
+      fix's own integration test run for real on the VM rather than by
+      inspection: `health.report_fail_open()` never touched
+      `applied_generation`, correct for its original callers (the
+      reconcile cycle itself failed, no fresh generation to report) but
+      wrong for this new caller, where reconciliation genuinely
+      succeeded — a bare `report_fail_open()` on a brand-new row let
+      `applied_generation` silently default to 0, understating the real
+      value on the very first `fail_open` cycle. Fixed with an optional
+      `applied_generation` parameter, defaulting to `None` (preserving
+      every existing caller's behavior exactly) and set explicitly by
+      the new caller.
+
+      **Verified live, twice**: `go build`/`go vet`/`go test` clean
+      (2 new tests, 10× flake-checked) plus the full Linux `pytest`
+      suite (482 passed, 0 skipped, up from 474). Then rebuilt the
+      images and re-ran the exact veth-harness NIC-down scenario from
+      the investigation above end to end: baseline `mode: 'running'` →
+      interface down → **`mode` flipped to `'fail_open'` within 2
+      seconds**, with a live-incrementing, human-readable reason
+      (`"arp-worker: N consecutive ARP send failures (the bound network
+      interface is likely down)"`) and `applied_generation` correctly
+      preserved at its true last-known-good value throughout → interface
+      restored → `mode` correctly returned to `'running'`,
+      `fail_open_reason` cleared. The production stack (`ppfaulttest`-
+      based) was rebuilt and redeployed with this fix too, confirmed
+      still green throughout, and all throwaway resources removed
+      after.
 
       **This also substantially restores confidence in the original
       2026-08-30 Milestone 3 claim** this section corrected earlier

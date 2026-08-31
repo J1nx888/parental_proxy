@@ -146,6 +146,16 @@ take effect everywhere.
   still raises past its timeout (Docker's `restart: unless-stopped`
   remains the fallback); the AdGuard wait never raises -- AdGuard isn't
   required for the rest of `run()` to function.
+- **ARP send-failure visibility** (added 2026-08-31, closing a gap a
+  live NIC-down test found): `phase3/arp-worker`'s `worker.Worker`
+  tracks a global consecutive-send-failure count, reported to the
+  controller on every `heartbeat_ack`. `controller/main.py`'s
+  `run_cycle` reports the pipeline as `fail_open` (not `running`) once
+  3 or more failures are seen in a row -- previously, a sustained ARP
+  send failure (e.g. the bound network interface going down) was
+  completely invisible to `interception_runtime`/`/health`, since
+  health reporting only ever tracked the controller<->worker Unix-socket
+  heartbeat, which such a failure doesn't touch at all.
 
 ---
 
