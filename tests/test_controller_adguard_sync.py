@@ -22,10 +22,12 @@ def _insert_domain(conn, pattern: str, mode: str = "bump") -> None:
     conn.commit()
 
 
-def _insert_device_with_binding(conn, mac: str, ip: str, *, bump_enabled: bool, active: bool = True) -> None:
+def _insert_device_with_binding(
+    conn, mac: str, ip: str, *, bump_enabled: bool, active: bool = True, is_authenticated: bool = True
+) -> None:
     conn.execute(
-        "INSERT INTO devices (mac_address, bump_enabled, created_at) VALUES (?, ?, datetime('now'))",
-        (mac, int(bump_enabled)),
+        "INSERT INTO devices (mac_address, bump_enabled, is_authenticated, created_at) VALUES (?, ?, ?, datetime('now'))",
+        (mac, int(bump_enabled), int(is_authenticated)),
     )
     device_id = conn.execute("SELECT id FROM devices WHERE mac_address = ?", (mac,)).fetchone()["id"]
     conn.execute(
@@ -89,6 +91,28 @@ def test_build_rules_covers_every_non_bump_device(conn):
     assert "192.168.1.10" in rules[0]
     assert "192.168.1.11" in rules[0]
     assert "192.168.1.12" not in rules[0], "a bump_enabled device must never be added to the deny list"
+
+
+def test_build_rules_still_denies_a_bump_enabled_device_that_is_not_yet_authenticated(conn):
+    """Regression test for a real gap found and fixed 2026-08-31 (same
+    class of bug as classify_device()/bypass_login -- see RoadMap.md):
+    build_rules() used to select on the raw bump_enabled column alone,
+    so a device with bump_enabled=1 but is_authenticated=0 (a genuinely
+    new PREAUTH device, or one pre-configured for bump ahead of its
+    first login) was excluded from the hard-deny list -- while ALSO not
+    being nftables bump_v4-eligible (bump_eligible() requires
+    AUTHENTICATED too) -- a full, unfiltered bypass of the hard-deny
+    invariant this module exists to enforce. Must now be denied, same
+    as any other non-bump-eligible device, until it actually logs in."""
+    _insert_domain(conn, "crunchyroll\\.com")
+    _insert_device_with_binding(
+        conn, "aa:bb:cc:dd:ee:04", "192.168.1.13", bump_enabled=True, is_authenticated=False
+    )
+
+    rules = adguard_sync.build_rules(conn)
+
+    assert len(rules) == 1
+    assert "192.168.1.13" in rules[0]
 
 
 def test_build_rules_threads_block_page_ip_into_every_rule(conn):

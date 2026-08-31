@@ -26,6 +26,7 @@ import sqlite3
 
 import adguard_client
 from periodic import PeriodicTask
+from policy_class import bump_eligible
 
 log = logging.getLogger("controller.adguard_sync")
 
@@ -73,41 +74,60 @@ def _domain_rule(pattern: str, client_ips: list[str], block_page_ip: str | None 
 def build_rules(conn: sqlite3.Connection, block_page_ip: str | None = None) -> list[str]:
     """The complete list of managed hard-deny rules for right now: one
     rule per `mode = 'bump'` domain, each scoped to every device that
-    is currently NOT `bump_enabled`.
+    is not currently `bump_eligible()` (`common/policy_class.py`).
 
-    Deliberately not filtered by `is_authenticated`/`ignored`/
-    `quarantined_at`: a device excluded from DNS-tier interception
+    **Fixed 2026-08-31 -- a real gap, same class of bug as
+    classify_device() and bypass_login (see RoadMap.md's dated entry
+    for that one)**: this used to select on the raw `d.bump_enabled = 0`
+    column instead of the actual derived `bump_eligible()` state. A
+    device with `bump_enabled = 1` set (an admin can do this at any
+    time, including on a device that hasn't logged in yet) but not yet
+    actually `AUTHENTICATED` -- e.g. a genuinely new, still-PREAUTH
+    device Phase 4 auto-creates, or one deliberately pre-configured for
+    bump ahead of its first login -- was excluded from this hard-deny
+    list entirely (since `bump_enabled = 1`), while ALSO not being a
+    member of nftables' `bump_v4` set (`bump_eligible()` requires
+    `AUTHENTICATED` too, which it isn't yet). The result: AdGuard
+    resolved the real IP for a `mode='bump'` domain, and nftables never
+    redirected the resulting HTTPS connection to Squid either -- a full,
+    unfiltered bypass of the exact invariant this module exists to
+    enforce, worse than either a hard deny or a Squid-refined
+    connection. Now selects the same way `controller/policy_state.py`
+    already does: fetch the columns `bump_eligible()` needs and exclude
+    only devices it actually returns True for.
+
+    Deliberately still not filtered by `ignored`/`quarantined_at` on
+    their own (only through `bump_eligible()`'s own use of
+    `classify_device()`): a device excluded from DNS-tier interception
     entirely (bypass_v4/quarantine_v4, see policy_class.py) never
     actually queries AdGuard's redirected port in the first place, so
     including its IP here changes nothing for it -- and the fail-closed
-    default (deny unless a device is explicitly opted into bump) is the
-    one RoadMap.md's invariant actually calls for. A device with no
-    currently-active `device_bindings` row contributes no IP -- there's
-    nothing to add a rule for yet; the same DHCP-staleness bound as
-    `controller/discovery.py`'s snapshot loop applies here (a device's
-    new IP is only picked up once discovery records it, and only
-    enforced once the next adguard_sync cycle runs after that).
+    default (deny unless a device is currently, actually bump-eligible)
+    is the one RoadMap.md's invariant actually calls for. A device with
+    no currently-active `device_bindings` row contributes no IP --
+    there's nothing to add a rule for yet; the same DHCP-staleness bound
+    as `controller/discovery.py`'s snapshot loop applies here (a
+    device's new IP is only picked up once discovery records it, and
+    only enforced once the next adguard_sync cycle runs after that).
 
     Returns an empty list when there are no bump-mode domains configured
-    at all, or no non-bump device currently has a known IP -- both
-    legitimate "nothing to deny yet" states, not errors.
+    at all, or no non-bump-eligible device currently has a known IP --
+    both legitimate "nothing to deny yet" states, not errors.
     """
     domains = conn.execute("SELECT pattern FROM domains WHERE mode = 'bump' ORDER BY id").fetchall()
     if not domains:
         return []
 
-    non_bump_ips = [
-        row["ipv4_address"]
-        for row in conn.execute(
-            """
-            SELECT DISTINCT b.ipv4_address
-            FROM devices d
-            JOIN device_bindings b ON b.device_id = d.id AND b.active = 1
-            WHERE d.bump_enabled = 0
-            ORDER BY b.ipv4_address
-            """
-        ).fetchall()
-    ]
+    rows = conn.execute(
+        """
+        SELECT DISTINCT b.ipv4_address, d.ignored, d.quarantined_at, d.is_authenticated,
+               d.bump_enabled, d.bypass_login
+        FROM devices d
+        JOIN device_bindings b ON b.device_id = d.id AND b.active = 1
+        ORDER BY b.ipv4_address
+        """
+    ).fetchall()
+    non_bump_ips = [row["ipv4_address"] for row in rows if not bump_eligible(row)]
     if not non_bump_ips:
         return []
 
