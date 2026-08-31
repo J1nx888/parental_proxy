@@ -944,7 +944,7 @@ from inside the container's own PID 1 does; confirmed the controller's
 reconnect logic recovers correctly either way) and the OOM-kill test
 above. NIC down/up and gateway reboot still need real hardware.
 
-- [ ] **TODO, next session the smoke-test VM is back online** — ordered
+- [x] **TODO, next session the smoke-test VM is back online** — ordered
   plan, written up 2026-08-30 end-of-night specifically so this can run
   with minimal check-ins. Each step is self-contained; do them in order,
   fix anything genuinely broken the same way this session did (don't
@@ -952,7 +952,7 @@ above. NIC down/up and gateway reboot still need real hardware.
   its own dated section below, matching this session's pattern) as you
   go rather than batching it to the end. Stop and check in only for the
   two flagged exceptions at the bottom — everything else is a "just go
-  do it" task.
+  do it" task. **Done 2026-08-31 — see dated writeup below.**
 
   1. **Housekeeping.** `git pull --ff-only` (expect a fast-forward onto
      today's commits, nothing local should be ahead). Check whether the
@@ -1019,6 +1019,101 @@ above. NIC down/up and gateway reboot still need real hardware.
     test, real-household-LAN/hardware fault testing) each need an actual
     decision or your physical presence — don't start any of them
     autonomously; report back and ask instead.
+
+**2026-08-31: ran the full plan above, all six steps, clean.**
+
+1. **Housekeeping.** `git pull --ff-only` fast-forwarded `218a489..d355563`
+   as expected. The controller's 10MB memory limit from the prior
+   session's OOM fault test had indeed survived (it was crash-looping,
+   `Restarting (137)`) — `docker update --memory 0` silently no-ops on
+   this Docker version (29.7.2) instead of actually clearing a limit
+   (worth remembering: `docker update --memory 0` is not a reliable way
+   to remove a limit once set); a `docker compose up -d --force-recreate
+   controller` did the job properly (recreates from the compose
+   definition, which carries no memory limit at all) and is now the
+   preferred technique for this.
+2. **Go test verification.** `phase3/nftables-manager`: `go build ./...`
+   and `go vet ./...` both clean; `go test ./...` all green including
+   both new `WriteHealth` tests, then a `-count=10` flake check on
+   `internal/dbsource` — 10/10 clean. `phase3/arp-worker`: build/vet/test
+   all clean too, nothing regressed. **The `WriteHealth` fix (commit
+   `d53a8a8`) is now genuinely verified**, not just reasoned-through.
+3. **Full Linux pytest run.** `447 passed in 90.55s`, 0 skipped — first
+   confirmation of the full current suite on Linux.
+4. **Live redeploy + smoke test.** `docker compose --profile interception
+   up -d --build` rebuilt and restarted all six cleanly. `/health` showed
+   both cards green ("running", recent timestamps) and controller logs
+   stayed silent (adguard_sync.py's `sync_once()` is silent on success by
+   design — only `on_error=lambda exc: log.warning("adguard sync failed:
+   %s", exc)` in `controller/main.py` would have logged anything) across
+   ~6 sync intervals (30s each) with zero "adguard sync failed" warnings.
+5. **Fault-tested `nftables-manager`.** Two real findings here, one of
+   which corrects this file's own earlier note above ("only a crash from
+   inside the container's own PID 1" triggers `restart: unless-stopped`):
+   - **`docker exec nftables-manager sh -c 'kill -9 1'` did NOT crash it
+     at all** — confirmed via `/proc/1/status` before and after, process
+     untouched. Root cause: `phase3/nftables-manager`'s (and, checked for
+     comparison, `phase3/arp-worker`'s) Dockerfile `ENTRYPOINT` is the Go
+     binary directly, no shell/tini/init wrapper — so the binary genuinely
+     *is* PID 1 of its own PID namespace. Linux's kernel exempts init
+     processes of a PID namespace from unhandled signals sent by a
+     process *within that same namespace* — including SIGKILL — so a
+     `docker exec`'d shell (which joins the container's existing PID
+     namespace) simply cannot kill it this way, no matter the UID or
+     capabilities (checked: both sender and PID 1 had identical
+     `CapEff`/root). This means the technique this file previously
+     documented as confirmed-working must have either been tested
+     differently last time or never actually verified against a
+     bare-binary-as-PID1 container — flagging rather than quietly
+     re-asserting it.
+   - **`docker kill -s KILL nftables-manager` from the host DID kill it**
+     (real `ExitCode=137`, confirmed via `docker events`) — sent from an
+     ancestor PID namespace with real privilege, so the kernel exemption
+     doesn't apply. But exactly as this file's existing note predicted,
+     Docker's restart-policy bookkeeping treats an explicit `docker
+     kill`/`stop` as admin-intentional and does **not** auto-restart
+     (`RestartCount` stayed put for 13+ seconds after).
+   - **The sustained OOM-kill scenario is what actually worked as a full
+     end-to-end test**, and needed retuning live: at a 10MB limit the
+     process's real steady-state footprint (~7-8MB) mostly fit, only
+     OOMing once right at a `docker update` boundary before settling
+     back down (`docker events` showed a genuine `container oom` →
+     `container die` (137) → `container start` cycle in under 300ms,
+     `RestartCount` 0→1 — a real kernel-initiated OOM, correctly
+     auto-recovered, unlike the admin-kill case above). Tightening to
+     6MB produced a real sustained crash loop (`OOMKilled=true`,
+     `RestartCount` stuck at 2 for 40+ seconds) — and during that window,
+     **`/health` correctly showed the nftables-manager card as "stale —
+     last reported healthy over 30s ago" instead of a false "running."**
+     This is the live, end-to-end proof of the `WriteHealth` fix the plan
+     was after, beyond the Go unit tests. Memory limit cleared via
+     `--force-recreate` afterward; card confirmed back to green "running".
+6. **Tear down.** All six containers' memory limits confirmed back to
+   `0`. Found and removed one genuine leftover: the `ppfaulttest` Docker
+   bridge network from a prior session's fault testing — **but this
+   turned out to still be load-bearing**: `.env`'s `ARP_WORKER_IFACE`
+   was still pointing at that network's `br-<id>` interface (a
+   deliberately-fabricated sandbox network + fake `GATEWAY_IP`/
+   `GATEWAY_MAC`, precisely so `arp-worker`'s real ARP-injection code has
+   something safe to run against instead of this VM's real `eth0`/`ens1`
+   or its cloud provider's actual gateway). Deleting the network broke
+   `arp-worker`'s configured interface. Recovered by recreating the
+   network with the identical name/subnet/gateway (`172.30.0.0/24`,
+   gateway `172.30.0.1`), updating `.env`'s `ARP_WORKER_IFACE` to the new
+   bridge's name (Docker assigns a new `br-<id>` per network even when
+   the subnet is reused), and recreating `arp-worker`+`controller` to
+   pick it up — confirmed clean startup and `/health` green again after.
+   **Lesson for next time a Docker network needs tearing down on this
+   VM**: check `.env` for any interface name that matches it first —
+   this project's sandbox ARP-testing setup is real infrastructure the
+   VM depends on, not disposable scratch state, even though its name
+   sounds like a one-off.
+
+Ended clean, all six containers up, `/health` green on both cards,
+`git status` clean, no leftover memory limits — genuinely nothing left to
+do autonomously per this plan's own stated exception. Not starting Phase
+4/Milestone 10/real-LAN work without a decision from the user, per the
+plan's own instruction.
 
 ### Fail-open engineering (a correction to an earlier assumption)
 
