@@ -237,11 +237,30 @@ NIC-down test showed `/health` flip to `fail_open` with a live-
 incrementing reason within 2 seconds of the interface going down, and
 correctly recover once it came back.
 
+**Same night, second follow-up**: implementing active ARP scanning
+(the discovery precedence list's last source -- see
+docs/architecture/overview.md) added `tests/test_controller_active_scan.py`
+-- 12 fully-mocked tests (a `_FakeSocket` stands in for `socket.socket`,
+so nothing here touches a real network) covering staleness/rate-limit
+selection (`select_stale_bindings`), the nudge itself (`nudge` sends
+exactly one UDP datagram and always closes the socket, even on a
+synchronous `OSError`), that `scan_once()` never writes
+`device_bindings` itself (that's deliberately left to
+`controller/discovery.py`'s own snapshot loop -- see `active_scan.py`'s
+module docstring), and the usual `run_loop` wiring
+(repeats/stops-promptly/reports-errors-without-dying) shared with every
+other `*_discovery.py` module in this codebase. The UDP-nudge
+*mechanism* itself (does `sendto()` to a closed port really trigger
+kernel ARP resolution?) was verified live against a real kernel on the
+smoke-test VM separately, before any of this code was written -- not
+re-verified by these mocked tests, which only exercise this module's
+own logic.
+
 Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (482 as of 2026-08-31 -- `AF_UNIX`-only files still
+authoritative total (494 as of 2026-08-31 -- `AF_UNIX`-only files still
 skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
-of the same suite at this commit collects 452 passed, 30 skipped, while
-Linux collects all 482) rather than trusting the sum of this table.
+of the same suite at this commit collects 464 passed, 30 skipped, while
+Linux collects all 494) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

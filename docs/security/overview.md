@@ -212,24 +212,34 @@ deactivating the stale `(mac, old_ip)` row and activating a fresh
 `(mac, new_ip)` one, so `resolve_user()`'s `WHERE ... AND active = 1` always
 targets whichever IP is *currently* live for that MAC, not a stale one.
 
-**The gap this depends on -- narrowed, not closed, 2026-08-30**: something
-has to actually call `record_binding()` regularly when a device's IP
-changes for this to stay current. `controller/discovery.py`'s
-`snapshot_once()` (a periodic `ip neigh show` snapshot) is now wired into
-an actual running loop (`discovery.run_loop()`, started from
-`controller/main.py`'s `run()` on its own background thread and its own
-DB connection, interval configurable via `--discovery-interval`) --
-before this, per the module's own docstring, it wasn't wired into
-anything at all, so staleness was unbounded. Now the freshness bound is
-that interval (default 30s), not "forever" -- but the higher-precedence
-live rtnetlink-event listener (RoadMap.md Milestone 4) still doesn't
-exist, so a device's new IP can still take up to one interval to become
-resolvable after a DHCP renewal. During that window `resolve_user()` for
-the new IP returns `None` — the device fails toward *less* access
+**The gap this depends on -- narrowed further, 2026-08-31**: something has
+to actually call `record_binding()` regularly when a device's IP changes
+for this to stay current. `controller/discovery.py`'s `snapshot_once()`
+(a periodic `ip neigh show` snapshot) is wired into an actual running
+loop (`discovery.run_loop()`, started from `controller/main.py`'s `run()`
+on its own background thread and its own DB connection, interval
+configurable via `--discovery-interval`). **Correction to this
+paragraph's own 2026-08-30 claim**: it said the higher-precedence live
+rtnetlink-event listener "still doesn't exist" -- that was true when
+written, but `controller/rtnetlink_listener.py` was built and wired in
+the same day (enabled by default alongside `--db-path`, see
+`--no-rtnetlink`), so most DHCP-renewal staleness is now closed near-
+immediately rather than bounded by the snapshot's own interval. The
+snapshot loop remains the catch-all for anything the live listener
+missed (e.g. a device already idle before this process started). As of
+2026-08-31, `controller/active_scan.py` narrows the remaining gap
+further still for a device that's gone quiet rather than renewed: it
+periodically nudges the kernel to re-resolve a stale binding's IP (a
+plain UDP `sendto()` to a closed port, since the controller holds no
+`CAP_NET_RAW` -- see `docs/architecture/overview.md`), letting the same
+snapshot/rtnetlink sources pick up a real device that's still on the LAN
+but hasn't generated fresh traffic on its own. During whatever window
+remains before any of these sources catches a new IP, `resolve_user()`
+for that IP returns `None` -- the device fails toward *less* access
 (denied, not misattributed to a different user), which is the safe
 direction, but it's still a real, bounded-but-nonzero gap, not a
-hypothetical one. See RoadMap.md Milestone 4 and
-`controller/discovery.py`'s docstring.
+hypothetical one. See RoadMap.md Milestone 4 and `controller/discovery.py`'s
+docstring.
 
 ### The hard-deny invariant: what stops a non-bump device from ever seeing a `mode='bump'` domain
 

@@ -156,6 +156,19 @@ take effect everywhere.
   completely invisible to `interception_runtime`/`/health`, since
   health reporting only ever tracked the controller<->worker Unix-socket
   heartbeat, which such a failure doesn't touch at all.
+- **Active ARP scanning** (`controller/active_scan.py`, added
+  2026-08-31) -- the discovery precedence list's last source, "only
+  when stale or onboarding a new device." Holds no `CAP_NET_RAW` itself
+  (only `phase3/arp-worker` does); instead it opens a plain UDP socket
+  and `sendto()`s a closed port on a stale `device_bindings` IP, which
+  forces the kernel's own routing layer to (re)resolve that address's
+  link-layer identity as a side effect -- confirmed live against a real
+  kernel before this was built, no new `arp-worker` IPC op needed. Only
+  ever nudges; `controller/discovery.py`'s already-running snapshot
+  loop is what actually observes and records any resulting resolution.
+  Rate-limited (`--active-scan-limit` bindings per `--active-scan-interval`,
+  only bindings older than `--active-scan-stale-after`) to avoid a scan
+  storm on a large LAN.
 
 ---
 

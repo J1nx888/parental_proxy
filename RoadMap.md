@@ -1338,7 +1338,7 @@ fixes for each.
       real bug along the way: `-controller-uid=0` (a legitimate UID —
       root) was being rejected as "not provided," since the flag used
       0 as both its zero-value default and its required-check sentinel.
-- [ ] **4. Identity model** — `device_bindings`, outbox events, MAC/IP
+- [x] **4. Identity model** — `device_bindings`, outbox events, MAC/IP
       conflict handling. **Scaffold written and verified 2026-08-29**:
       `device_bindings`/`interception_runtime`/`network_events` tables
       added to `common/db.py`; `common/identity.py` records
@@ -1441,71 +1441,67 @@ fixes for each.
       correctly deactivated a synthetic test binding the moment the
       real one appeared for the same IP.
 
-      Still unbuilt: active, rate-limited ARP scanning (the design
-      doc's final precedence-order source, "only when stale or
-      onboarding a new device") — deliberately not attempted this pass;
-      see this file's open items for why it needs a real design decision
-      (namely: whether to use the "connect a UDP socket to nudge the
-      kernel's neighbor-cache state machine" technique to keep the
-      controller unprivileged, versus asking the ARP worker itself to
-      do it) rather than a mechanical build.
+      **Active, rate-limited ARP scanning: done and verified live
+      2026-08-31** (the design doc's final precedence-order source,
+      "only when stale or onboarding a new device"). The design
+      decision this needed (UDP-nudge vs. a new arp-worker IPC "probe"
+      op) was confirmed live against a real kernel on the smoke-test VM
+      **before** writing any code, per this project's own "verify
+      against the real thing" discipline: deleting a neighbor entry for
+      an address the host doesn't own and `sendto()`-ing a closed UDP
+      port to it reliably transitioned the entry to `INCOMPLETE` (a
+      genuine kernel-initiated resolution attempt), and doing the same
+      against an already-STALE entry kicked off real re-verification —
+      confirmed for both the "onboarding" and "stale refresh" shapes
+      this feature needs, with no new `phase3/arp-worker` IPC op
+      required. (One methodological dead end worth recording: the first
+      version of this check nudged a *secondary IP address added to the
+      same host's own interface* and found NO neighbor entry ever
+      appeared at all — a locally-owned address is routed internally,
+      never triggering real ARP. Re-ran against a genuinely unowned
+      address instead, which is the valid test.)
 
-      **TODO, next session — concrete plan, written up 2026-08-31 end
-      of night so this can start with minimal re-derivation:**
+      `controller/active_scan.py` (`select_stale_bindings()`,
+      `nudge()`, `scan_once()`, `run_loop()`) mirrors
+      `adguard_discovery.py`'s shape exactly, wired into
+      `controller/main.py` behind `--active-scan-interval`/
+      `--active-scan-stale-after`/`--active-scan-limit`/
+      `--no-active-scan`. It deliberately only ever nudges — it never
+      writes `device_bindings` itself; `controller/discovery.py`'s
+      already-running snapshot loop is what observes and records any
+      resulting resolution, exactly like `adguard_discovery.py`'s own
+      narrow-scope precedent. 12 new fully-mocked unit tests (no real
+      network) cover staleness/rate-limit selection, the nudge itself,
+      and `run_loop` wiring — see `tests/test_controller_active_scan.py`.
 
-      1. **Design decision to make first** (this is the one genuine
-         judgment call, not mechanical): how does the controller
-         trigger a fresh ARP resolution for a stale/onboarding device
-         without CAP_NET_RAW (deliberately withheld from it -- only
-         `phase3/arp-worker` holds that)? Two real options:
-         - **UDP-nudge** (controller stays unprivileged): open a UDP
-           socket and `sendto()` a closed port on the target IP. The
-           kernel attempts to resolve the IP at the routing layer as a
-           side effect, even though the "connection" itself fails
-           (ICMP port-unreachable) — no raw socket needed. Confirm this
-           genuinely nudges a `STALE`/absent neighbor entry toward
-           re-resolution on real Linux before committing to it (quick
-           to check directly on the smoke-test VM: delete/observe an
-           `ip neigh` entry, `sendto` a closed UDP port, check whether
-           the kernel re-resolves it).
-         - **Ask the worker to do it**: extend the IPC protocol with a
-           new op (e.g. `"probe"` — see `phase3/arp-worker/internal/ipc/protocol.go`
-           and `dispatch.go` for the existing message-type pattern) that
-           tells the worker to send a real ARP *request* (not just its
-           usual gratuitous *replies*) for a specific IP, since it
-           already holds `CAP_NET_RAW` and the raw socket. More
-           "correct" architecturally (matches "arp-worker owns all raw
-           packet I/O") but bigger — a new protocol message, a new Go
-           handler, a new Python IPC client method.
-         - Leaning UDP-nudge for a first cut: keeps the controller/
-           worker responsibility split unchanged, much smaller diff.
-           Worth 10 minutes of live confirmation on the VM before
-           committing, though, per this project's own "verify against
-           the real thing" discipline — don't assume the kernel
-           behavior, check it.
-      2. **Rate limiting**: the design doc's own phrase is "only when
-         stale or onboarding a new device" — needs a real definition of
-         "stale" (probably: an active `device_bindings` row whose
-         `last_seen_at` has exceeded some threshold, distinct from
-         `dashboard.py`'s own `HEALTH_STALE_AFTER_SECONDS` which is
-         about interception-runtime health, not device freshness) and
-         a genuine rate limit (a scan storm on a large household LAN is
-         a real, avoidable self-inflicted problem) — a `PeriodicTask`-
-         driven loop (matching `discovery.py`/`adguard_sync.py`'s own
-         shape) that scans at most N stale/pending devices per cycle is
-         probably right, not a scan-everything-every-cycle design.
-      3. **New module**: `controller/active_scan.py`, mirroring
-         `adguard_discovery.py`'s shape from tonight (a `scan_once()`
-         plus a `run_loop()`), wired into `controller/main.py` behind a
-         new optional CLI flag, matching the project's established
-         pattern (see `--adguard-discovery-interval`/
-         `--no-adguard-discovery` from tonight for the exact style to
-         copy).
-      4. **Tests**: unit tests for the rate-limiting/staleness-selection
-         logic (fully mockable, no real network needed) plus one live
-         VM confirmation that a real UDP-nudge (or worker-probe) against
-         a genuinely stale entry actually produces a fresh
-         `device_bindings` update end-to-end.
+      **Live end-to-end proof, using a genuinely separate network
+      namespace** (the veth harness below, built for this and reused
+      for the gateway-reboot test) rather than a self-owned IP: a
+      `device_bindings` row was seeded with `last_seen_at` an hour in
+      the past (source `rtnetlink`) for a real container on the far
+      side of a veth pair, with its host-side neighbor entry deleted
+      first for a clean baseline. Running the real `active_scan.scan_once()`
+      sent one real UDP datagram across the bridge; one second later
+      `ip neigh show` showed the container's real MAC in `REACHABLE`
+      state (a genuine ARP resolution, not a self-answered loopback).
+      Running the real `discovery.snapshot_once()` immediately after
+      picked that up and rewrote the binding: `last_seen_at` jumped from
+      the seeded hour-old value to "now," `source` became `snapshot` —
+      the full nudge-to-discovery pipeline closing end-to-end, for real,
+      exactly as designed.
+
+      Deployed live to the production controller the same session
+      (`docker compose up -d --force-recreate controller` after
+      rebuilding the image) — `interception_runtime` stayed `running`
+      through and past the first scan interval, no crash, no fail_open.
+      Two `device_bindings` rows that this session's own testing had
+      caused the *production* controller's live discovery/rtnetlink
+      loops to pick up (a real, useful reminder: `arp-worker`/
+      `controller` both run `network_mode: host`, so anything visible in
+      the host's own `ip neigh` table — including scratch veth-harness
+      traffic — is visible to production's discovery loops too) were
+      found and deactivated (`active = 0`, not hard-deleted) before
+      redeploying, rather than left to linger as bogus pending bindings.
 - [ ] **5. `nftables` integration** — dedicated table, named policy
       sets, atomic apply/rollback. **Scaffold written AND verified
       against real nftables 2026-08-29**, in `phase3/nftables-manager/`
@@ -1589,10 +1585,12 @@ fixes for each.
       evaluation order. `devices.quarantined_at` added (nullable,
       nothing sets it yet — no dashboard control exists to trigger
       quarantine; that's future, user-facing work, not built here).
-- [ ] **9. Fault campaign** — signals, OOM kill, NIC down/up, gateway
-      reboot, DB lock, malformed IPC, partial `nftables` failure.
-      **Partially done 2026-08-29 — the subset testable without real
-      network hardware or destructive host access**: malformed IPC
+- [x] **9. Fault campaign** — signals, OOM kill, NIC down/up, gateway
+      reboot, DB lock, malformed IPC, partial `nftables` failure. **All
+      sub-items done and verified live as of 2026-08-31** (gateway
+      reboot, the last one, closed the same day — see its own dated
+      entry below). Starting from 2026-08-29's subset testable without
+      real network hardware or destructive host access: malformed IPC
       (covered since Milestone 2/3's dispatch tests); DB lock (a
       transient SQLite lock from a concurrent writer just makes a
       health write wait out `busy_timeout`, doesn't crash — tested);
@@ -1659,22 +1657,59 @@ fixes for each.
       anywhere in health reporting) with a purpose-built test rather
       than an improvised one.
 
-      **Still not attempted**: gateway reboot. No longer blocked on real
-      hardware, though — the veth harness built immediately below gives
-      this a genuine, independently-listening "real gateway" stand-in
-      container for the first time; a reboot test is just stopping and
-      restarting that container while poisoning is live and confirming
-      nothing in the worker/controller misbehaves while it's briefly
-      gone (poisoning itself doesn't depend on the real gateway being
-      reachable at all, which is most of the reason a fault here seems
-      unlikely — but that's still an assumption, not yet a result).
-      Cheap to run whenever it's next worth doing, using the same
-      throwaway setup.
+      **Gateway reboot: done and verified live 2026-08-31** — see the
+      dedicated writeup immediately below (including a real correction
+      to the naive "just `docker stop`/`docker start` the stand-in"
+      plan this paragraph originally proposed).
 
-      **TODO, next session — exact reusable runbook** (condensed from
-      the two builds done tonight, so this doesn't need re-deriving;
-      all resources are throwaway and get deleted after, nothing here
-      touches the production `ppfaulttest`-based stack):
+      **Gateway reboot: done and verified live 2026-08-31.** Rebuilt the
+      veth harness (below) and ran a real device/binding-backed
+      poisoning target against it. **Real, useful finding along the
+      way, discovered before the reboot test itself could even run**: a
+      plain `docker stop`/`docker start` of a `--network none` container
+      does NOT behave like a real gateway reboot — Docker tears down and
+      recreates that container's entire network namespace on stop/start,
+      silently destroying every manually-injected veth/IP this harness
+      relies on (confirmed directly: `ip addr show` inside the
+      "restarted" gateway stand-in came back with only loopback, and its
+      bridge-side veth peer had vanished too). A real gateway reboot
+      keeps its interface/MAC identity the whole time; `docker stop`/
+      `start` does not, so it's the wrong tool for this test. Switched
+      to bringing the gateway stand-in's own veth link down, waiting,
+      then back up (`ip link set veth-g down` / `up` from a privileged
+      helper joined to its netns) — same real "device goes silent, comes
+      back with the same identity" fault shape, without Docker's
+      namespace-recreation confound.
+
+      With that corrected technique: poisoning was confirmed live
+      first (victim resolved the worker's own MAC), then the gateway
+      stand-in's link was brought down for 3s and back up. Result: zero
+      worker crashes, zero controller reconnects/fail_opens, poisoning
+      completely unaffected throughout and after — confirming the
+      milestone's own long-standing expectation ("poisoning doesn't
+      depend on the real gateway being reachable at all") for the first
+      time with a real result rather than an assumption. A final forced
+      fresh-resolution check afterward showed the same
+      always-real-reply-wins-a-race / periodic-reannouncement-wins-
+      afterward pattern as every other test this project has run against
+      this harness.
+
+      **One more real, unplanned finding from this same session**:
+      because `arp-worker`/`controller` both run `network_mode: host`,
+      the production controller's own live discovery/rtnetlink loops
+      were watching the SAME host `ip neigh` table this throwaway veth
+      harness (and an earlier ad-hoc UDP-nudge check) used, and picked
+      up two bogus `device_bindings` rows from the test traffic as a
+      real side effect. Found and deactivated (`active = 0`) before
+      moving on -- worth remembering for any future host-netns test
+      harness on this VM: it is not actually isolated from production's
+      own passive discovery, even though it never touches the
+      production DB or containers directly.
+
+      **Exact reusable runbook** (condensed from the two builds this
+      project has now done against this technique; all resources are
+      throwaway and get deleted after, nothing here touches the
+      production `ppfaulttest`-based stack):
       1. Bridge with **no IP conflicting with the gateway IP** (the
          bridge needs SOME IP for `mdlayher/arp`'s client to bind, but
          it must be disjoint from whatever IP the gateway stand-in
@@ -1702,19 +1737,24 @@ fixes for each.
          `identity.record_binding(conn, mac, ip, source='snapshot')`
          (see this session's own DB-insert snippets) so it becomes a
          real poisoning target.
-      7. **For the gateway-reboot test specifically**: once poisoning
-         is confirmed live (victim resolves the worker's MAC), run
-         `docker stop pp-<gateway-role>` then `docker start pp-<gateway-role>`
-         a few seconds later. Watch `docker logs pp-test-worker`/
+      7. **For the gateway-reboot test specifically**: once poisoning is
+         confirmed live (victim resolves the worker's MAC), do **NOT**
+         use `docker stop`/`docker start` on the gateway stand-in — see
+         this section's own finding above for why that destroys its
+         network namespace instead of simulating a reboot. Use
+         `docker run --rm --network container:pp-<gateway-role>
+         --cap-add=NET_ADMIN alpine:3.20 sh -c 'apk add --no-cache
+         iproute2; ip link set veth-<X> down'`, wait a few seconds, then
+         the same with `up`. Watch `docker logs pp-test-worker`/
          `pp-test-controller` throughout for anything unexpected
-         (crashes, IPC faults) — the expectation, not yet a confirmed
-         result, is "nothing happens" since poisoning doesn't depend on
-         the real gateway being reachable at all. Also confirm the
-         victim's own resolution behavior stays sane once the gateway
-         stand-in returns (a forced fresh resolution, same technique as
-         the NIC-down investigation, should show the real restored MAC
-         then get re-poisoned within one interval, same as every other
-         result tonight).
+         (crashes, IPC faults) — confirmed result (2026-08-31): nothing
+         happens, poisoning is completely unaffected, since it doesn't
+         depend on the real gateway being reachable at all. Also confirm
+         the victim's own resolution behavior stays sane once the
+         gateway stand-in returns (a forced fresh resolution, same
+         technique as the NIC-down investigation, shows the real
+         restored MAC then gets re-poisoned within one interval, same as
+         every other result this harness has produced).
       8. Use `nicolaka/netshoot` + `nsenter -t <PID> -n ip neigh ...`
          for any real inspection/manipulation of a container's ARP
          table from outside it — Alpine's own `iproute2` package is
