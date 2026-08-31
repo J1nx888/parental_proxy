@@ -50,6 +50,7 @@ _common_dir = Path(__file__).resolve().parent.parent / "common"
 if _common_dir.is_dir():
     sys.path.insert(0, str(_common_dir))
 
+import active_scan
 import adguard_discovery
 import adguard_sync
 import discovery
@@ -112,6 +113,9 @@ def run(
     block_page_ip: str | None = None,
     worker_ready_timeout: float = 30.0,
     adguard_ready_timeout: float = 30.0,
+    active_scan_interval: float | None = None,
+    active_scan_stale_after: float = 300.0,
+    active_scan_limit: int = 5,
 ) -> None:
     """The main control loop. Runs until SIGTERM/SIGINT.
 
@@ -164,6 +168,23 @@ def run(
     Independent of adguard_interval -- one pushes hard-deny rules TO
     AdGuard, the other only reads FROM it -- both require adguard_url/
     adguard_username/adguard_password when set.
+
+    active_scan_interval, if given (not None), starts
+    controller/active_scan.py's periodic rate-limited ARP-nudge loop on
+    its own background thread and its own DB connection (same reasoning
+    as discovery_interval above) -- Milestone 4's final discovery
+    source, "active, rate-limited ARP scanning (only when stale or
+    onboarding a new device)." Requires no adguard_url/credentials
+    (unlike adguard_interval/adguard_discovery_interval above) since it
+    never touches AdGuard at all -- it only nudges the kernel's own
+    neighbor-resolution state for stale device_bindings rows;
+    controller/discovery.py's own already-running snapshot loop is what
+    actually observes and records any resulting resolution (see
+    active_scan.py's module docstring). active_scan_stale_after/
+    active_scan_limit control, respectively, how old last_seen_at must
+    be before a binding is nudged and how many bindings get nudged per
+    cycle -- the rate limit that keeps this from becoming a scan storm
+    on a large household LAN.
     block_page_ip, if given, is threaded through to
     adguard_sync.build_rules() so hard-deny rules also carry a
     $dnsrewrite pointing at that IP's port 80 (see
@@ -326,6 +347,15 @@ def run(
             on_error=lambda exc: log.warning("adguard discovery correlation failed: %s", exc),
         )
 
+    active_scan_task = None
+    if active_scan_interval is not None:
+        active_scan_task = active_scan.run_loop(
+            active_scan_interval,
+            active_scan_stale_after,
+            active_scan_limit,
+            on_error=lambda exc: log.warning("active ARP scan failed: %s", exc),
+        )
+
     sdnotify.ready()
 
     def _reconnect(reason: str) -> None:
@@ -365,6 +395,8 @@ def run(
             adguard_task.stop()
         if adguard_discovery_task is not None:
             adguard_discovery_task.stop()
+        if active_scan_task is not None:
+            active_scan_task.stop()
         try:
             client.shutdown("controller_requested")
         except WorkerConnectionError:
@@ -572,6 +604,31 @@ def main(argv: list[str] | None = None) -> int:
         "useful in a given deployment.",
     )
     parser.add_argument(
+        "--active-scan-interval", type=float, default=60.0,
+        help="Seconds between controller/active_scan.py rate-limited ARP-nudge "
+        "cycles -- Milestone 4's 'active, rate-limited ARP scanning (only when "
+        "stale or onboarding a new device)' source (only runs at all if "
+        "--db-path is set). Requires no AdGuard config -- see --no-active-scan "
+        "to disable it independently.",
+    )
+    parser.add_argument(
+        "--active-scan-stale-after", type=float, default=300.0,
+        help="Seconds a device_bindings row's last_seen_at must be older than "
+        "before controller/active_scan.py nudges it -- distinct from "
+        "dashboard.py's own HEALTH_STALE_AFTER_SECONDS (that's about "
+        "interception-runtime health, this is about device freshness).",
+    )
+    parser.add_argument(
+        "--active-scan-limit", type=int, default=5,
+        help="Maximum number of stale bindings controller/active_scan.py nudges "
+        "per cycle -- the rate limit that keeps this from becoming a scan storm "
+        "on a large household LAN.",
+    )
+    parser.add_argument(
+        "--no-active-scan", action="store_true",
+        help="Disable the active ARP-nudge loop even when --db-path is set.",
+    )
+    parser.add_argument(
         "--dashboard-url",
         help="Same value as the dashboard's own DASHBOARD_URL env var, e.g. "
         "http://192.168.1.50:8787 -- if set (and its host is a plain IPv4 "
@@ -595,6 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     enable_rtnetlink = False
     adguard_interval: float | None = None
     adguard_discovery_interval: float | None = None
+    active_scan_interval: float | None = None
     if args.db_path:
         if not args.gateway_ip or not args.gateway_mac:
             parser.error("--db-path requires --gateway-ip and --gateway-mac")
@@ -624,6 +682,12 @@ def main(argv: list[str] | None = None) -> int:
                 # above -- only meaningful alongside adguard_interval
                 # since both require the same adguard_url/credentials.
                 adguard_discovery_interval = args.adguard_discovery_interval
+        if not args.no_active_scan:
+            # active_scan.run_loop() opens its own connection internally
+            # too, same reasoning as discovery_interval above -- unlike
+            # adguard_discovery above, this needs no adguard_url/
+            # credentials gate since it never touches AdGuard at all.
+            active_scan_interval = args.active_scan_interval
     else:
         provider = placeholder_desired_state
 
@@ -644,6 +708,9 @@ def main(argv: list[str] | None = None) -> int:
         block_page_ip=_parse_block_page_ip(args.dashboard_url),
         worker_ready_timeout=args.worker_ready_timeout,
         adguard_ready_timeout=args.adguard_ready_timeout,
+        active_scan_interval=active_scan_interval,
+        active_scan_stale_after=args.active_scan_stale_after,
+        active_scan_limit=args.active_scan_limit,
     )
     return 0
 
