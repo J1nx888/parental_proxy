@@ -1239,10 +1239,14 @@ fixes for each.
       of that table since Milestone 4 added it. A failed reconcile
       cycle is now logged and reported as `fail_open` rather than
       crashing the process. Squid/AdGuard readiness *gates* specifically
-      (blocking startup until those services answer) aren't built —
-      AdGuard Home itself isn't integrated into this repo yet — but the
-      health-reporting mechanism those gates would feed into now exists
-      and is tested.
+      (blocking startup until those services answer) still aren't
+      built, but AdGuard Home itself IS now integrated into this repo
+      (`adguard/`, done 2026-08-30 — this line was stale, written before
+      that work), and the health-reporting mechanism those gates would
+      feed into is not only built and tested but now has a dashboard
+      view reading it (`/health`, see the "Dashboard 'interception
+      health' view" section above) -- readiness gates remain the one
+      real gap here, not the underlying plumbing.
 - [ ] **7. Authentication workflow** — toggling
       `devices.is_authenticated` updates policy without restarting
       spoofing. **Done and verified live end-to-end 2026-08-29** — see
