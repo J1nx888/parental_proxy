@@ -1322,10 +1322,13 @@ fixes for each.
       a genuine L2 segment. Confirmed live: the controller computed
       desired state from the DB and told the worker to apply it; the
       worker actually poisoned a real container's ARP cache (verified
-      against its real, independently-confirmed MAC — **but see the
-      2026-08-31 correction under Milestone 9 below: a more rigorous
-      same-VM test found real cause for doubt in this specific
-      claim**); the worker's own
+      against its real, independently-confirmed MAC — **2026-08-31
+      update: a same-night re-test under Milestone 9 below initially
+      cast real doubt on this claim, given a Docker-bridge-specific
+      confound, then resolved that doubt in this claim's favor with a
+      properly-isolated harness — read both dated notes there for the
+      full trail, but the short version is this claim holds up**); the
+      worker's own
       lease monitor detected the controller's death on its own and
       entered repair-only mode without being told to; a SIGTERM to the
       controller correctly propagated a real "shutdown" IPC message
@@ -1591,11 +1594,17 @@ fixes for each.
       anywhere in health reporting) with a purpose-built test rather
       than an improvised one.
 
-      **Still not attempted, genuinely needs real hardware**: gateway
-      reboot (the sandbox's `GATEWAY_IP`/`GATEWAY_MAC` are purely
-      synthetic — no real device answers ARP for it at all today, so
-      there is nothing to "reboot" without first building out a real
-      stand-in gateway container, not done this pass).
+      **Still not attempted**: gateway reboot. No longer blocked on real
+      hardware, though — the veth harness built immediately below gives
+      this a genuine, independently-listening "real gateway" stand-in
+      container for the first time; a reboot test is just stopping and
+      restarting that container while poisoning is live and confirming
+      nothing in the worker/controller misbehaves while it's briefly
+      gone (poisoning itself doesn't depend on the real gateway being
+      reachable at all, which is most of the reason a fault here seems
+      unlikely — but that's still an assumption, not yet a result).
+      Cheap to run whenever it's next worth doing, using the same
+      throwaway setup.
 
       **Follow-up the same night: isolated the NIC-down/up question from
       a deeper, more consequential one, and found real cause for doubt
@@ -1650,6 +1659,88 @@ fixes for each.
       design decision (namespace/veth topology, how `arp-worker`'s
       `ARP_WORKER_IFACE`/`GATEWAY_IP`/`GATEWAY_MAC` map onto it) —
       flagged to the user rather than started autonomously.
+
+      **Same night, immediately after: built that exact harness, and
+      the news is good — the poisoning mechanism genuinely works,
+      including recovering from a NIC flap.** Two throwaway containers
+      (`--network none`) joined by two veth pairs plugged into a plain
+      Linux bridge with **no IP address of its own** (`ip link add
+      br-arptest type bridge` — deliberately never `ip addr add` on the
+      bridge device itself, the one thing the earlier confound
+      required), one side holding the "victim" role, the other a
+      genuine, independently-listening "real gateway" stand-in — plus
+      a throwaway `arp-worker`+`controller` pair (fresh socket path,
+      fresh SQLite DB, same production images, one real device/binding
+      row for the victim) pointed at this topology instead of the
+      shared `ppfaulttest` sandbox. Building it required nothing beyond
+      what the earlier feasibility check already proved (creating a
+      veth pair and moving ends into container namespaces by PID, all
+      via `docker run --network host --pid=host --cap-add=NET_ADMIN`,
+      no host root) plus one more small technique:
+      `nicolaka/netshoot` + `nsenter -t <pid> -n` to run genuine,
+      full-featured `ip neigh` commands inside a container's namespace
+      from outside it (Alpine's own `iproute2` package turned out to
+      still just be a busybox-applet shim with no real `neigh del`
+      support — worth remembering for next time).
+
+      **Results, each repeated and consistent:**
+      - Steady-state poisoning: the victim's ARP entry for the gateway
+        correctly and stably showed the worker's own MAC, not the real
+        gateway's.
+      - **The actual mechanism, traced precisely**: a genuinely fresh
+        resolution (explicit `ip neigh del` + a real ping) is won by
+        the real gateway stand-in every time — a live, listening peer
+        replies to a real ARP request just as fast as anything else on
+        a virtualized segment, so the worker was never going to win
+        that specific race. What actually works is the OTHER half of
+        the design: the worker's own periodic (`Interval: 2s`)
+        gratuitous, unsolicited ARP re-announcement, which the kernel
+        accepts as an update to an already-resolved entry — re-poisoning
+        it back to the worker's MAC within about one interval, every
+        time, holding indefinitely until the next genuine re-resolution
+        forces a brief, expected flicker back to the truth. This is
+        exactly the mechanism the design was always supposed to rely
+        on (RoadMap.md's own Phase 3 design section on continuous
+        re-poisoning, not a one-shot poison) — now actually proven, not
+        assumed.
+      - Graceful shutdown: `docker stop` (SIGTERM) → the worker's own
+        logged "shutting down: sending corrective ARPs before exit" →
+        the victim's entry was restored to the REAL gateway's MAC
+        **immediately**, with no fresh-resolution trigger needed.
+      - **NIC down/up, now properly answered**: brought `br-arptest`
+        down while poisoning was live — the worker correctly kept
+        trying every cycle and logged a real, distinct `OnSendError`
+        each time (`sendto: network is down`), never crashing. Brought
+        it back up — no further failures logged (this project's
+        established "silent on success" pattern), and a forced fresh
+        resolution afterward confirmed the worker correctly re-poisoned
+        the entry again within one interval, with **no process restart
+        needed**. Both halves of what was an open question are now
+        closed with real evidence, not assumption.
+      - **The one genuinely confirmed gap, now proven rather than
+        speculated**: `interception_runtime` in the throwaway DB read
+        `mode: 'running'`, `fail_open_reason: None` throughout the
+        entire NIC-down window — health reporting is blind to this
+        failure mode, because it only tracks the controller↔worker
+        Unix-socket heartbeat, which the LAN-facing interface going
+        down has no effect on whatsoever. `/health` would show fully
+        green while the actual interception mechanism is completely
+        failing. This is real and worth fixing eventually (e.g. wiring
+        `OnSendError` into health reporting somehow) but is a distinct,
+        smaller gap than the mechanism-doesn't-work doubt this
+        investigation started with — that doubt is now resolved, and
+        resolved in the mechanism's favor.
+
+      **This also substantially restores confidence in the original
+      2026-08-30 Milestone 3 claim** this section corrected earlier
+      tonight: it was likely a real observation after all, just an
+      unrigorous one (no forced fresh-resolution check) that happened
+      not to get unlucky. Tonight's harness is the rigorous version of
+      that same claim, and it holds up. All disposable resources
+      (containers, the bridge, both Docker volumes) removed after;
+      the production `ppfaulttest`-based stack was never touched and
+      stayed healthy throughout (`/health` green on both cards the
+      whole time, confirmed before and after).
 - [ ] **10. Soak test** — 7–14 days of mixed real household load,
       roaming, sleep/wake, with memory/FD/CPU trend monitoring. **Not
       startable autonomously** — needs the real household network
