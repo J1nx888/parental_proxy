@@ -383,11 +383,29 @@ in real credentials, selected a real group from the live dropdown, and
 confirmed the device's `group_id`/`is_authenticated` actually changed
 in the dev DB afterward.
 
+**Same night, eighth follow-up**: auditing every other `bump_enabled`/
+`is_authenticated`/`bypass_login` check in the codebase (user request,
+prompted by the `classify_device()` bug) found a second real gap of the
+exact same kind -- `controller/adguard_sync.py`'s `build_rules()`
+selected on the raw `bump_enabled` column instead of the derived
+`bump_eligible()` state, letting a `bump_enabled=1`-but-not-yet-
+authenticated device bypass both AdGuard's hard-deny AND nftables'
+`bump_v4` redirect at once (see docs/security/overview.md's dated
+entry for the full trace). One new regression test in
+`tests/test_controller_adguard_sync.py` proves such a device is now
+correctly included in the hard-deny list. The rest of the audit (Squid
+helpers, `common/matching.py`, the Go side, every `INSERT INTO devices`
+site) found the existing code already correct -- see RoadMap.md's own
+dated audit entry for the full site-by-site trace, including one
+currently-unreachable cosmetic inaccuracy noted but left alone
+(dashboard.py's "awaiting login" display doesn't check
+`quarantined_at`, but nothing can set that column yet).
+
 Run `pytest --collect-only -q` against `tests/` for a live,
-authoritative total (551 as of 2026-08-31 -- `AF_UNIX`-only files still
+authoritative total (552 as of 2026-08-31 -- `AF_UNIX`-only files still
 skip on Windows, where `socket.AF_UNIX` doesn't exist, so a Windows run
-of the same suite at this commit collects 521 passed, 30 skipped, while
-Linux collects all 551) rather than trusting the sum of this table.
+of the same suite at this commit collects 522 passed, 30 skipped, while
+Linux collects all 552) rather than trusting the sum of this table.
 
 ### Representative pattern: `tests/test_logging_dedupe.py`
 

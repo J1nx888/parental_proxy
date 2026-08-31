@@ -308,13 +308,15 @@ docstring.
 
 Squid's own identity resolution above only ever runs for traffic that
 already reached Squid's intercept ports — which nftables only routes
-there for a `bump_enabled = 1` device (`bump_v4` set membership) in the
-first place. For every OTHER device, the actual enforcement point is
-one layer earlier, at DNS: **`controller/adguard_sync.py`** (added
-2026-08-30, closing the last gap this section used to flag) computes,
-for every `domains.mode = 'bump'` row, a per-client AdGuard Home
-filtering rule (`$client=ip1,ip2,...`) scoped to exactly the devices
-that are currently NOT `bump_enabled`, and pushes the full set as a
+there for a device `common/policy_class.py`'s `bump_eligible()` returns
+True for (`bump_v4` set membership: `bump_enabled = 1` AND currently
+`AUTHENTICATED`, not `bump_enabled` alone) in the first place. For every
+OTHER device, the actual enforcement point is one layer earlier, at
+DNS: **`controller/adguard_sync.py`** (added 2026-08-30, closing the
+last gap this section used to flag) computes, for every
+`domains.mode = 'bump'` row, a per-client AdGuard Home filtering rule
+(`$client=ip1,ip2,...`) scoped to exactly the devices that are
+currently NOT `bump_eligible()`, and pushes the full set as a
 `/control/filtering/set_rules` replace every sync cycle. A non-bump
 device's DNS query for a bump-mode domain (Crunchyroll, or any other
 domain an admin sets to `bump`) never even resolves — confirmed live
@@ -325,6 +327,23 @@ that's authenticated but not bump-enabled gets normal DNS-tier
 protection for everything else, but is structurally incapable of
 resolving a domain the household has marked as needing Squid's
 refinement, regardless of what app or client makes the request.
+
+**Real bug found and fixed 2026-08-31, while auditing this exact
+invariant for a second time** (prompted by the `classify_device()`/
+`bypass_login` fix found the same day): `build_rules()` used to select
+on the raw `bump_enabled` column rather than the actual derived
+`bump_eligible()` state above. A device with `bump_enabled = 1` set but
+not yet `AUTHENTICATED` (a genuinely new PREAUTH device, or one
+pre-configured for bump ahead of its first login) was excluded from
+this hard-deny list — while simultaneously NOT being a member of
+nftables' `bump_v4` set either, since `bump_eligible()` requires
+`AUTHENTICATED` too. The result was a full, silent bypass: AdGuard
+resolved the real IP for the `mode='bump'` domain, and nftables never
+redirected the resulting HTTPS connection to Squid — worse than either
+a hard deny or Squid's own refinement, a completely unfiltered
+connection to exactly the domain this whole mechanism exists to
+control. Now fixed to select the same way `controller/policy_state.py`
+already does.
 
 Same freshness caveat as the DHCP note above applies here too — a
 device's current IP has to already be in `device_bindings` (via the

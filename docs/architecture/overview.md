@@ -122,9 +122,15 @@ take effect everywhere.
   handling (pure Python itself, no C extension).
 - **AdGuard Home** (`adguard/adguardhome:v0.107.79`, pinned rather than
   `latest`) -- the DNS tier's filtering engine, and (since 2026-08-30) what
-  enforces the hard-deny invariant for `mode='bump'` domains on non-
-  `bump_enabled` devices via its `$client=`-scoped custom filtering rules
-  (see `controller/adguard_sync.py`). Also provides network-wide ad/
+  enforces the hard-deny invariant for `mode='bump'` domains on every
+  device that isn't currently `bump_eligible()` via its `$client=`-scoped
+  custom filtering rules (see `controller/adguard_sync.py`'s `build_rules()`
+  -- **fixed 2026-08-31**: this used to select on the raw `bump_enabled`
+  column, which let a `bump_enabled=1`-but-not-yet-`AUTHENTICATED` device
+  bypass both this hard-deny AND nftables' `bump_v4` redirect at once, a
+  genuine unfiltered gap, same class of bug as `classify_device()`'s own
+  `bypass_login` fix the same day -- see RoadMap.md's dated audit entry).
+  Also provides network-wide ad/
   tracker blocking for every device: its own default filter is enabled
   automatically on first configure, plus (2026-08-30) a curated set of
   uBlockOrigin/uAssets domain-blocking lists added by

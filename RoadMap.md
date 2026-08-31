@@ -2231,6 +2231,73 @@ group from the live dropdown (populated from a real DB read, not a
 static list), submitted, and confirmed the device's `group_id`/
 `is_authenticated` actually changed in the dev DB afterward.
 
+**Full audit of every other `bump_enabled`/`is_authenticated`/
+`bypass_login` check in the codebase, 2026-08-31** (user: "audit the
+other bump_enabled and isA_uahtneitcated checks for similar gaps"),
+prompted directly by the `classify_device()` bug just found. Traced
+every read site (not just the writes) across Python and Go:
+
+- **`controller/adguard_sync.py`'s `build_rules()` -- a second real
+  bug, same class exactly, found and fixed the same session.** It
+  selected devices to hard-deny using the raw `d.bump_enabled = 0`
+  column instead of the actual derived `bump_eligible()` state (which
+  also requires `AUTHENTICATED`). A device with `bump_enabled = 1` but
+  not yet authenticated -- a genuinely new PREAUTH device Phase 4
+  auto-creates, or one an admin pre-configured for bump ahead of its
+  first login -- was excluded from AdGuard's hard-deny list (since
+  `bump_enabled = 1`) while ALSO not a member of nftables' `bump_v4`
+  set (not `AUTHENTICATED` yet) -- meaning its HTTPS connections to
+  `mode='bump'` domains went straight to the real internet completely
+  unfiltered. Worse than either a hard deny or Squid refinement: a full,
+  silent bypass of the exact invariant this module exists to enforce.
+  Fixed to select the same way `policy_state.py` already does (fetch
+  the columns `bump_eligible()` needs, exclude only what it actually
+  returns True for). 1 new regression test
+  (`tests/test_controller_adguard_sync.py`).
+- `controller/desired_state.py` -- checked, correct by design and
+  already documented as such: interception scope (who gets ARP-spoofed
+  at all) is deliberately independent of policy scope (`is_authenticated`
+  plays no part), per `docs/design/phase3-technical-design.md` section 5.
+- `proxy/authz_helper.py`/`sni_helper.py`/`common/squid_helper.py` --
+  checked, correctly touch NONE of these columns at all. By the time a
+  connection reaches Squid's intercept ports, nftables has already
+  guaranteed `bump_eligible()` was true (that's the only way traffic
+  gets redirected there) -- Squid re-deriving or re-checking the same
+  state would be duplicated logic with its own chance to drift, not
+  extra safety.
+- `common/matching.py` -- checked, doesn't touch these columns at all
+  (a different concern: per-user/group/device domain access lists).
+- `phase3/nftables-manager`'s Go side (`dbsource`, `policy` packages) --
+  checked, only ever reads the Python-precomputed `desired_policy_json`
+  blob; no independent/duplicated derivation of these flags exists on
+  that side to drift from the Python one.
+- `dashboard/dashboard.py`'s own `pending`/Status-column display logic
+  (Milestone 2) -- checked; cosmetic-only (decides what badge to show,
+  never enforcement), and correctly excludes `bypass_login`/`ignored`
+  devices from "awaiting login" post-fix. One real but currently
+  unreachable inaccuracy noted, not fixed: it doesn't check
+  `quarantined_at`, so a hypothetically quarantined-and-unauthenticated
+  device would display as "awaiting login" even though `QUARANTINE`
+  actually takes precedence and such a device's packets are dropped
+  outright (never even reaching the portal) -- left alone since nothing
+  in the dashboard can set `quarantined_at` yet (Milestone 8's own
+  documented gap), so this can't currently occur.
+- Every `INSERT INTO devices` site (exactly two: `dashboard.py`'s
+  `add_device()` and `identity.py`'s `_create_pending_device()`) --
+  checked, both set exactly the flag combination their own already-
+  audited docstrings claim (schema defaults for an admin-created
+  device; explicit `is_authenticated = 0` for an auto-discovered one).
+
+No further gaps found. 552 tests total (522 passed/30 skipped on
+Windows) after this pass. **VM redeploy note**: the smoke-test VM's
+4pm-Eastern auto-shutdown hit mid-redeploy of this fix -- `git pull`,
+image rebuild, and `docker compose up -d --force-recreate controller`
+all completed and the container reported "Started" before the SSH
+connection was cut, so the fix is very likely live, but the final
+health/log confirmation this project's own discipline calls for was
+not obtained. Confirm `/health` and re-check controller logs next time
+the VM is up before treating this as fully verified live.
+
 ## Original design sketch (2026-08-30, not started at the time)
 
 Force all internet through the system regardless of per-device
