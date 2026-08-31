@@ -1,24 +1,24 @@
 {
   "version": 1,
-  "last_run": "2026-08-31T20:15:00Z",
+  "last_run": "2026-08-31T23:45:00Z",
   "sections": {
     "architecture": {
       "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "adguard/", "defaults/", "dashboard/", "controller/", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile"],
-      "fingerprint": "0dd53eb3f498441fc0cd54975c0d7608f094146380210def4b69e10ddc5716a5",
+      "fingerprint": "c447de07caba4b21a4afb7ac382076ad8723e57487cdc2c30fa448f6fa22639c",
       "doc_path": "docs/architecture/overview.md",
-      "last_updated": "2026-08-31T20:15:00Z"
+      "last_updated": "2026-08-31T23:45:00Z"
     },
     "dashboard": {
       "source_paths": ["dashboard/", "common/db.py", "common/matching.py"],
-      "fingerprint": "5fcde30862a058d2e0c3adb30d2823347507b902005dc38282e9d1aff2245ff0",
+      "fingerprint": "e24308d103500f30a3b7aaca60b42510656ac0aaf0b521c70afdcd1f533613d7",
       "doc_path": "docs/dashboard/routes.md",
-      "last_updated": "2026-08-31T19:30:00Z"
+      "last_updated": "2026-08-31T23:45:00Z"
     },
     "database": {
       "source_paths": ["common/db.py", "defaults/seed_defaults.py"],
-      "fingerprint": "a3a54fee71214a3c6509aa11eb3c4cb84a87ef28d7b268b02e81d931f9591fed",
+      "fingerprint": "4d6aa8321f087a7b78f6f292cd011760303cda1a988945eaca395ddc902b2353",
       "doc_path": "docs/database/schema.md",
-      "last_updated": "2026-08-30T00:00:00Z"
+      "last_updated": "2026-08-31T23:00:00Z"
     },
     "deployment": {
       "source_paths": ["docker-compose.yml", "proxy/Dockerfile", "adguard/Dockerfile", "adguard/entrypoint.sh", "dashboard/Dockerfile", "controller/Dockerfile", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile", "proxy/entrypoint.sh", "setup.sh", ".env.example", ".github/workflows/tests.yml", "README.md"],
@@ -28,15 +28,15 @@
     },
     "security": {
       "source_paths": ["common/auth.py", "proxy/authz_helper.py", "proxy/sni_helper.py", "common/squid_helper.py", "proxy/entrypoint.sh", "proxy/squid.conf.template", "dashboard/dashboard.py", "dashboard/block_page_server.py", "dashboard/captive_portal_server.py", "common/device_identity.py", "common/adguard_client.py", "controller/adguard_sync.py", "controller/main.py", "adguard/entrypoint.sh"],
-      "fingerprint": "657a392d503fe148f634c959a97bc642f049cce69023b87f684e0a5bf1f945a3",
+      "fingerprint": "fc8ca8c0667f1e807c3981fe96dcdcaecb2c5271aa2277534d38c82e2100ccc0",
       "doc_path": "docs/security/overview.md",
-      "last_updated": "2026-08-31T20:15:00Z"
+      "last_updated": "2026-08-31T23:45:00Z"
     },
     "testing": {
       "source_paths": ["tests/", "pytest.ini", "requirements-dev.txt", ".github/workflows/tests.yml"],
-      "fingerprint": "0422dec2bf36a530c21989144e336269ea1afd69c2a1b3ddbb87cc2912bae1db",
+      "fingerprint": "255fe4f7ce715fb3c3c017cf462e9fb7786c14775f85881d1cfe2e9ee39bfc56",
       "doc_path": "docs/testing/overview.md",
-      "last_updated": "2026-08-31T20:15:00Z"
+      "last_updated": "2026-08-31T23:45:00Z"
     }
   }
 }

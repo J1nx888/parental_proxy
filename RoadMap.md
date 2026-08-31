@@ -39,8 +39,9 @@ Pi-hole setup:
 | — | Filter/picker UI scaling (GH #8) | ✅ Done |
 | 3 | Network-level interception (the actual Bark Home replacement mechanism) | 🔶 Milestones 1–9 have real, tested (several functionally verified live) work; not yet deployed anywhere real — see the Milestones list below |
 | 4 | Captive-portal forced enrollment | ⬜ Design sketch only, not started |
-| 5 | YouTube channel/creator-level filtering | ⬜ Assessed, not started |
-| 6 | Admin control surface: responsive/PWA, eventual remote access | ⬜ Not started |
+| 5 | Admin dashboard: responsive layout, installable PWA, control surface | 🔶 Begun — mobile/tablet audit done, one bug fixed |
+| 6 | YouTube channel/creator-level filtering | ⬜ Assessed, not started |
+| 7 | Remote Access Hardening: TLS, VPN, session/auth model for off-LAN access | ⬜ Not started |
 
 ---
 
@@ -2298,6 +2299,157 @@ health/log confirmation this project's own discipline calls for was
 not obtained. Confirm `/health` and re-check controller logs next time
 the VM is up before treating this as fully verified live.
 
+**2026-08-31, same day: "tighter Squid/AdGuard integration" request
+surfaced a THIRD real bug, bigger than the two above, plus closed a
+genuine feature gap ([GH #9](https://github.com/J1nx888/parental_proxy/issues/9)).**
+User was poking at the Report page with seeded dev data and noticed two
+things: no way to filter by device/group, and AdGuard traffic never
+showed up at all. Investigating turned up a live bug on Squid itself,
+not just an AdGuard gap:
+
+- **The bug**: `common/device_identity.py`'s `resolve_user()` INNER
+  JOINed straight from `device_bindings` to `users` through
+  `devices.user_id` -- a device assigned to a GROUP (not a person)
+  resolved to no identity at all, and both `proxy/authz_helper.py`
+  (bump-tier) and `proxy/sni_helper.py` (splice-tier) denied it
+  everything before ever reaching a domain check. Even a user-resolved
+  device could never benefit from a `group_domains`/`device_domains`
+  grant -- `common/matching.py`'s `group_has_domain()`/
+  `device_has_domain()` existed but were never called by any
+  enforcement path at all (their own docstrings admitted it). **Net
+  effect: a domain assigned to a group or directly to a device did
+  nothing on Squid, live, in production-ready code, until this fix.**
+- **The gap**: `controller/adguard_sync.py` enforced exactly one thing
+  -- hard-deny `bump`-mode domains for non-bump-eligible devices. It
+  never touched `splice`-mode domains (what most devices actually use)
+  at all, so the entire user/group/device/everyone content allowlist
+  built on the Domains page was completely unenforced at the DNS tier.
+- **The other logging gap**: `access_log` had no `device_id` column,
+  and `dashboard/block_page_server.py` (AdGuard's kid-facing block
+  page) wrote nothing to the DB at all, not even for the block itself.
+
+**Fix, in four stages, one shared resolver instead of two duplicated
+ones** (design planned via a written implementation plan, reviewed and
+approved before any code changed, per the user's explicit "scope a
+plan first" direction):
+
+1. `common/matching.py` gained `device_domain_reason(conn, device,
+   domain)` -- the single authorization check (is_global -> user ->
+   group -> device) now used everywhere. `common/device_identity.py`'s
+   `resolve_user()` was replaced with `resolve_user_for_device()` +
+   `log_identity_fields()`, so "no user" and "no identity at all" can
+   never be conflated again. Both proxy helpers rewritten to resolve
+   the DEVICE first (`resolve_device()`, already existed) rather than
+   jumping straight to a user. New reason `show_requires_user` for a
+   crunchyroll-kind domain authorized via group/device but with no
+   resolvable user (user_shows has no group/device equivalent).
+2. `access_log.device_id` added (the established `_migrate()`
+   ALTER-TABLE-if-missing pattern). `logging_util.log_access()` gained
+   an optional `device_id` param (not part of the dedupe key).
+   `block_page_server.py` now writes a real row per hit, wrapped in a
+   try/except so a DB hiccup can never break the actual page a kid is
+   looking at.
+3. `controller/adguard_sync.py` gained `build_splice_deny_rules()` --
+   same `$client=`-scoped-rule mechanism as the existing bump hard-deny,
+   now also covering `mode='splice', is_global=0` domains. **Scope
+   locked with the user**: only enforces domains that already have a
+   row; a domain with no row at all stays default-allow at the DNS
+   tier, unchanged from today -- default-deny-for-unconfigured there is
+   a deliberately separate future decision.
+4. Report page: the plain `<select name="user">` filter replaced with
+   the same combobox widget the Domains page already uses, now
+   including groups/devices (`target=user:5`/`group:2`/`device:7`,
+   legacy `?user=<username>` still works). `approve_from_report()`'s
+   `scope` extended from `user`/`global` to also accept `device`/
+   `group`, granting `device_domains`/`group_domains` instead of
+   `user_domains`. No new "Block" action needed -- revoking already
+   existed via the Domains page's per-assignment delete; this just
+   makes that revoke *actually take effect* on both tiers, live.
+
+19 new tests across `tests/test_helpers_protocol.py`,
+`tests/test_device_identity.py`, `tests/test_block_page_server.py`,
+`tests/test_controller_adguard_sync.py`, `tests/test_dashboard.py`.
+Verified live end-to-end in a browser against seeded dev data, not just
+via the test suite: filtered the Report page to one device via the new
+combobox (confirmed exactly one row, correct stat-strip totals),
+clicked "Approve for Device 1" on a device-only denied row, and
+confirmed directly in the dev DB that a `domains` row (`splice`,
+`is_global=0`) and a `device_domains` grant row were both created.
+
+**Same day, before committing: the project owner reviewed and clarified
+the intended design further, changing real behavior.** Five explicit
+points, restated and confirmed back before implementing:
+
+1. AdGuard's baseline protection applies to every device/user/group
+   *unless* that device is `ignored` (BYPASS) -- not `bypass_login`,
+   which is a separate flag that only skips the captive-portal login
+   step; a `bypass_login` device still belongs to whatever user/group
+   it's assigned and is still filtered normally (confirmed against
+   `classify_device()`'s own docstring, which already made this
+   distinction explicit).
+2. `bump_enabled` is already per-device, not per-user -- one user can
+   have both a bumped and a non-bumped device. Already true, no change.
+3. **The actual behavior change**: for a `bump`-mode domain, a
+   bump-eligible device should ALSO have AdGuard check whether that
+   specific domain is assigned to it -- not just whether the device is
+   bump-eligible at all. If not assigned, AdGuard blocks it outright and
+   the connection never reaches Squid.
+4. A non-bump device already gets this domain-assignment check (the
+   `build_splice_deny_rules()` work above) -- confirmed as intended, not
+   changed.
+5. Whatever's blocked for a user/device on the Domains page should be
+   blocked in AdGuard too, for that same user/device -- confirmed as the
+   whole point of both `build_rules()` and `build_splice_deny_rules()`.
+
+**Implementation**: `controller/adguard_sync.py`'s `build_rules()` and
+`build_splice_deny_rules()` were unified onto one shared engine,
+`_build_domain_deny_rules(conn, mode, require_bump_eligible, ...)`. A
+device is authorized for a domain when `matching.device_domain_reason()`
+returns non-None AND (for `mode='bump'` only) `bump_eligible()` is also
+true -- `is_global` on a bump domain still only ever means "assigned to
+everyone," never "skip the bump-eligibility gate too" (verified: a
+non-bump-eligible device is still denied a global bump domain exactly as
+before this change). The engine also excludes any device
+`classify_device()` returns `BYPASS` for (`ignored=1`) from every rule it
+builds, on either mode, per point 1.
+
+**Point 1's `ignored` vs `bypass_login` distinction became a fourth
+request, not just a clarifying answer**: "anything that gets the
+bypass_login should be added to ignore by default but give me the
+ability to change that group later." Implemented in `dashboard.py`'s
+`update_device()` and `bypass_login_device()`: turning `bypass_login` on
+now defaults `ignored` to 1 too -- but only as a genuine default, not a
+forced override. Three guards, all tested: (a) skipped entirely if the
+same submission explicitly picked a user/group assignment (an explicit
+choice always wins); (b) skipped if the device already has a real
+`user_id`/`group_id` from before; (c) only fires on the actual
+bypass_login 0->1 transition (checked against the row's current DB
+value), so a later save with bypass_login already on never re-forces
+`ignored` back on top of an admin's own subsequent "actually, assign it
+somewhere" edit.
+
+**Why the old `build_rules()`/`build_splice_deny_rules()` tests all kept
+passing unchanged (26 of them)**: every existing test fixture uses
+`is_global=True` bump domains, under which the new `device_domain_reason()`
+check trivially returns `"global_domain"` for every device -- so the
+only thing that ever differentiated allow/deny in those tests was
+already `bump_eligible()`, exactly as before. The new behavior (a
+bump-eligible device denied a *specific*, non-global, unassigned bump
+domain) only shows up under `is_global=False`, which none of the
+original tests exercised -- confirming the rework is a strict
+extension, not a silent behavior change to anything already covered.
+10 new tests added: 5 in `tests/test_controller_adguard_sync.py` -- a
+bump-eligible device denied an unassigned non-global bump domain, then
+allowed once assigned via `device_domains`; a non-bump-eligible device
+still denied on a *global* bump domain (confirming point 3 doesn't
+weaken the original invariant); an `ignored` device excluded from both
+`build_rules()` and `build_splice_deny_rules()` even when it would
+otherwise clearly be denied -- plus 5 in `tests/test_dashboard.py` for
+the bypass_login-defaults-to-ignored behavior (the plain default,
+skipped-on-explicit-assignment, and skipped-on-a-later-resave cases, for
+both the quick-action route and the full edit form). 552 tests total
+after this pass.
+
 ## Original design sketch (2026-08-30, not started at the time)
 
 Force all internet through the system regardless of per-device
@@ -2340,7 +2492,68 @@ for non-interactive devices (smart TVs, voice assistants) that can't
 complete a login flow; the exact UI for the admin quick-add path
 described above.
 
-## Phase 5 — YouTube channel/creator-level filtering (assessed, not started)
+## Phase 5 — Admin dashboard: PWA and control surface (begun 2026-08-31)
+
+Responsive layout (desktop/mobile) and an installable PWA don't require
+a React rewrite — achievable on the existing Flask/Jinja2 architecture,
+already partly in place via Phase 1's PWA work (manifest/service worker
+already shipped there; this phase is the rest of the responsive-layout
+and installability work on top of that foundation). Also covers any
+further admin-facing UI/control-surface work beyond what exists today
+that isn't specifically about remote-access hardening (that's its own
+concern — see Phase 7).
+
+**2026-08-31: live mobile/tablet audit, one real bug found and fixed.**
+Started this phase early (real-network testing is blocked, so this work
+doesn't need to wait). Walked every dashboard page —
+Report/Devices/device-detail/Users/Domains/Settings — live in a headless
+browser at 375×812 (mobile) and 768×1024 (tablet), checking
+`document.documentElement.scrollWidth` against `clientWidth` on each
+(the actual test for real page-level horizontal scroll, not just "does
+it look okay in a screenshot").
+
+Found one genuine bug: `.chart-grid` (Report page's two Chart.js
+canvases) overflowed the viewport at mobile width —
+`scrollWidth` 404px in a 375px viewport. Root cause is the classic CSS
+Grid gotcha: a grid item's `min-width` defaults to `auto`, which floors
+its track at the content's *intrinsic* size — a `<canvas>` gets a real
+pixel `width` attribute (its internal render resolution) independent of
+whatever CSS width the grid tries to assign it, so that intrinsic size
+can hold the whole row open past the viewport. Fixed by adding
+`min-width: 0` to `.chart-card` and `max-width: 100%` to its `canvas`
+(`dashboard/static/css/app.css`). Confirmed fixed:
+`scrollWidth`/`clientWidth` both 375 after.
+
+Everything else already held up with no changes needed: the sidebar
+already collapses to an icon-only rail below 720px
+(`html.sidebar-collapsed`/the `@media (max-width: 720px)` block already
+in `app.css`), `.access-grid`'s 3-column picker already collapses to
+one column, wide tables already scroll inside their own
+`.table-scroll` wrapper instead of pushing the page, forms already
+stack full-width, and the tablet width (768px, just past the 720px
+breakpoint) showed the full sidebar + two-column chart grid with room
+to spare. PWA installability was already fully wired from Phase 1: a
+theme-color meta tag, `<link rel="manifest">`, `<link
+rel="apple-touch-icon">`, and the `/sw.js` registration script are all
+already in `dashboard.py`'s page shell. The Phase 4 captive-portal page
+(`dashboard/captive_portal_server.py`) was already built mobile-first
+(`viewport` meta tag, `max-width: 24rem; margin: 4rem auto` card
+layout) — not re-verified live this pass, lower priority since it was
+never a general-purpose desktop-first layout to begin with.
+
+**Testing-harness note for next time**: this headless browser tool does
+not retain HTTP Basic Auth credentials across a page's own subresource
+requests (embedding `user:pass@host` in the top-level navigation URL
+authenticates the document itself but CSS/JS/icon requests the page
+then issues still 401 — a limitation of this specific automation setup,
+not of real browsers, which cache Basic Auth per-origin and attach it
+to every subsequent request in that realm). Worked around it by running
+a scratch copy of `dashboard/dev_server.py` with
+`dashboard._check_admin_auth` monkey-patched to always return `True`,
+on a different port, never touching any tracked file. That scratch
+script was left in the session scratchpad, not the repo.
+
+## Phase 6 — YouTube channel/creator-level filtering (assessed, not started)
 
 Same fundamental shape as the existing Crunchyroll integration: the
 YouTube Data API can resolve a channel handle to a stable ID, but
@@ -2358,16 +2571,14 @@ agreed: block outbound UDP/443 for bump-tier devices at the
 router/firewall level to force TCP fallback, not something to solve
 inside this codebase.
 
-## Phase 6 — Admin control surface (assessed, not started)
+## Phase 7 — Remote Access Hardening (assessed, not started)
 
-Responsive layout (desktop/mobile) and an installable PWA don't require
-a React rewrite — achievable on the existing Flask/Jinja2 architecture,
-already partly in place via Phase 1's PWA work. The one real-stakes item
-is eventual remote access: since this dashboard controls a child's
-internet access, exposing it beyond the LAN means real auth hardening,
-TLS, and likely a VPN (Tailscale/WireGuard) rather than raw port
-forwarding — worth designing the session/auth model correctly from the
-start rather than retrofitting later, even though it's not needed yet.
+The one real-stakes item in exposing this dashboard beyond the LAN:
+since it controls a child's internet access, that exposure means real
+auth hardening, TLS, and likely a VPN (Tailscale/WireGuard) rather than
+raw port forwarding — worth designing the session/auth model correctly
+from the start rather than retrofitting later, even though it's not
+needed yet.
 
 ---
 
@@ -2375,7 +2586,7 @@ start rather than retrofitting later, even though it's not needed yet.
 
 Security is designed in from the start on every phase above, not
 retrofitted — even though this stays LAN-only for now, since external
-exposure is an eventual goal (Phase 6). Concrete surfaces already
+exposure is an eventual goal (Phase 7). Concrete surfaces already
 flagged: the Phase 4 login flow is a brand-new externally-reachable(-
 eventually) auth surface needing real scrutiny (credential handling,
 brute-force/lockout, session design); the DNS resolver added in Phase 3

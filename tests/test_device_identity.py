@@ -1,16 +1,20 @@
 """common/device_identity.py: source-IP-based identity resolution for
-Squid's intercept mode (resolve_user) and, since Phase 4 milestone 3,
-the captive-portal login server (resolve_device). No dedicated test
-file existed for this module before now -- resolve_user only had
-incidental coverage via tests/test_helpers_protocol.py's sni/authz
-helper tests; added direct coverage for both functions here while
-adding resolve_device.
+Squid's intercept mode and, since Phase 4 milestone 3, the captive-portal
+login server (resolve_device).
+
+resolve_user() (removed 2026-08-31) used to resolve straight from
+client_ip to a `users` row in one query -- replaced by resolve_device()
+(unchanged) + resolve_user_for_device(), split apart specifically so a
+group- or device-only assignment (no `users` row at all) is never
+conflated with "no identity resolved at all" -- see
+common/matching.py's device_domain_reason() docstring for the bug this
+was part of.
 """
 from __future__ import annotations
 
 import db
 import identity
-from device_identity import resolve_device, resolve_user
+from device_identity import resolve_device, resolve_user_for_device
 
 MAC_A = "aa:bb:cc:dd:ee:01"
 IP_1 = "192.168.1.21"
@@ -64,26 +68,46 @@ def test_resolve_device_ignores_an_inactive_binding(conn):
 
 
 # ============================================================
-# resolve_user (pre-existing function, previously untested in
-# isolation -- see this file's own module docstring)
+# resolve_user_for_device
 # ============================================================
 
-def test_resolve_user_returns_none_with_no_active_binding(conn):
-    assert resolve_user(conn, IP_1) is None
+def test_resolve_user_for_device_returns_none_for_none_device(conn):
+    assert resolve_user_for_device(conn, None) is None
 
 
-def test_resolve_user_returns_none_when_the_device_has_no_user(conn):
+def test_resolve_user_for_device_returns_none_when_the_device_has_no_user(conn):
     identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
-    assert resolve_user(conn, IP_1) is None
+    device = resolve_device(conn, IP_1)
+    assert resolve_user_for_device(conn, device) is None
 
 
-def test_resolve_user_returns_the_owning_user(conn):
+def test_resolve_user_for_device_returns_none_for_a_group_assigned_device(conn):
+    """The core case resolve_user() used to get wrong: a group-assigned
+    device (user_id NULL, group_id set) is a real, resolvable device --
+    it just has no *user* of its own."""
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    device_id = conn.execute("SELECT device_id FROM device_bindings WHERE ipv4_address = ?", (IP_1,)).fetchone()["device_id"]
+    conn.execute(
+        "INSERT INTO groups (name, created_at) VALUES ('TVs', ?)", (db.now_iso(),)
+    )
+    group_id = conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()["id"]
+    conn.execute("UPDATE devices SET group_id = ? WHERE id = ?", (group_id, device_id))
+    conn.commit()
+
+    device = resolve_device(conn, IP_1)
+
+    assert device["group_id"] == group_id
+    assert resolve_user_for_device(conn, device) is None
+
+
+def test_resolve_user_for_device_returns_the_owning_user(conn):
     identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
     device_id = conn.execute("SELECT device_id FROM device_bindings WHERE ipv4_address = ?", (IP_1,)).fetchone()["device_id"]
     user = _add_user(conn)
     conn.execute("UPDATE devices SET user_id = ? WHERE id = ?", (user["id"], device_id))
     conn.commit()
 
-    resolved = resolve_user(conn, IP_1)
+    device = resolve_device(conn, IP_1)
+    resolved = resolve_user_for_device(conn, device)
 
     assert resolved["username"] == "kid1"

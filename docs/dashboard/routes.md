@@ -168,7 +168,7 @@ containing just the inner page content (no `<html>`/`<nav>` -- that's
 | `USER_DETAIL_BODY` | `user_detail()` | One user's assigned domains (read-only list), approved shows table + add form, change-password form. |
 | `DOMAINS_BODY` | `domains()` | All domains table (or filtered by `?user_id=`), "Add domain" form, and conditionally the "Approve a specific page for {user}" form. |
 | `DOMAIN_DETAIL_BODY` | `domain_detail()` | One domain's mode/global/note edit form, assigned-users toggle table (only if not global), allowed-paths table + add form (only if mode is `bump`). |
-| `REPORT_BODY` | `report()` | Access-log table with user/status GET filter form and inline per-row "Approve" actions. |
+| `REPORT_BODY` | `report()` | Access-log table with a user/group/device/status GET filter form (combobox, since 2026-08-31) and inline per-row "Approve" actions. |
 | `SETTINGS_BODY` | `settings_page()` | Local network CIDR form, blocked-site experience mode form, admin username/password form. |
 
 All of these live in the same file as their route handlers, directly above
@@ -317,33 +317,65 @@ admin's next action is one edit + submit rather than starting from scratch:
 
 ### Report (`/report`)
 
-- `GET /report` -> `report()` -- optional `?user=` (username, exact match)
-  and `?status=` (`blocked`/`allowed`) GET filters, built as a raw SQL
-  string with conditionally appended `AND` clauses (parameterized, not
+- `GET /report` -> `report()` -- filters, built as a raw SQL string with
+  conditionally appended `AND` clauses (parameterized, not
   string-interpolated -- safe from injection) against `access_log`, capped
   at `LIMIT 200`, newest first (`ORDER BY id DESC`). Also surfaces
   `db.get_setting(conn, "cr_resolver_last_error")` so a failing Crunchyroll
   metadata resolver shows a banner at the top of the page. Renders
   `REPORT_BODY`.
-- `POST /report/approve` -> `approve_from_report()` -- form field `log_id`.
-  Looks up the `access_log` row and branches three ways:
-  1. **Show-scoped** (`row["series_id"]` set): resolves the title via
-     `cr_api.series_title()` and upserts `user_shows` for that user --
-     one-click "approve this show".
+  - `?status=` (`blocked`/`allowed`) -- unchanged.
+  - **Who/what filter, reworked 2026-08-31 (GH #9)**: the plain
+    `<select name="user">` was replaced with the same shared combobox
+    widget the Domains page uses (`_report_filter_combo()`, mirrors
+    `_domains_filter_combo()`), now covering users, groups, AND devices --
+    not just users. `?target=` (e.g. `device:7`, `group:2`, decoded by the
+    already-shared `_parse_filter_target()`) is the current encoding;
+    `_get_report_filter()` resolves it to at most one of
+    `(filtered_user, filtered_group, filtered_device)`. A user filter still
+    matches `access_log.username`; a device filter matches the new
+    `access_log.device_id` column directly; a group filter matches
+    `device_id IN (SELECT id FROM devices WHERE group_id = ?)` (access_log
+    has no `group_id` of its own). The older `?user=<username>` param still
+    works as a fallback when `?target=` isn't present, for any existing
+    bookmarks/links. Rows written before this migration have `device_id
+    IS NULL` and won't appear under a device/group filter -- not
+    back-filled.
+- `POST /report/approve` -> `approve_from_report()` -- form fields `log_id`
+  and `scope` (`user` default, or `global`/`device`/`group` since
+  2026-08-31 -- see below). Looks up the `access_log` row, validates the
+  requested `scope` actually has something to grant against (`scope=user`
+  needs `row["user_id"]`; `scope=device`/`group` need `row["device_id"]`
+  to resolve to a real `devices` row; `scope=group` additionally needs
+  that device to have a `group_id`) -- an invalid combination errors via
+  `flash_redirect(..., error=True)` rather than crashing. Then branches
+  three ways:
+  1. **Show-scoped** (`row["series_id"]` set): `scope=device`/`group` are
+     rejected here (`user_shows` has no group/device equivalent -- see
+     `authz_helper.decide()`'s `show_requires_user` reason). Otherwise
+     resolves the title via `cr_api.series_title()` and upserts
+     `user_shows` for that user -- one-click "approve this show".
   2. **Path-not-allowed** (`row["reason"] == "path_not_allowed"`): the
-     domain is already assigned to the user (that's why the path check ran
-     at all), so a plain `user_domains` insert would be a silent no-op and
-     the same request would be denied again. Instead this redirects to
+     domain is already assigned (that's why the path check ran at all), so
+     a plain assignment insert would be a silent no-op and the same
+     request would be denied again. Instead this redirects to
      `domain_detail` with `prefill_path=path_to_pattern(row["path"])` so the
      admin reviews/saves an actual path rule (see Prefill section).
   3. **New/blocked domain** (anything else): looks up the domain via
      `matching.find_domain()`; if it's never been configured at all,
-     creates it as `splice` mode, `is_global=0`, note `'Auto-added from
-     report approval'` (the safest default for a reactive one-off
-     approval), then assigns it to the user via `user_domains`.
+     creates it as `splice` mode, `is_global=0` (still `0` even for
+     `scope=device`/`group`, only ever `1` for `scope=global`), note
+     `'Auto-added from report approval'`, then grants it via
+     `user_domains`/`device_domains`/`group_domains` depending on `scope`
+     (`global` instead flips the domain's own `is_global`).
   All three branches end with `flash_redirect("report", ...)` except branch
   2, which does a plain `redirect(url_for("domain_detail", ...))` instead
   (no flash message on that hop, just the `prefill_path` param).
+  **No separate "Block"/revoke action exists or is planned** -- revoking a
+  grant already works via the Domains page's per-assignment delete on
+  `user_domains`/`group_domains`/`device_domains`; the 2026-08-31 fix
+  described in `docs/security/overview.md` §3.5 is what makes that revoke
+  *actually take effect* on AdGuard's DNS tier too, not just Squid.
 
 ### Devices and groups (`/devices`, `/groups`)
 
@@ -388,13 +420,26 @@ actual captive-portal login screen itself is still Phase 4, not built).
 - `POST /devices/update` -> `update_device()` -- form fields `device_id`,
   `label`, `assignment`, `bump_enabled` (checkbox), `bypass_login`
   (checkbox). Updates the row. Redirects to `device_detail`.
+  **`bypass_login` defaults `ignored` to 1 (added 2026-08-31, project
+  owner's explicit direction)**: on the actual 0->1 transition of
+  `bypass_login` (checked against the row's current DB value, not just
+  whether the checkbox is ticked this submit), if this same submission's
+  `assignment` resolved to neither a user nor a group, `ignored` is set
+  to 1 too. Skipped entirely if the submission explicitly picked a
+  user/group assignment (an explicit choice always wins), and only ever
+  fires once per transition, so a later save with `bypass_login` already
+  on never re-forces `ignored` back over an admin's own subsequent
+  "actually, assign it somewhere" edit.
 - `POST /devices/bypass_login` -> `bypass_login_device()` (added
   2026-08-31) -- form field `device_id`. Sets `bypass_login = 1` and
   nothing else -- deliberately a single-column `UPDATE`, not a wholesale
   form resubmit like `update_device()`, so the "Bypass" quick-action
   button in the pending-devices card can fire from a bare one-field form
   without needing to also resubmit (and risk blanking) the device's
-  label/assignment/bump_enabled. Redirects to `devices`.
+  label/assignment/bump_enabled. **Also defaults `ignored` to 1 (added
+  2026-08-31, same reasoning as `update_device()` above)**, via a single
+  `CASE` expression in the same `UPDATE` -- skipped if the device already
+  has a real `user_id`/`group_id`. Redirects to `devices`.
 - `POST /devices/delete` -> `delete_device()` -- form field `device_id`.
   Hard-deletes the row (`device_bindings`/`device_domains`/
   `network_events` referencing it fall back to `device_id = NULL` via `ON
@@ -503,8 +548,11 @@ shape, not an error).
   sure" step, so a JS-disabled/scripted client can delete without
   confirmation (acceptable here since admin-only + CSRF-guarded).
 - **The `/report` approve button only appears for blocked rows with a known
-  user**: `{% if not row.allowed and row.user_id %}` -- rows with no
-  `user_id` (requests that didn't even map to a known proxy login) have
+  user OR device** (reworked 2026-08-31 for the device/group case, GH #9):
+  `{% if not row.allowed and row.user_id %}` (submits `scope=user`)
+  `{% elif not row.allowed and row.device_id %}` (submits `scope=device`)
+  -- a row with neither (a genuinely never-seen identity, or a
+  pre-migration row from before `access_log.device_id` existed) has
   nothing sensible to approve into, so no button is shown.
 - **The built-in Crunchyroll domain (`kind == 'crunchyroll'`) is
   undeletable** but still fully editable (mode/global/note/paths) from

@@ -48,6 +48,37 @@ def _bind_ip_to_user(conn, user_id, ip):
     identity.record_binding(conn, mac, ip, source="rtnetlink")
 
 
+def _bind_ip_to_group(conn, group_id, ip):
+    """Same as _bind_ip_to_user, but for a device assigned to a GROUP
+    instead of a user (user_id NULL, group_id set) -- the case
+    common/matching.py's device_domain_reason() was added to fix (see its
+    own docstring)."""
+    mac = f"aa:bb:cc:dd:ee:{next(_mac_counter):02x}"
+    conn.execute(
+        "INSERT INTO devices (mac_address, group_id, created_at) VALUES (?, ?, ?)",
+        (mac, group_id, db.now_iso()),
+    )
+    conn.commit()
+    identity.record_binding(conn, mac, ip, source="rtnetlink")
+    return conn.execute("SELECT id FROM devices WHERE mac_address = ?", (mac,)).fetchone()["id"]
+
+
+def _bind_ip_to_bare_device(conn, ip):
+    """A device with neither user_id nor group_id -- only ever authorized
+    via a direct device_domains grant."""
+    mac = f"aa:bb:cc:dd:ee:{next(_mac_counter):02x}"
+    conn.execute("INSERT INTO devices (mac_address, created_at) VALUES (?, ?)", (mac, db.now_iso()))
+    conn.commit()
+    identity.record_binding(conn, mac, ip, source="rtnetlink")
+    return conn.execute("SELECT id FROM devices WHERE mac_address = ?", (mac,)).fetchone()["id"]
+
+
+def _add_group(conn, name="TVs"):
+    conn.execute("INSERT INTO groups (name, created_at) VALUES (?, ?)", (name, db.now_iso()))
+    conn.commit()
+    return conn.execute("SELECT * FROM groups WHERE name = ?", (name,)).fetchone()["id"]
+
+
 def _add_domain(conn, pattern, mode, is_global=1, kind="generic"):
     conn.execute(
         "INSERT INTO domains (pattern, mode, kind, is_global, note, created_at) VALUES (?,?,?,?,NULL,?)",
@@ -182,6 +213,29 @@ def test_sni_handle_splice_per_user_domain_requires_assignment(conn):
     assert sni_helper.handle_splice(conn, "192.168.1.5", "example.com") is True
 
 
+def test_sni_handle_splice_group_assigned_device_gets_access(conn):
+    """The core regression test for the group/device authorization bug
+    (see common/matching.py's device_domain_reason() docstring): a device
+    assigned to a GROUP, not a user, used to resolve to no identity at all
+    (device_identity.resolve_user() INNER JOINs devices.user_id) and was
+    denied unconditionally before ever reaching a domain check."""
+    group_id = _add_group(conn, "TVs")
+    _bind_ip_to_group(conn, group_id, "192.168.1.5")
+    domain = _add_domain(conn, r"example\.com", mode="splice", is_global=0)
+    assert sni_helper.handle_splice(conn, "192.168.1.5", "example.com") is False
+    row = conn.execute("SELECT * FROM access_log ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["reason"] == "domain_not_assigned"
+    assert row["username"] != "(unauthenticated)"  # a real device identity, just no user
+
+    conn.execute("INSERT INTO group_domains (group_id, domain_id) VALUES (?,?)", (group_id, domain["id"]))
+    conn.commit()
+    assert sni_helper.handle_splice(conn, "192.168.1.5", "example.com") is True
+    row = conn.execute("SELECT * FROM access_log ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["reason"] == "group_domain"
+    assert row["user_id"] is None
+    assert row["device_id"] is not None
+
+
 def test_sni_handle_splice_wrong_mode_domain_denied(conn):
     user = _add_user(conn, "kid1", "pw")
     _bind_ip_to_user(conn, user["id"], "192.168.1.5")
@@ -306,6 +360,23 @@ def test_authz_bump_domain_not_assigned_to_user_denied(conn):
     assert row["reason"] == "domain_not_assigned"
 
 
+def test_authz_device_only_assignment_works_with_no_user_or_group(conn):
+    """Second half of the authorization-bug regression coverage: a device
+    with NEITHER user_id NOR group_id, authorized only via a direct
+    device_domains grant."""
+    device_id = _bind_ip_to_bare_device(conn, "192.168.1.5")
+    domain = _add_domain(conn, r"example\.com", mode="bump", is_global=0)
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:443", "/") is False
+
+    conn.execute("INSERT INTO device_domains (device_id, domain_id) VALUES (?,?)", (device_id, domain["id"]))
+    conn.commit()
+    assert authz_helper.decide(conn, "192.168.1.5", "example.com:443", "/") is True
+    row = conn.execute("SELECT * FROM access_log ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["reason"] == "device_domain"
+    assert row["user_id"] is None
+    assert row["device_id"] == device_id
+
+
 def test_authz_generic_bump_domain_no_path_rules_allows_any_path(conn):
     user = _add_user(conn, "kid1", "pw")
     _bind_ip_to_user(conn, user["id"], "192.168.1.5")
@@ -338,6 +409,23 @@ def test_authz_crunchyroll_cms_objects_always_allowed(conn):
         conn, "192.168.1.5", "www.crunchyroll.com:443",
         "/content/v2/cms/objects/GYE5K0XVR",
     ) is True
+
+
+def test_authz_crunchyroll_denied_when_device_has_no_resolvable_user(conn):
+    """A group-assigned device can be authorized for the crunchyroll DOMAIN
+    itself (via group_domains), but user_shows is keyed by user_id only --
+    there's no group/device-level show list to check, so this must fail
+    closed with a distinct reason rather than allow blindly or crash."""
+    group_id = _add_group(conn, "TVs")
+    _bind_ip_to_group(conn, group_id, "192.168.1.5")
+    domain = _add_domain(conn, r"crunchyroll\.com", mode="bump", is_global=0, kind="crunchyroll")
+    conn.execute("INSERT INTO group_domains (group_id, domain_id) VALUES (?,?)", (group_id, domain["id"]))
+    conn.commit()
+
+    path = "/series/GYE5K0XVR/ace-attorney"
+    assert authz_helper.decide(conn, "192.168.1.5", "www.crunchyroll.com:443", path) is False
+    row = conn.execute("SELECT * FROM access_log ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["reason"] == "show_requires_user"
 
 
 def test_authz_crunchyroll_series_page_requires_approval(conn):

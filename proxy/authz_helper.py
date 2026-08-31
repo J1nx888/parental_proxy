@@ -16,11 +16,16 @@ common/device_identity.py's device_bindings-based lookup, same as
 sni_helper.py.
 
 Decision order for a bump-mode domain:
-  1. Client's device must resolve to a user, and be inside the configured LAN.
-  2. Domain must be globally allowed, or explicitly assigned to this user.
+  1. Client's IP must resolve to a known device (any device -- a bare
+     device_bindings match, not a user), and be inside the configured LAN.
+  2. Domain must be globally allowed, or assigned to this device's user,
+     its group, or the device itself directly -- see
+     common/matching.py's device_domain_reason().
   3. If it's the Crunchyroll domain: resolve watch/playback/series requests
      to their parent show via the CMS API (cached) and check the user's
      show list. CMS metadata-only requests are always allowed (matches v1).
+     Requires a resolved user -- user_shows has no group/device
+     equivalent, see decide()'s own "show_requires_user" case.
   4. Otherwise: if the domain has any configured allowed-paths, the
      request's path must match one of them (defense-in-depth, same idea as
      v1's allowed_paths.txt). A domain with zero configured paths allows
@@ -28,6 +33,14 @@ Decision order for a bump-mode domain:
      matters.
 
 Every decision is logged (deduped) via logging_util.
+
+**Fixed 2026-08-31**: step 1/2 used to resolve straight to a `users` row
+(device_identity.resolve_user()) and only ever check
+`is_global or user_has_domain(...)` -- a device assigned to a GROUP (no
+user_id) resolved to no identity at all and was denied everything, and
+even a user-resolved device could never benefit from a group/device-level
+domain grant. See common/matching.py's device_domain_reason() docstring
+for the full bug writeup and RoadMap.md's dated entry.
 """
 from __future__ import annotations
 
@@ -53,53 +66,73 @@ def decide(conn, client_ip: str, dst: str, path: str, _data: str = "-") -> bool:
     hostname = _split_host_port(dst)
     path = path or "/"
 
-    user = device_identity.resolve_user(conn, client_ip)
-    if user is None:
+    # Resolve the DEVICE first, not the user -- a group- or device-only
+    # assignment has no `users` row at all, but is still a real identity
+    # (see common/matching.py's device_domain_reason()). Only a source IP
+    # with no active device_bindings row at all (never seen, or stale)
+    # gets the old "no identity" treatment: deny, unlogged, exactly as
+    # before this fix.
+    device = device_identity.resolve_device(conn, client_ip)
+    if device is None:
         return False
+
+    user = device_identity.resolve_user_for_device(conn, device)
+    user_id, username, device_id = device_identity.log_identity_fields(device, user)
 
     if not matching.ip_in_configured_lan(conn, client_ip):
         logging_util.log_access(
-            conn, user_id=user["id"], username=user["username"], domain=hostname,
-            path=path, allowed=False, reason="outside_lan",
+            conn, user_id=user_id, username=username, domain=hostname,
+            path=path, allowed=False, reason="outside_lan", device_id=device_id,
         )
         return False
 
     domain = matching.find_domain(conn, hostname)
     if domain is None or domain["mode"] != "bump":
         # Two ways to get here: a genuinely unconfigured domain, or a
-        # splice-mode domain this user isn't permitted -- ssl_bump's
+        # splice-mode domain this device isn't permitted -- ssl_bump's
         # block_page rule (see sni_helper.py) deliberately bumps both so a
         # real deny page can be served here instead of a bare connection
         # failure. Either way: deny.
         logging_util.log_access(
-            conn, user_id=user["id"], username=user["username"], domain=hostname,
+            conn, user_id=user_id, username=username, domain=hostname,
             path=path, allowed=False,
             reason="unknown_domain" if domain is None else "not_bump_mode",
+            device_id=device_id,
         )
         return False
 
-    domain_ok = bool(domain["is_global"]) or matching.user_has_domain(conn, user["id"], domain["id"])
-    if not domain_ok:
+    reason = matching.device_domain_reason(conn, device, domain)
+    if reason is None:
         logging_util.log_access(
-            conn, user_id=user["id"], username=user["username"], domain=hostname,
-            path=path, allowed=False, reason="domain_not_assigned",
+            conn, user_id=user_id, username=username, domain=hostname,
+            path=path, allowed=False, reason="domain_not_assigned", device_id=device_id,
         )
         return False
 
     if domain["kind"] == "crunchyroll":
+        if user is None:
+            # The domain itself is authorized (via group/device), but
+            # user_shows is keyed by user_id only -- there's no
+            # group/device-level show list to check against. Fails
+            # closed rather than either silently allowing every show or
+            # crashing on a None user_id below.
+            logging_util.log_access(
+                conn, user_id=user_id, username=username, domain=hostname,
+                path=path, allowed=False, reason="show_requires_user", device_id=device_id,
+            )
+            return False
         return _decide_crunchyroll(conn, user, hostname, path, domain)
 
     if not matching.path_allowed(conn, domain["id"], path) and _has_any_path_rules(conn, domain["id"]):
         logging_util.log_access(
-            conn, user_id=user["id"], username=user["username"], domain=hostname,
-            path=path, allowed=False, reason="path_not_allowed",
+            conn, user_id=user_id, username=username, domain=hostname,
+            path=path, allowed=False, reason="path_not_allowed", device_id=device_id,
         )
         return False
 
     logging_util.log_access(
-        conn, user_id=user["id"], username=user["username"], domain=hostname,
-        path=path, allowed=True,
-        reason="global_domain" if domain["is_global"] else "user_domain",
+        conn, user_id=user_id, username=username, domain=hostname,
+        path=path, allowed=True, reason=reason, device_id=device_id,
     )
     return True
 

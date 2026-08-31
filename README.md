@@ -287,8 +287,11 @@ common/            shared Python, flat-copied into every Python container's
   series_resolve.py   DB-backed object-id -> series-id cache
   matching.py         domain/path pattern matching, LAN CIDR check
   logging_util.py     deduped access-log writer
-  device_identity.py  resolve_user(conn, client_ip) -- Squid's identity
-                       source since intercept mode replaced per-login auth
+  device_identity.py  resolve_device(conn, client_ip) + resolve_user_for_device()
+                       -- Squid's identity source since intercept mode replaced
+                       per-login auth (split into two functions 2026-08-31 so a
+                       group/device-only identity is never conflated with "no
+                       identity resolved at all" -- see matching.device_domain_reason())
   identity.py         record_binding() etc. -- writes device_bindings rows
   adguard_client.py   HTTP client for AdGuard Home's admin API
 

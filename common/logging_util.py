@@ -39,7 +39,19 @@ def log_access(
     reason: str,
     series_id: str | None = None,
     series_name: str | None = None,
+    device_id: int | None = None,
 ) -> None:
+    """device_id (added 2026-08-31, see RoadMap.md's dated entry): which
+    `devices` row made this request, when known -- lets the Report page
+    filter/act on a row by device or group even when it has no user_id at
+    all (a group- or device-assigned identity, see
+    common/matching.py's device_domain_reason()). Deliberately NOT part of
+    the dedupe key below -- two devices sharing one username (not possible
+    today, but kept simple) or a device's IP moving between requests within
+    the dedupe window should still collapse the same way it always has;
+    device_id is purely a stored column on whichever row wins the dedupe
+    check, not a new dimension of "is this a new event".
+    """
     cutoff_iso = iso_secs_ago(DEDUPE_WINDOW_SECONDS)
     # series_id is part of the dedupe key (SQLite's `IS` is null-safe, so two
     # NULLs still match) so two different blocked shows on the same domain
@@ -60,8 +72,8 @@ def log_access(
         return
     conn.execute(
         "INSERT INTO access_log "
-        "(ts, user_id, username, domain, path, series_id, series_name, allowed, reason) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(ts, user_id, username, domain, path, series_id, series_name, allowed, reason, device_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             now_iso(),
             user_id,
@@ -72,5 +84,6 @@ def log_access(
             series_name,
             1 if allowed else 0,
             reason,
+            device_id,
         ),
     )

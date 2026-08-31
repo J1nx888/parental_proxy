@@ -122,7 +122,10 @@ common/     Shared Python, imported by BOTH containers. NOT a package —
             `from common import db`.
               db.py              SQLite schema (SCHEMA string) + get_conn()/init_db()
               matching.py        domain-suffix / path / LAN-CIDR matching
-              device_identity.py resolve_user(conn, client_ip) — Squid's identity source
+              device_identity.py resolve_device(conn, client_ip) + resolve_user_for_device(conn, device)
+                                  — Squid's identity source (split 2026-08-31 so a
+                                  group/device-only identity, with no `users` row at
+                                  all, is never conflated with "no identity resolved")
               identity.py        record_binding() etc. — writes device_bindings rows
               squid_helper.py    the shared stdin/stdout external_acl_type protocol loop
               logging_util.py    deduped access-log writer
@@ -159,12 +162,18 @@ no reconfigure/restart" true.
 
 **Request flow (abridged):** intercepted TLS → Squid peeks SNI →
 `sni_helper.py` decides bump / splice / trusted / block-page, resolving the
-client's identity from its source IP via `device_identity.resolve_user`
-(`device_bindings` → `devices.user_id`) — this replaced per-request
-Basic-Auth on 2026-08-30. If the domain is `bump` mode, the decrypted HTTP
-request is re-checked by `authz_helper.py`, which for Crunchyroll resolves
-the requested show (`cr_urls` → `series_resolve` → `cr_api`, cached in
-`series_cache`) against the user's approved list. Every decision is logged
+client's identity from its source IP via `device_identity.resolve_device`
+(`device_bindings` → the `devices` row itself, regardless of whether it has
+a `user_id`) — this replaced per-request Basic-Auth on 2026-08-30. Domain
+access is then checked via `matching.device_domain_reason()` (added
+2026-08-31), which authorizes via `is_global`, the device's user, its
+group, or the device itself directly — whichever grants it first. If the
+domain is `bump` mode, the decrypted HTTP request is re-checked by
+`authz_helper.py`, which for Crunchyroll resolves the requested show
+(`cr_urls` → `series_resolve` → `cr_api`, cached in `series_cache`) against
+the user's approved list — a group/device-only identity with no resolvable
+user gets `reason="show_requires_user"` here, since `user_shows` has no
+group/device equivalent. Every decision is logged
 with a `reason` string — those strings are what the Report page shows and
 what makes an entry "Approve"-able. Full version: `docs/architecture/overview.md` §6.
 

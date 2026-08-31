@@ -21,51 +21,56 @@ from __future__ import annotations
 import sqlite3
 
 
-def resolve_user(conn: sqlite3.Connection, client_ip: str) -> sqlite3.Row | None:
-    """The `users` row for whoever this source IP currently belongs to,
-    or None if identity can't be resolved.
+def resolve_user_for_device(conn: sqlite3.Connection, device: sqlite3.Row | None) -> sqlite3.Row | None:
+    """The `users` row for `device`'s own user_id, or None if the device
+    itself is None, has no user_id at all (unassigned), or is assigned to
+    a group instead of a person -- a group/device-only assignment is still
+    a real, enforceable identity (see common/matching.py's
+    device_domain_reason()), it just has no single `users` row of its own.
 
-    None covers three distinct cases, deliberately not told apart here
-    -- every one of them means "treat this like the old unauthenticated
-    %LOGIN case," so a caller doesn't need to: no active
-    device_bindings row for this IP at all (never seen, or a stale
-    binding); the bound device belongs to a group instead of a user
-    (device_bindings mirrors what device_bindings.device_id points to,
-    but common/matching.py's group-based checks aren't wired into any
-    proxy enforcement path yet -- see its own docstrings); or the
-    device has neither (unassigned).
-
-    In practice this is only ever reached for a bump_v4 device in the
-    first place -- nftables only redirects bump-enabled, already-
-    authenticated devices to Squid's intercept ports at all (see
-    phase3/nftables-manager/internal/nft/knftables_adapter.go) -- but
-    this function makes no assumption about that; a resolution failure
-    here is simply "no identity," exactly like an empty/absent %LOGIN
-    used to be.
-
-    A device with more than one simultaneously-active binding (see
-    common/identity.py's own notes on how that can briefly happen)
-    resolves to the most-recently-seen one, matching
-    common/identity.py's own active_binding_ip().
+    **Replaces the old resolve_user(conn, client_ip) (removed 2026-08-31,
+    see device_domain_reason()'s own docstring for the bug this was part
+    of)**: that function INNER JOINed straight from device_bindings to
+    users through devices.user_id in one query, so a group-assigned device
+    resolved to None -- indistinguishable from "never seen at all" -- and
+    every caller treated that None as "deny everything," even though the
+    device itself was perfectly well identified. Callers now resolve the
+    *device* first via resolve_device() above (which has no such blind
+    spot -- it matches on device_bindings alone) and pass it here
+    separately, so "no user" and "no identity at all" are never conflated
+    again.
     """
-    return conn.execute(
-        """
-        SELECT u.* FROM device_bindings b
-        JOIN devices d ON d.id = b.device_id
-        JOIN users u ON u.id = d.user_id
-        WHERE b.ipv4_address = ? AND b.active = 1
-        ORDER BY b.last_seen_at DESC LIMIT 1
-        """,
-        (client_ip,),
-    ).fetchone()
+    if device is None or device["user_id"] is None:
+        return None
+    return conn.execute("SELECT * FROM users WHERE id = ?", (device["user_id"],)).fetchone()
+
+
+def log_identity_fields(
+    device: sqlite3.Row | None, user: sqlite3.Row | None
+) -> tuple[int | None, str, int | None]:
+    """(user_id, username, device_id) for logging_util.log_access(), in
+    priority order: a real resolved user; else the device's own label (or
+    MAC address if unlabeled, matching how the dashboard's device
+    comboboxes already display an unlabeled device -- see dashboard.py's
+    _entity_combo) as a synthetic username, with device_id set so the
+    Report page can still filter/act on this row by device or group even
+    with no user_id; else the pre-existing "(unauthenticated)" placeholder,
+    unchanged, for the genuinely-never-seen case (device itself is None --
+    no active device_bindings row at all)."""
+    if user is not None:
+        return user["id"], user["username"], (device["id"] if device is not None else None)
+    if device is not None:
+        return None, device["label"] or device["mac_address"], device["id"]
+    return None, "(unauthenticated)", None
 
 
 def resolve_device(conn: sqlite3.Connection, client_ip: str) -> sqlite3.Row | None:
     """The `devices` row for whoever currently holds this source IP, or
     None if there's no active device_bindings row for it at all.
 
-    Unlike resolve_user() above, this returns the device itself
-    regardless of whether it already has a user_id assigned --
+    Unlike resolve_user_for_device() above, this resolves straight from
+    client_ip (not from an already-resolved device), and returns the
+    device itself regardless of whether it has a user_id assigned --
     dashboard/captive_portal_server.py (Phase 4 milestone 3) needs the
     device_id itself to actually grant access (flipping
     is_authenticated), not just whichever user, if any, already owns

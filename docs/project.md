@@ -21,7 +21,9 @@ common/        Shared Python modules used by BOTH containers (flat-copied into e
   auth.py            password hashing/verification (PBKDF2)
   db.py              SQLite schema (SCHEMA string) + init_db()
   matching.py        domain/user/LAN-permission lookup logic
-  device_identity.py resolve_user(conn, client_ip) -- Squid's identity source since 2026-08-30
+  device_identity.py resolve_device(conn, client_ip) + resolve_user_for_device(conn, device)
+                      -- Squid's identity source since 2026-08-30 (split into two
+                      functions 2026-08-31, see docs/security/overview.md §3)
   squid_helper.py    shared external_acl_type request/response protocol plumbing
   logging_util.py    deduped access-log writer
   cr_urls.py         Crunchyroll URL classification (playback/series/season/episode)

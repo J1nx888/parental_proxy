@@ -72,21 +72,18 @@ def handle_trusted(conn, client_ip: str, sni: str, _data: str = "-") -> bool:
     return domain is not None and domain["mode"] == "trusted"
 
 
-def _log_denial(conn, sni: str, reason: str, user: sqlite3.Row | None = None) -> None:
+def _log_denial(
+    conn, sni: str, reason: str, device: sqlite3.Row | None = None, user: sqlite3.Row | None = None
+) -> None:
     """Log a denied SNI-layer decision -- domain only, no path, since
     nothing is decrypted at this layer. Shared by handle_splice and
     handle_block_page so the identity-resolution-for-logging isn't
     duplicated between them."""
-    if user is None:
-        logging_util.log_access(
-            conn, user_id=None, username="(unauthenticated)", domain=sni,
-            path=None, allowed=False, reason=reason,
-        )
-    else:
-        logging_util.log_access(
-            conn, user_id=user["id"], username=user["username"],
-            domain=sni, path=None, allowed=False, reason=reason,
-        )
+    user_id, username, device_id = device_identity.log_identity_fields(device, user)
+    logging_util.log_access(
+        conn, user_id=user_id, username=username, domain=sni,
+        path=None, allowed=False, reason=reason, device_id=device_id,
+    )
 
 
 def handle_splice(conn, client_ip: str, sni: str, _data: str = "-") -> bool:
@@ -94,22 +91,28 @@ def handle_splice(conn, client_ip: str, sni: str, _data: str = "-") -> bool:
     if domain is None or domain["mode"] != "splice":
         return False
 
-    user = device_identity.resolve_user(conn, client_ip)
-    if user is None:
+    # Resolve the DEVICE first -- see authz_helper.decide()'s own comment
+    # on why (a group/device-only assignment has no `users` row at all,
+    # but is still a real, enforceable identity).
+    device = device_identity.resolve_device(conn, client_ip)
+    if device is None:
         _log_denial(conn, sni, "not_authenticated")
         return False
+    user = device_identity.resolve_user_for_device(conn, device)
+    user_id, username, device_id = device_identity.log_identity_fields(device, user)
 
     if not matching.ip_in_configured_lan(conn, client_ip):
         logging_util.log_access(
-            conn, user_id=user["id"], username=user["username"], domain=sni,
-            path=None, allowed=False, reason="outside_lan",
+            conn, user_id=user_id, username=username, domain=sni,
+            path=None, allowed=False, reason="outside_lan", device_id=device_id,
         )
         return False
 
-    allowed = bool(domain["is_global"]) or matching.user_has_domain(conn, user["id"], domain["id"])
+    reason = matching.device_domain_reason(conn, device, domain)
+    allowed = reason is not None
     logging_util.log_access(
-        conn, user_id=user["id"], username=user["username"], domain=sni, path=None,
-        allowed=allowed, reason="global_domain" if domain["is_global"] else "user_domain",
+        conn, user_id=user_id, username=username, domain=sni, path=None,
+        allowed=allowed, reason=reason or "domain_not_assigned", device_id=device_id,
     )
     return allowed
 
@@ -160,8 +163,9 @@ def handle_block_page(conn, client_ip: str, sni: str, _data: str = "-") -> bool:
     # fixing this properly; revisit if it shows up as real load or
     # Report-page noise in practice.
     if mode != "redirect" and matching.find_domain(conn, sni) is None:
-        user = device_identity.resolve_user(conn, client_ip)
-        _log_denial(conn, sni, "unknown_domain", user=user)
+        device = device_identity.resolve_device(conn, client_ip)
+        user = device_identity.resolve_user_for_device(conn, device) if device is not None else None
+        _log_denial(conn, sni, "unknown_domain", device=device, user=user)
 
     return mode == "redirect"
 

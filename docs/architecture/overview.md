@@ -26,9 +26,16 @@ assigned to which user and which are SSL-Bump-enabled.
 common/                      shared Python modules, imported by both containers
   db.py                        SQLite schema (SCHEMA string) + get_conn()/init_db()
   auth.py                      PBKDF2-SHA256 password hashing (hash_password/verify_password)
-  matching.py                  domain/path regex matching, LAN CIDR check
-  device_identity.py           resolve_user(conn, client_ip) -- source IP -> device_bindings ->
-                                devices.user_id -> users row (Squid's identity source since 2026-08-30)
+  matching.py                  domain/path regex matching, LAN CIDR check;
+                                device_domain_reason(conn, device, domain) -- the shared
+                                is_global/user/group/device authorization check (added
+                                2026-08-31), used by both proxy helpers and
+                                controller/adguard_sync.py's build_splice_deny_rules()
+  device_identity.py           resolve_device(conn, client_ip) -- source IP -> device_bindings ->
+                                the devices row itself (Squid's identity source since 2026-08-30);
+                                resolve_user_for_device(conn, device) -- devices.user_id -> users row,
+                                or None for an unassigned/group-assigned device (split from a single
+                                resolve_user() 2026-08-31 -- see matching.device_domain_reason())
   logging_util.py              log_access() -- deduped access-log writer
   squid_helper.py              shared stdin/stdout protocol loop (run())
   series_resolve.py            Crunchyroll object-id -> series-id cache (resolve_series_ids())
@@ -121,15 +128,41 @@ take effect everywhere.
   needed for `controller/rtnetlink_listener.py`'s live netlink socket
   handling (pure Python itself, no C extension).
 - **AdGuard Home** (`adguard/adguardhome:v0.107.79`, pinned rather than
-  `latest`) -- the DNS tier's filtering engine, and (since 2026-08-30) what
-  enforces the hard-deny invariant for `mode='bump'` domains on every
-  device that isn't currently `bump_eligible()` via its `$client=`-scoped
-  custom filtering rules (see `controller/adguard_sync.py`'s `build_rules()`
-  -- **fixed 2026-08-31**: this used to select on the raw `bump_enabled`
-  column, which let a `bump_enabled=1`-but-not-yet-`AUTHENTICATED` device
-  bypass both this hard-deny AND nftables' `bump_v4` redirect at once, a
-  genuine unfiltered gap, same class of bug as `classify_device()`'s own
-  `bypass_login` fix the same day -- see RoadMap.md's dated audit entry).
+  `latest`) -- the DNS tier's filtering engine, enforcing two rule sets via
+  its `$client=`-scoped custom filtering rules, both built by
+  `controller/adguard_sync.py`'s shared `_build_domain_deny_rules(conn,
+  mode, require_bump_eligible, ...)` engine and pushed together in one
+  managed block:
+  - `build_rules()` (since 2026-08-30, reworked 2026-08-31): for every
+    `mode='bump'` domain, denies any device that isn't BOTH currently
+    `bump_eligible()` AND actually authorized for that specific domain
+    (`matching.device_domain_reason()` -- `is_global`, or a user/group/
+    device grant). The bump-eligibility-only version had a real gap
+    **fixed 2026-08-31**: it used to select on the raw `bump_enabled`
+    column, which let a `bump_enabled=1`-but-not-yet-`AUTHENTICATED`
+    device bypass both this hard-deny AND nftables' `bump_v4` redirect at
+    once -- see RoadMap.md's dated audit entry. The bump-eligibility-only
+    check was itself **superseded the same day** (project owner's
+    explicit direction, GH #9): a bump-eligible device used to get a free
+    DNS pass to *any* bump-mode domain, relying entirely on Squid to
+    catch an unassigned one after decryption -- now AdGuard checks the
+    same per-domain assignment first. `is_global` still only ever means
+    "assigned to everyone," never "skip the bump-eligibility gate."
+  - `build_splice_deny_rules()` (added 2026-08-31, GH #9): the same
+    per-user/group/device/everyone assignment, enforced at the DNS tier
+    too, for `mode='splice'` domains -- no bump-eligibility gate here,
+    since splice is exactly the tier a non-bump device uses. Closes a gap
+    where the entire Domains-page content allowlist was completely
+    unenforced for any device not going through Squid.
+  Both exclude any device `common/policy_class.py`'s `classify_device()`
+  returns `BYPASS` for (`ignored=1`, not `bypass_login` -- see that
+  function's own docstring for the distinction) from every rule, on
+  either mode -- the project owner's explicit direction the same day:
+  AdGuard's baseline protection applies to everyone unless a device is
+  set to `ignored`. Scope deliberately still excludes domains with no
+  `domains` row at all (default-allow, unchanged) -- see
+  `_build_domain_deny_rules()`'s own docstring and RoadMap.md's dated
+  entry.
   Also provides network-wide ad/
   tracker blocking for every device: its own default filter is enabled
   automatically on first configure, plus (2026-08-30) a curated set of
@@ -212,8 +245,9 @@ take effect everywhere.
   `devices.is_authenticated` -- DNS-tier access only, never
   `bump_enabled` -- via `common/device_identity.py`'s new
   `resolve_device()` (source IP -> `device_bindings` -> the `devices`
-  row itself, the write-side counterpart to that module's existing
-  `resolve_user()`). No interception for HTTPS (tcp/443) -- see the
+  row itself, the write-side counterpart to that module's
+  `resolve_user_for_device()`, the read-side function derived from a
+  resolved device -- see §1's device_identity.py entry). No interception for HTTPS (tcp/443) -- see the
   module's own docstring for why that's a deliberate, industry-standard
   limitation (matching real commercial captive portals) rather than an
   oversight, and RoadMap.md for the follow-up hardening option this
@@ -431,9 +465,13 @@ read by `sni_helper.py handle_block_page()`:
    `CONNECT` for HTTPS, so there is no handshake step left to challenge with
    a 407 in the first place. Identity is resolved later, per-decision, from
    the client's source IP (`%>a`) via `common/device_identity.py`'s
-   `resolve_user(conn, client_ip)` (source IP -> `device_bindings` ->
-   `devices.user_id` -> `users` row) -- see `docs/security/overview.md` §3
-   for the full model and its DHCP/staleness caveat.
+   `resolve_device(conn, client_ip)` (source IP -> `device_bindings` -> the
+   `devices` row itself) and, from that, `resolve_user_for_device(conn,
+   device)` (`devices.user_id` -> `users` row, or `None` for an unassigned
+   or group-assigned device -- split from a single `resolve_user()`
+   2026-08-31, see `docs/security/overview.md` §3's dated entry for the bug
+   this fixed) -- see that section for the full model and its
+   DHCP/staleness caveat.
 2. `http_access deny CONNECT !SSL_ports` / `allow CONNECT` /
    `allow CONNECT step1`/`step2` still gate the (now purely internal, since
    there's no client-sent `CONNECT`) tunnel/negotiation phase Squid itself
@@ -448,10 +486,13 @@ read by `sni_helper.py handle_block_page()`:
    - `sni_trusted` -> `handle_trusted()` -> splice if `mode == 'trusted'`
    - `sni_bump` -> `handle_bump()` -> bump if `mode == 'bump'`
    - `sni_splice_allowed` -> `handle_splice()` -> splice if `mode == 'splice'`
-     AND `device_identity.resolve_user()` resolves an identity for the
+     AND `device_identity.resolve_device()` resolves a device for the
      client IP, that IP is inside the configured LAN
-     (`matching.ip_in_configured_lan()`), and either the domain `is_global`
-     or `matching.user_has_domain()` returns true
+     (`matching.ip_in_configured_lan()`), and
+     `matching.device_domain_reason()` (added 2026-08-31) authorizes it --
+     `is_global`, or an explicit `user_domains`/`group_domains`/
+     `device_domains` grant via the device's user, its group, or the
+     device itself directly, whichever matches first
    - `sni_show_block_page` -> `handle_block_page()` -> bump-for-denial only if
      `block_page_mode == 'redirect'`
    - final catch-all: `ssl_bump terminate step2 all`
@@ -474,27 +515,36 @@ read by `sni_helper.py handle_block_page()`:
    falls through to `http_access allow authz_allowed`, backed by
    `external_acl_type authz_check` -> `proxy/authz_helper.py decide()`.
 6. `decide(conn, client_ip, dst, path, _data)`:
-   - resolves identity via `device_identity.resolve_user(conn, client_ip)`;
-     fails closed (silently, no log) if unresolved, or logged
-     `reason="outside_lan"` if outside the configured LAN
-     (`matching.ip_in_configured_lan()`)
+   - resolves via `device_identity.resolve_device(conn, client_ip)`, then
+     `resolve_user_for_device()` for whichever user (if any) owns it; fails
+     closed (silently, no log) if no device resolves at all -- a genuinely
+     never-seen IP -- or logged `reason="outside_lan"` if outside the
+     configured LAN (`matching.ip_in_configured_lan()`)
    - `matching.find_domain()` on the decrypted `Host` (`%DST`, host:port
      split via `_split_host_port()`); denies as `unknown_domain` or
      `not_bump_mode` if the domain isn't a `bump`-mode row (this is also how
      a `redirect`-mode block-page connection, which got bumped only to be
      denied, is actually denied here)
-   - checks `domain.is_global` or `matching.user_has_domain()`
-   - **if `domain.kind == 'crunchyroll'`**: delegates to
+   - checks `matching.device_domain_reason(conn, device, domain)` (added
+     2026-08-31) -- `is_global`, or an explicit `user_domains`/
+     `group_domains`/`device_domains` grant, whichever matches first; denies
+     `reason="domain_not_assigned"` if none do
+   - **if `domain.kind == 'crunchyroll'`**: requires a resolved user at all
+     (`user_shows` has no group/device equivalent) -- denies
+     `reason="show_requires_user"` if the domain is authorized via
+     group/device but no user resolved, else delegates to
      `_decide_crunchyroll()` (see 6c below)
    - **otherwise**: `matching.path_allowed(conn, domain_id, path)` against
      `domain_paths` rows, but only enforced if the domain has *any*
      configured paths at all (`_has_any_path_rules()`) -- a domain with zero
      path rows allows any path once the domain-level check passes.
    - every branch calls `logging_util.log_access()` with a `reason` string
-     (`global_domain`, `user_domain`, `path_not_allowed`, `domain_not_assigned`,
-     `unknown_domain`, `not_bump_mode`, `outside_lan`, etc.) -- these reason
-     strings are what the dashboard's Report page displays and what makes an
-     entry "Approve"-able.
+     (`global_domain`, `user_domain`, `group_domain`, `device_domain`,
+     `path_not_allowed`, `domain_not_assigned`, `unknown_domain`,
+     `not_bump_mode`, `outside_lan`, `show_requires_user`, etc.) and a
+     `device_id` (added 2026-08-31) -- these reason strings are what the
+     dashboard's Report page displays and what makes an entry
+     "Approve"-able, now for a device/group identity too, not just a user.
 
 ### 6c. Crunchyroll-specific show resolution
 

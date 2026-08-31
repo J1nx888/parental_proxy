@@ -273,6 +273,13 @@ CREATE TABLE IF NOT EXISTS access_log (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,
     user_id     INTEGER,
+    -- Added 2026-08-31 alongside common/matching.py's device_domain_reason()
+    -- fix: which `devices` row made this request, when known. Lets the
+    -- Report page filter/act on a row by device or group even when it has
+    -- no user_id at all (a group- or device-assigned identity). No
+    -- REFERENCES clause, matching user_id's own existing convention on
+    -- this table.
+    device_id   INTEGER,
     username    TEXT NOT NULL,
     domain      TEXT NOT NULL,
     path        TEXT,
@@ -322,6 +329,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(access_log)")}
     if "approval_requested_at" not in columns:
         conn.execute("ALTER TABLE access_log ADD COLUMN approval_requested_at TEXT")
+    if "device_id" not in columns:
+        conn.execute("ALTER TABLE access_log ADD COLUMN device_id INTEGER")
 
     device_columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
     if "last_seen_at" not in device_columns:

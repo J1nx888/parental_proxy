@@ -73,10 +73,11 @@ def user_has_domain(conn: sqlite3.Connection, user_id: int, domain_id: int) -> b
 
 
 def group_has_domain(conn: sqlite3.Connection, group_id: int, domain_id: int) -> bool:
-    """v2 roadmap groundwork -- group_domains mirrors user_domains exactly,
-    but nothing in the proxy enforcement path consults it yet (groups
-    aren't identifiable at request time until the interception layer
-    exists). Used today only by the dashboard's Domains/group-filter view."""
+    """group_domains mirrors user_domains exactly. Consulted by proxy
+    enforcement via device_domain_reason() below (fixed 2026-08-31 -- this
+    function existed since the v2 roadmap groundwork but was never actually
+    called from any enforcement path until then; see that function's own
+    docstring for the bug this closed)."""
     row = conn.execute(
         "SELECT 1 FROM group_domains WHERE group_id = ? AND domain_id = ?",
         (group_id, domain_id),
@@ -85,14 +86,55 @@ def group_has_domain(conn: sqlite3.Connection, group_id: int, domain_id: int) ->
 
 
 def device_has_domain(conn: sqlite3.Connection, device_id: int, domain_id: int) -> bool:
-    """v2 roadmap groundwork, same status as group_has_domain() above --
-    device_domains grants one specific device access directly, independent
-    of any user/group assignment. Not consulted by proxy enforcement yet."""
+    """device_domains grants one specific device access directly,
+    independent of any user/group assignment. Consulted by proxy
+    enforcement via device_domain_reason() below (fixed 2026-08-31, same
+    as group_has_domain() above)."""
     row = conn.execute(
         "SELECT 1 FROM device_domains WHERE device_id = ? AND domain_id = ?",
         (device_id, domain_id),
     ).fetchone()
     return row is not None
+
+
+def device_domain_reason(conn: sqlite3.Connection, device: sqlite3.Row, domain: sqlite3.Row) -> str | None:
+    """The specific reason `device` is authorized for `domain`, or None if
+    it isn't authorized by any axis. Checked in this order: is_global, then
+    per-user (if device has a user_id), then per-group (if device has a
+    group_id), then per-device direct assignment -- the first thing that
+    matches wins.
+
+    **Fixed 2026-08-31 -- a real bug, found while scoping tighter Squid/
+    AdGuard integration (see RoadMap.md's dated entry)**: proxy/authz_helper.py
+    and proxy/sni_helper.py used to resolve identity via
+    device_identity.resolve_user() (an INNER JOIN on devices.user_id) and
+    then only ever check `is_global or user_has_domain(...)` inline -- so a
+    device assigned to a GROUP (user_id NULL) resolved to no identity at
+    all and was denied everything before even reaching a domain check, and
+    even a device that DID resolve to a user could never benefit from a
+    group_domains or device_domains grant, because nothing ever called
+    group_has_domain()/device_has_domain() at all. This function is the
+    single shared replacement for that old inline check, used by both proxy
+    helpers (which now resolve the *device* first, see
+    device_identity.resolve_device()) and controller/adguard_sync.py's
+    build_splice_deny_rules() -- one place that knows all four axes, so
+    Squid and AdGuard can never drift out of sync on what "authorized"
+    means again.
+
+    Returns a reason string (not a bare bool) so callers get their log
+    line's reason for free, matching the existing "global_domain"/
+    "user_domain" vocabulary and extending it with "group_domain"/
+    "device_domain" for the two axes this fix newly wires up.
+    """
+    if domain["is_global"]:
+        return "global_domain"
+    if device["user_id"] is not None and user_has_domain(conn, device["user_id"], domain["id"]):
+        return "user_domain"
+    if device["group_id"] is not None and group_has_domain(conn, device["group_id"], domain["id"]):
+        return "group_domain"
+    if device_has_domain(conn, device["id"], domain["id"]):
+        return "device_domain"
+    return None
 
 
 def user_has_show(conn: sqlite3.Connection, user_id: int, series_id: str) -> bool:

@@ -246,8 +246,9 @@ and its one-click "approve" action.
 |---|---|---|
 | `id`          | INTEGER | PRIMARY KEY |
 | `ts`          | TEXT    | NOT NULL (ISO-8601 UTC, `db.now_iso()`) |
-| `user_id`     | INTEGER | nullable -- NULL when `device_identity.resolve_user()` couldn't resolve an identity for the client IP (e.g. `not_authenticated`) |
-| `username`    | TEXT    | NOT NULL -- the resolved user's username, or a placeholder (`"(unauthenticated)"`) when `user_id` is NULL, see `sni_helper._log_denial()` |
+| `user_id`     | INTEGER | nullable -- NULL when the identified device has no resolvable user at all: a group- or device-only identity (see `device_domain_reason()` below), or a genuinely never-seen IP (`reason="not_authenticated"`/`"(unauthenticated)"`) |
+| `device_id`   | INTEGER | nullable, added 2026-08-31 (`ALTER TABLE`, see `common/db.py`'s `_migrate()`) -- which `devices` row made this request, when known. Lets the Report page filter/act on a row by device or group even with `user_id` NULL. No `REFERENCES` clause, matching `user_id`'s own convention on this table. Pre-migration rows have this NULL. |
+| `username`    | TEXT    | NOT NULL -- the resolved user's username; the device's own label/MAC when there's a device but no user (`device_identity.log_identity_fields()`); or `"(unauthenticated)"` when neither resolves at all |
 | `domain`      | TEXT    | NOT NULL -- the hostname actually observed (SNI or `%DST`), not the `domains.pattern` regex that matched it |
 | `path`        | TEXT    | nullable -- always NULL for SNI-layer (splice) entries, since nothing is decrypted at that layer to reveal a path |
 | `series_id`   | TEXT    | nullable -- set only for Crunchyroll show-level decisions |
@@ -501,25 +502,42 @@ convention followed by every write site. Enumerated by grepping every
 `reason=` assignment in `proxy/sni_helper.py` and `proxy/authz_helper.py`:
 
 From `proxy/sni_helper.py` (SNI/splice layer, `path` always NULL):
-- `not_authenticated` -- `handle_splice()`: `device_identity.resolve_user()`
-  found no identity for the client IP (no active `device_bindings` row, or
-  the device isn't assigned to a user).
+- `not_authenticated` -- `handle_splice()`: `device_identity.resolve_device()`
+  found no active `device_bindings` row for the client IP at all (a
+  genuinely never-seen device -- unchanged by the 2026-08-31 fix below).
 - `outside_lan` -- `handle_splice()`: client IP failed `ip_in_configured_lan()`.
 - `global_domain` -- `handle_splice()`: allowed because `domains.is_global = 1`.
-- `user_domain` -- `handle_splice()`: allowed because of an explicit `user_domains` row.
+- `user_domain` / `group_domain` / `device_domain` -- `handle_splice()`:
+  allowed via `matching.device_domain_reason()` (added 2026-08-31, closing
+  a real bug -- `group_domain`/`device_domain` previously could never fire
+  at all since nothing called `group_has_domain()`/`device_has_domain()`
+  from any enforcement path) because of an explicit `user_domains` /
+  `group_domains` / `device_domains` row, respectively.
+- `domain_not_assigned` -- `handle_splice()`: a real device identity
+  resolved, but `device_domain_reason()` found no authorization by any
+  axis (added 2026-08-31; replaces what used to be an implicit
+  `allowed=False` with no distinct reason of its own).
 - `unknown_domain` -- `handle_block_page()`: connection reached the catch-all rule and genuinely has no matching `domains` row at all (only logged when `block_page_mode != 'redirect'`, since redirect mode instead falls through to `authz_helper.decide()` which logs a richer, path-bearing version of the same case).
 
 From `proxy/authz_helper.py` (HTTP layer, bump-mode domains, `path` always populated):
 - `outside_lan` -- `decide()`: client IP failed the LAN check (mirrors the SNI-layer reason of the same name).
 - `unknown_domain` -- `decide()`: no `domains` row matches this hostname at all.
 - `not_bump_mode` -- `decide()`: a `domains` row exists but its `mode` isn't `bump` (reached via the ssl_bump `block_page` redirect path for a denied splice-mode domain).
-- `domain_not_assigned` -- `decide()`: domain exists and is `bump` mode, but is neither global nor assigned to this user.
+- `domain_not_assigned` -- `decide()`: domain exists and is `bump` mode, but `matching.device_domain_reason()` found no authorization by any axis (global, user, group, or device).
 - `path_not_allowed` -- `decide()` (generic bump domain) and `_decide_crunchyroll()` (Crunchyroll `OTHER`-shape fallback): domain permitted, but the request path matched none of its `domain_paths` patterns (only checked when the domain has at least one path rule at all).
-- `global_domain` -- `decide()`: generic bump-mode domain allowed because it's global.
-- `user_domain` -- `decide()`: generic bump-mode domain allowed via an explicit `user_domains` row.
+- `global_domain` / `user_domain` / `group_domain` / `device_domain` -- `decide()`: generic bump-mode domain allowed, via whichever axis `device_domain_reason()` matched first (see the SNI-layer entries above for `group_domain`/`device_domain`'s 2026-08-31 history).
+- `show_requires_user` -- `decide()`: a crunchyroll-kind domain IS authorized (via group/device), but no user resolved for this device at all -- `user_shows` is keyed by `user_id` only, so there's no group/device-level show list to check (added 2026-08-31, alongside the `group_domain`/`device_domain` fix).
 - `blocked_shape` -- `_decide_crunchyroll()`: `cr_urls.classify()` recognized the URL as a shape that's always denied.
 - `show_approved` / `show_not_approved` -- `_decide_crunchyroll()` (both the direct `SERIES_PAGE` case and the resolved `WATCH_PAGE`/`PLAYBACK` case): whether `matching.user_has_show()` found this `series_id` in the user's `user_shows`. Logged once per series id when a request references more than one (e.g. a playback request naming multiple objects).
 - `resolution_failed` -- `_decide_crunchyroll()`: `series_resolve.resolve_series_ids()` returned `None` (CMS API unreachable and no usable stale-positive cache entry existed for every requested object id) -- fails closed.
+
+From `dashboard/block_page_server.py` (AdGuard-side block page, added
+2026-08-31 -- this module wrote nothing to `access_log` at all before
+then):
+- `dns_tier_denied` -- `_log_block()`: every hit gets this one
+  undifferentiated reason (the server only ever sees the `Host` header, not
+  which `domains`/`devices` rule caused the DNS-tier redirect that landed
+  the browser here).
 
 `CMS_OBJECTS`-kind Crunchyroll requests (pure metadata) are never logged at
 all -- they're allowed unconditionally and return before reaching any

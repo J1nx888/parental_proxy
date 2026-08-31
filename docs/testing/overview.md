@@ -327,14 +327,69 @@ attempts/60s, built alongside the login form rather than retrofitted --
 see docs/security/overview.md §6) blocks the next attempt outright,
 including one with the actually-correct password, and resets on a
 genuine success. `tests/test_device_identity.py` is a new file for a
-previously-untested module (`resolve_user` only ever had incidental
-coverage via `tests/test_helpers_protocol.py`) -- covers the new
-`resolve_device()` directly plus retroactive direct coverage for
-`resolve_user()`. Also visually and interactively verified in a live
+previously-untested module (`resolve_user`, since replaced -- see below --
+only ever had incidental coverage via `tests/test_helpers_protocol.py`) --
+covers `resolve_device()` directly plus (as of 2026-08-31)
+`resolve_user_for_device()`, including the group-assigned-device case that
+motivated splitting it out of the original `resolve_user()`. Also visually
+and interactively verified in a live
 browser against `dashboard/dev_server.py`: the login page render,
 completing a real login through the actual rendered form (not just
 `fetch()`), and confirming `is_authenticated` flipped in the real
 on-disk dev DB afterward.
+
+**2026-08-31, "tighter Squid/AdGuard integration" pass (GH #9)**: 19 new
+tests across five files, for the group/device authorization bug fix and
+the AdGuard splice-tier enforcement gap it was found alongside (see
+`docs/security/overview.md` §3.5 for the full writeup). `tests/test_helpers_protocol.py`
+gained `_bind_ip_to_group()`/`_bind_ip_to_bare_device()` helpers and
+regression tests proving a group-assigned device now gets real
+`sni_helper`/`authz_helper` access via `group_domains`/`device_domains`
+(the core bug), plus a `show_requires_user` case for a crunchyroll-kind
+domain authorized via group/device with no resolvable user.
+`tests/test_controller_adguard_sync.py` gained `build_splice_deny_rules()`
+coverage (denies an unassigned device, excludes a user- or group-assigned
+one, ignores global/bump domains) and a `sync_once()` test confirming both
+rule sets get pushed together. `tests/test_block_page_server.py` gained
+coverage for the new `access_log` write this module didn't do before
+(a real row for a known device, a placeholder row for an unknown IP, and
+a check that the page itself still renders even if the DB write fails --
+that failure mode is deliberately swallowed, not surfaced, per this
+module's own reasoning that a kid staring at a broken page is worse than
+a silently-skipped log line). `tests/test_dashboard.py` gained Report-page
+filter-by-device/group-target tests, a legacy-`?user=`-still-works
+regression guard, and `approve_from_report()` `scope=device`/`scope=group`
+tests (including the "device not in a group" error case). Verified live
+in a browser against seeded dev data too, not just the test suite --
+filtered the Report page to one device via the new combobox, approved a
+device-only row, and confirmed the resulting `domains`/`device_domains`
+rows directly in the dev DB.
+
+**Same day, before committing any of the above**: the project owner
+reviewed and corrected the design further -- AdGuard now also checks
+per-domain assignment for bump-eligible devices, not just bump-eligibility
+alone (see `docs/security/overview.md`'s "Rework, same day" subsection).
+10 more tests: 5 in `tests/test_controller_adguard_sync.py`
+(`_insert_device_with_binding()` gained an `ignored` param) -- a
+bump-eligible device denied an unassigned non-global bump domain, then
+allowed once assigned via `device_domains`; a non-bump-eligible device
+still denied on a *global* bump domain (confirms the rework doesn't
+weaken the original hard-deny); an `ignored` device excluded from both
+`build_rules()` and `build_splice_deny_rules()` even when it would
+otherwise clearly be denied. All 26 pre-existing tests in that file kept
+passing completely unchanged through this rework, without modification --
+worth noting explicitly, since every one of them uses an `is_global=True`
+bump domain, under which the new assignment check trivially authorizes
+everyone, leaving `bump_eligible()` as the only thing that ever
+differentiated allow/deny in those fixtures, exactly as before. The other
+5 new tests, in `tests/test_dashboard.py`, cover the bypass_login-defaults-
+to-ignored UI behavior (project owner: "anything that gets the
+bypass_login should be added to ignore by default but give me the ability
+to change that later") for both `bypass_login_device()` (the quick-action
+route) and `update_device()` (the full edit form) -- the plain default, a
+device that already has an assignment keeping it, an explicit same-submit
+assignment overriding the default, and a later resave not re-forcing
+`ignored` back on. 552 tests total after this pass.
 
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see

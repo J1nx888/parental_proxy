@@ -383,8 +383,20 @@ a.stat-link.active .stat { border-color: var(--brand); box-shadow: 0 0 0 2px var
   gap: 1.25rem;
   margin-bottom: 1.5rem;
 }
-.chart-card { height: 260px; position: relative; }
-.chart-card canvas { max-height: 100%; }
+.chart-card {
+  height: 260px;
+  position: relative;
+  /* Without this, a grid item's default min-width:auto floors its track at
+     its content's intrinsic size -- Chart.js's <canvas> gets a real pixel
+     width attribute (its internal render resolution) independent of the
+     CSS width the grid actually assigns it, so that intrinsic size can
+     exceed the track and push the whole page wider than the viewport.
+     Found 2026-08-31 mobile-layout pass: at 375px wide, this pushed
+     document.documentElement.scrollWidth to 404px (real page-level
+     horizontal scroll, not just an overflowing canvas). */
+  min-width: 0;
+}
+.chart-card canvas { max-width: 100%; max-height: 100%; }
 .chart-card .empty-note {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: var(--text-muted); font-size: .85rem;

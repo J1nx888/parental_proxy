@@ -1046,6 +1046,48 @@ def _parse_filter_target(raw: str) -> dict:
     return {}
 
 
+def _report_filter_combo(all_users, all_groups, all_devices) -> list[dict]:
+    """Items for the Report page's filter combobox (data-mode="single",
+    like DEVICE_ASSIGNMENT_SELECT -- NOT data-mode="nav" like the Domains
+    page's _domains_filter_combo above, since this filter has to compose
+    with the existing status/days selects in one form and submit together
+    on Apply, rather than navigating immediately on pick)."""
+    items = [{"id": "", "label": "All kids, groups, devices"}]
+    items += [{"id": f"user:{u['id']}", "label": u["display_name"]} for u in all_users]
+    items += [{"id": f"group:{g['id']}", "label": g["name"]} for g in all_groups]
+    items += [
+        {"id": f"device:{d['id']}", "label": d["label"] or d["mac_address"]}
+        for d in all_devices
+    ]
+    return items
+
+
+def _get_report_filter(conn, args):
+    """Resolves the Report page's filter to at most one of (filtered_user,
+    filtered_group, filtered_device) -- added 2026-08-31 alongside
+    access_log.device_id (RoadMap.md's dated entry, GH #9) so a row with
+    no user_id at all (a group- or device-only identity) can still be
+    filtered/acted on. ?target= (the same combined combobox encoding the
+    Domains page already uses -- 'user:5'/'group:2'/'device:7', decoded by
+    _parse_filter_target) takes priority over the legacy ?user=<username>
+    param, kept working for any existing bookmarks/links that still point
+    at it."""
+    target = args.get("target", "")
+    if target:
+        decoded = _parse_filter_target(target)
+        if decoded.get("user_id"):
+            return conn.execute("SELECT * FROM users WHERE id = ?", (decoded["user_id"],)).fetchone(), None, None
+        if decoded.get("group_id"):
+            return None, conn.execute("SELECT * FROM groups WHERE id = ?", (decoded["group_id"],)).fetchone(), None
+        if decoded.get("device_id"):
+            return None, None, conn.execute("SELECT * FROM devices WHERE id = ?", (decoded["device_id"],)).fetchone()
+        return None, None, None
+    legacy_username = args.get("user", "")
+    if legacy_username:
+        return conn.execute("SELECT * FROM users WHERE username = ?", (legacy_username,)).fetchone(), None, None
+    return None, None, None
+
+
 def _get_filtered_target(conn, args_or_form):
     """Resolves the Domains page's filter -- either the combined ?target=
     picker or the older individual ?user_id= / ?group_id= / ?device_id=
@@ -1715,13 +1757,31 @@ def add_device():
 def bypass_login_device():
     """Quick-action from the devices list for a device awaiting login
     (Phase 4's admin-facing quick-add path, RoadMap.md): sets
-    bypass_login=1 without touching label/assignment/bump_enabled --
-    unlike update_device()'s wholesale form submit, this only ever
-    changes the one field, so it's safe to fire from a single button in
-    the list row without re-submitting the device's other settings."""
+    bypass_login=1 without touching label/bump_enabled -- unlike
+    update_device()'s wholesale form submit, this only ever changes a
+    couple fields, so it's safe to fire from a single button in the list
+    row without re-submitting the device's other settings.
+
+    **Also defaults `ignored=1` (2026-08-31, project owner's explicit
+    direction)**: a device that will never log in (this button's whole
+    purpose) commonly has no real user/group assignment either -- a smart
+    TV, a thermostat -- so defaulting it straight to `ignored` (AdGuard's
+    baseline-protection exemption, see common/policy_class.py's
+    classify_device()) saves a second manual step. Deliberately only a
+    DEFAULT: the `CASE` below skips it entirely if the device already has
+    a real `user_id`/`group_id`, so this quick action never clobbers an
+    existing assignment -- and since this only runs once, here, an admin
+    who later assigns the device (or explicitly un-ignores it) via
+    update_device() is never fought by this route re-asserting `ignored`
+    on some later, unrelated save."""
     device_id = request.form.get("device_id", "")
     conn = get_db()
-    conn.execute("UPDATE devices SET bypass_login = 1 WHERE id = ?", (device_id,))
+    conn.execute(
+        "UPDATE devices SET bypass_login = 1, "
+        "ignored = CASE WHEN user_id IS NULL AND group_id IS NULL THEN 1 ELSE ignored END "
+        "WHERE id = ?",
+        (device_id,),
+    )
     conn.commit()
     return flash_redirect("devices", "Device will no longer be asked to log in.")
 
@@ -1754,7 +1814,11 @@ DEVICE_DETAIL_BODY = """
   never complete a login flow (a smart TV, Echo, thermostat) -- it's exempted
   from the captive-portal gate (`dashboard/captive_portal_server.py`, live as
   of 2026-08-31) and falls back to its assignment above instead of a personal
-  login. <strong>SSL-Bump enabled</strong> and the device's user/group
+  login. Turning this on defaults the assignment above to <strong>Ignore</strong>
+  too (skipped if you've already picked a user or group here) -- change it
+  back to a real assignment any time afterward if this device should still
+  get AdGuard's baseline content filtering despite never logging in.
+  <strong>SSL-Bump enabled</strong> and the device's user/group
   assignment are now real, enforced settings once Phase 3's ARP-spoof +
   nftables + Squid-intercept stack (see RoadMap.md) is actually running --
   that stack is fully built and tested but has not yet been deployed against
@@ -1792,6 +1856,26 @@ def update_device():
     bump_enabled = 1 if request.form.get("bump_enabled") else 0
     bypass_login = 1 if request.form.get("bypass_login") else 0
     conn = get_db()
+
+    # Defaults bypass_login -> ignored (2026-08-31, project owner's
+    # explicit direction) -- same reasoning as bypass_login_device()'s own
+    # comment: a device that will never log in commonly has no meaningful
+    # assignment either, so default it to `ignored` the moment bypass_login
+    # is newly turned on. Deliberately narrow, so it only ever nudges a
+    # genuine default rather than fighting an admin's explicit choice:
+    #   - only fires on the actual 0->1 transition (checked against the
+    #     row's CURRENT value, not just "is the checkbox ticked this
+    #     time") -- once set, saving the form again with bypass_login
+    #     already 1 never re-forces `ignored` back on, so the admin's own
+    #     later "actually, un-ignore it" edit sticks.
+    #   - skipped entirely if this same submission explicitly picked a
+    #     user or group assignment -- an explicit assignment always wins
+    #     over the default, never silently overridden.
+    if bypass_login and not ignored and user_id is None and group_id is None:
+        current = conn.execute("SELECT bypass_login FROM devices WHERE id = ?", (device_id,)).fetchone()
+        if current is not None and not current["bypass_login"]:
+            ignored = 1
+
     conn.execute(
         "UPDATE devices SET label = ?, user_id = ?, group_id = ?, ignored = ?, "
         "bump_enabled = ?, bypass_login = ? WHERE id = ?",
@@ -1905,12 +1989,13 @@ REPORT_BODY = """
 <div class="card">
 <h2>Filter</h2>
 <form class="add-form" method="get" action="{{ url_for('report') }}">
-  <select name="user">
-    <option value="">All kids</option>
-    {% for u in all_users %}
-    <option value="{{ u.username }}" {{ 'selected' if filter_user==u.username }}>{{ u.display_name }}</option>
-    {% endfor %}
-  </select>
+  <div class="combobox" data-combobox data-mode="single" data-initial="{{ report_target }}" style="max-width:280px;">
+    <div class="combobox-current" data-combobox-current></div>
+    <input type="search" class="combobox-input" data-combobox-input placeholder="All kids, groups, devices&hellip;">
+    <div class="combobox-results" data-combobox-results></div>
+    <input type="hidden" name="target" data-combobox-hidden value="{{ report_target }}">
+    <script type="application/json" data-combobox-items>{{ report_filter_combo|tojson }}</script>
+  </div>
   <select name="status">
     <option value="">All</option>
     <option value="blocked" {{ 'selected' if filter_status=='blocked' }}>Blocked only</option>
@@ -1929,10 +2014,10 @@ REPORT_BODY = """
 
 <div class="stat-strip">
   <div class="stat"><div class="stat-value">{{ total }}</div><div class="stat-label">Requests shown</div></div>
-  <a class="stat-link {{ 'active' if filter_status=='allowed' }}" href="{{ url_for('report', user=filter_user, status='allowed', days=days) }}">
+  <a class="stat-link {{ 'active' if filter_status=='allowed' }}" href="{{ url_for('report', target=report_target, status='allowed', days=days) }}">
     <div class="stat"><div class="stat-value">{{ allowed_total }}</div><div class="stat-label">Allowed</div></div>
   </a>
-  <a class="stat-link {{ 'active' if filter_status=='blocked' }}" href="{{ url_for('report', user=filter_user, status='blocked', days=days) }}">
+  <a class="stat-link {{ 'active' if filter_status=='blocked' }}" href="{{ url_for('report', target=report_target, status='blocked', days=days) }}">
     <div class="stat"><div class="stat-value">{{ blocked_total }}</div><div class="stat-label">Blocked</div></div>
   </a>
   <div class="stat"><div class="stat-value">{{ (blocked_pct ~ '%') if total else '--' }}</div><div class="stat-label">% blocked</div></div>
@@ -1969,6 +2054,14 @@ REPORT_BODY = """
       {% if not row.allowed and row.user_id %}
       <form class="inline" method="post" action="{{ url_for('approve_from_report') }}">
         <input type="hidden" name="log_id" value="{{ row.id }}">
+        <input type="hidden" name="scope" value="user">
+        {% for k, v in redirect_kwargs.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+        <button class="add small" type="submit">Approve for {{ row.username }}</button>
+      </form>
+      {% elif not row.allowed and row.device_id %}
+      <form class="inline" method="post" action="{{ url_for('approve_from_report') }}">
+        <input type="hidden" name="log_id" value="{{ row.id }}">
+        <input type="hidden" name="scope" value="device">
         {% for k, v in redirect_kwargs.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
         <button class="add small" type="submit">Approve for {{ row.username }}</button>
       </form>
@@ -2055,12 +2148,16 @@ def _parse_report_days(value) -> int:
 
 
 def _report_redirect_kwargs(source) -> dict:
-    """Pulls the current user/status/days filter off `source` (request.args
-    for the page itself, request.form for an action taken from it) so every
-    approve/dismiss click redirects back to the same filtered view instead
-    of silently resetting it to the defaults."""
+    """Pulls the current target/status/days filter off `source`
+    (request.args for the page itself, request.form for an action taken
+    from it) so every approve/dismiss click redirects back to the same
+    filtered view instead of silently resetting it to the defaults.
+    `target` (the combined user/group/device combobox encoding) takes
+    priority over the legacy `user` param, same as _get_report_filter."""
     kwargs = {}
-    if source.get("user"):
+    if source.get("target"):
+        kwargs["target"] = source["target"]
+    elif source.get("user"):
         kwargs["user"] = source["user"]
     if source.get("status"):
         kwargs["status"] = source["status"]
@@ -2073,9 +2170,14 @@ def _report_redirect_kwargs(source) -> dict:
 @require_admin
 def report():
     conn = get_db()
-    filter_user = request.args.get("user", "")
+    filtered_user, filtered_group, filtered_device = _get_report_filter(conn, request.args)
     filter_status = request.args.get("status", "")
     days = _parse_report_days(request.args.get("days"))
+    report_target = (
+        f"user:{filtered_user['id']}" if filtered_user else
+        f"group:{filtered_group['id']}" if filtered_group else
+        f"device:{filtered_device['id']}" if filtered_device else ""
+    )
 
     # The date range applies to literally everything below (stat strip, both
     # charts, and the activity table) -- one `where_sql` built once, reused
@@ -2083,9 +2185,18 @@ def report():
     # disagree about what date/kid/status window "the Report page" means.
     where_sql = "WHERE ts >= ?"
     params: list = [db.iso_secs_ago(days * 86400)]
-    if filter_user:
+    if filtered_user:
         where_sql += " AND username = ?"
-        params.append(filter_user)
+        params.append(filtered_user["username"])
+    elif filtered_group:
+        # access_log has no group_id of its own -- resolve through the
+        # device that made the request, same join direction devices.group_id
+        # already establishes everywhere else in this app.
+        where_sql += " AND device_id IN (SELECT id FROM devices WHERE group_id = ?)"
+        params.append(filtered_group["id"])
+    elif filtered_device:
+        where_sql += " AND device_id = ?"
+        params.append(filtered_device["id"])
     if filter_status == "blocked":
         where_sql += " AND allowed = 0"
     elif filter_status == "allowed":
@@ -2130,10 +2241,13 @@ def report():
     ).fetchall()
 
     all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+    all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
+    all_devices = conn.execute("SELECT * FROM devices ORDER BY COALESCE(label, mac_address)").fetchall()
     body = render_template_string(
         REPORT_BODY, rows=rows, all_users=all_users, pending_requests=pending_requests,
-        filter_user=filter_user, filter_status=filter_status, days=days, day_options=REPORT_DAY_OPTIONS,
-        filters_active=bool(filter_user or filter_status or days != REPORT_DEFAULT_DAYS),
+        report_target=report_target, report_filter_combo=_report_filter_combo(all_users, all_groups, all_devices),
+        filter_status=filter_status, days=days, day_options=REPORT_DAY_OPTIONS,
+        filters_active=bool(filtered_user or filtered_group or filtered_device or filter_status or days != REPORT_DEFAULT_DAYS),
         redirect_kwargs=_report_redirect_kwargs(request.args),
         resolver_error=db.get_setting(conn, "cr_resolver_last_error"),
         total=total, allowed_total=allowed_total, blocked_total=blocked_total, blocked_pct=blocked_pct,
@@ -2151,17 +2265,30 @@ def report():
 @require_admin
 def approve_from_report():
     log_id = request.form.get("log_id", "")
-    # "user" = just the person who hit this (the default, and the only
-    # option the plain Recent-activity table's inline button offers).
-    # "global" = approve for everyone -- only offered from the pending-
-    # requests card, since that's the one place a per-request choice makes
-    # sense to surface.
+    # "user" = the person who hit this (the default, and what the plain
+    # Recent-activity table's inline button offers for a user-identified
+    # row). "device"/"group" (added 2026-08-31, GH #9): the same button
+    # for a device- or group-only row (no user_id at all -- see
+    # common/matching.py's device_domain_reason()). "global" = approve for
+    # everyone -- only offered from the pending-requests card, since
+    # that's the one place a per-request choice makes sense to surface.
     scope = request.form.get("scope", "user")
     redirect_kwargs = _report_redirect_kwargs(request.form)
     conn = get_db()
     row = conn.execute("SELECT * FROM access_log WHERE id = ?", (log_id,)).fetchone()
-    if row is None or row["user_id"] is None:
+    if row is None:
         return flash_redirect("report", "Couldn't find that log entry.", error=True, **redirect_kwargs)
+
+    device = (
+        conn.execute("SELECT * FROM devices WHERE id = ?", (row["device_id"],)).fetchone()
+        if row["device_id"] else None
+    )
+    if scope == "user" and row["user_id"] is None:
+        return flash_redirect("report", "This entry has no associated user.", error=True, **redirect_kwargs)
+    if scope in ("device", "group") and device is None:
+        return flash_redirect("report", "This entry has no associated device.", error=True, **redirect_kwargs)
+    if scope == "group" and device is not None and device["group_id"] is None:
+        return flash_redirect("report", "This device isn't in a group.", error=True, **redirect_kwargs)
 
     # Whatever happens below, the admin has now acted on this row -- clear
     # any outstanding "Request approval" flag so it drops off the pending
@@ -2170,6 +2297,15 @@ def approve_from_report():
     conn.commit()
 
     if row["series_id"]:
+        if scope in ("device", "group"):
+            # user_shows is keyed by user_id only -- there's no group/
+            # device-level show list (see authz_helper.decide()'s own
+            # "show_requires_user" denial for the enforcement side of this
+            # same constraint). Nothing sensible to grant here.
+            return flash_redirect(
+                "report", "Shows can only be approved for a specific kid or everyone, not a device or group.",
+                error=True, **redirect_kwargs,
+            )
         name = cr_api.series_title(row["series_id"]) or row["series_id"]
         if scope == "global":
             # user_shows has no is_global concept (unlike domains) -- "for
@@ -2225,13 +2361,26 @@ def approve_from_report():
     if scope == "global":
         if not domain["is_global"]:
             conn.execute("UPDATE domains SET is_global = 1 WHERE id = ?", (domain["id"],))
-    else:
+        label = "everyone"
+    elif scope == "device":
+        conn.execute(
+            "INSERT OR IGNORE INTO device_domains (device_id, domain_id) VALUES (?,?)",
+            (device["id"], domain["id"]),
+        )
+        label = row["username"]  # already the device's own label/MAC, see log_identity_fields()
+    elif scope == "group":
+        conn.execute(
+            "INSERT OR IGNORE INTO group_domains (group_id, domain_id) VALUES (?,?)",
+            (device["group_id"], domain["id"]),
+        )
+        label = "this group"
+    else:  # "user"
         conn.execute(
             "INSERT OR IGNORE INTO user_domains (user_id, domain_id) VALUES (?,?)",
             (row["user_id"], domain["id"]),
         )
+        label = row["username"]
     conn.commit()
-    label = "everyone" if scope == "global" else row["username"]
     return flash_redirect("report", f"Approved {row['domain']} for {label}.", **redirect_kwargs)
 
 

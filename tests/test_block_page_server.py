@@ -4,6 +4,14 @@ ephemeral port and makes real HTTP requests, since this module has no
 pure logic worth unit-testing in isolation (it's a handful of lines of
 stdlib http.server wiring; the actual "does the request produce the
 right page" behavior is what matters).
+
+Since 2026-08-31 this server also writes to access_log (see its own
+module docstring) -- tests exercising that need the `conn` fixture
+(tests/conftest.py) so db.DB_PATH points at an isolated test DB; the
+page-rendering tests above that predate this don't need it at all
+(the DB write is wrapped in its own try/except specifically so a
+missing/broken DB can never break the actual page response -- see
+`test_page_still_renders_even_if_logging_is_unreachable` below).
 """
 from __future__ import annotations
 
@@ -12,6 +20,8 @@ import http.client
 import pytest
 
 import block_page_server
+import db
+import identity
 
 
 @pytest.fixture
@@ -78,5 +88,53 @@ def test_head_and_post_also_get_the_page(server):
 
 def test_any_path_gets_the_same_page(server):
     status, body, _ = _get(server, path="/some/deep/path?query=1")
+    assert status == 403
+    assert "isn't approved" in body
+
+
+# ============================================================
+# access_log writes (added 2026-08-31 -- see module docstring / GH #9)
+# ============================================================
+
+def test_writes_access_log_row_for_a_known_device(server, conn):
+    mac = "aa:bb:cc:dd:ee:01"
+    conn.execute("INSERT INTO devices (mac_address, created_at) VALUES (?, ?)", (mac, db.now_iso()))
+    conn.commit()
+    identity.record_binding(conn, mac, "127.0.0.1", source="rtnetlink")
+
+    _get(server, host_header="crunchyroll.com")
+
+    row = conn.execute("SELECT * FROM access_log ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None
+    assert row["domain"] == "crunchyroll.com"
+    assert row["allowed"] == 0
+    assert row["reason"] == "dns_tier_denied"
+    assert row["device_id"] is not None
+    assert row["user_id"] is None  # bare device, no user assigned
+
+
+def test_writes_placeholder_row_for_an_unrecognized_ip(server, conn):
+    """The requesting IP (127.0.0.1, since the test server binds
+    localhost) has no device_bindings row at all -- same
+    "(unauthenticated)" fallback the Squid helpers use for a never-seen
+    device."""
+    _get(server, host_header="crunchyroll.com")
+
+    row = conn.execute("SELECT * FROM access_log ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None
+    assert row["username"] == "(unauthenticated)"
+    assert row["user_id"] is None
+    assert row["device_id"] is None
+
+
+def test_page_still_renders_even_if_logging_is_unreachable(server, monkeypatch):
+    """The block page itself must never break just because the DB write
+    failed -- a kid staring at a blank connection error would be strictly
+    worse than a working page with a silently-skipped log line."""
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated DB failure")
+
+    monkeypatch.setattr(block_page_server.db, "get_conn", _boom)
+    status, body, _ = _get(server, host_header="crunchyroll.com")
     assert status == 403
     assert "isn't approved" in body

@@ -33,21 +33,36 @@ default -- no worse. Port 80 gets a real page.
 
 Deliberately NOT the same Flask `/blocked` route the Squid path uses:
 that route correlates against a recent `access_log` row Squid's own
-helpers wrote, which doesn't exist here (AdGuard never touches this
-project's database at all) -- reusing it would either show nothing
-useful or, worse, correlate against an unrelated recent Squid denial
-from a different device. This server already has the one piece of
-context that matters, directly from the request itself: the `Host`
-header IS the blocked domain, no correlation needed. Deliberately no
-"Request approval" flow here (unlike /blocked) -- wiring that up would
-need its own access_log-equivalent write path; a clear, simpler
-scope for this first pass.
+helpers wrote by matching on identity+timing, which this server doesn't
+need -- it already has the one piece of context that matters, directly
+from the request itself: the `Host` header IS the blocked domain, no
+correlation required. Deliberately still no "Request approval" flow
+here (unlike /blocked) -- that would need a reactive UI wired to this
+specific write path; a clear, simpler scope for this pass.
+
+**2026-08-31 -- this module now DOES write to access_log** (see
+`_respond()` below), closing a real gap found while scoping tighter
+Squid/AdGuard integration (RoadMap.md's dated entry, GH #9): until this
+fix, "AdGuard never touches this project's database at all" was
+literally true, so every AdGuard-side block -- including the NEW
+splice-tier enforcement `controller/adguard_sync.py`'s
+`build_splice_deny_rules()` adds -- was completely invisible on the
+Report page, not even the block itself. Identity is resolved the same
+way the Squid helpers do (`common/device_identity.py`'s
+`resolve_device()`/`resolve_user_for_device()`), from the requesting
+socket's own address -- this server sees the real LAN client IP
+directly (no `%>a`-style macro needed, it's a plain HTTP server), so no
+proxy-specific translation is required.
 """
 from __future__ import annotations
 
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import db
+import device_identity
+import logging_util
 
 log = logging.getLogger("dashboard.block_page_server")
 
@@ -86,12 +101,44 @@ class _BlockPageHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:  # noqa: A002 -- matches stdlib's own signature
         log.info("%s - %s", self.address_string(), format % args)
 
+    def _log_block(self, host: str) -> None:
+        """Record this hit in access_log, same as the Squid helpers do --
+        see this module's own docstring for why this write path didn't
+        exist before 2026-08-31. A fresh connection per request (this is a
+        low-traffic, one-off HTTP server, not a long-lived process with a
+        pooled connection) -- same pattern captive_portal_server.py already
+        uses for the same reason."""
+        conn = None
+        try:
+            conn = db.get_conn()
+            device = device_identity.resolve_device(conn, self.client_address[0])
+            user = device_identity.resolve_user_for_device(conn, device) if device is not None else None
+            user_id, username, device_id = device_identity.log_identity_fields(device, user)
+            logging_util.log_access(
+                conn, user_id=user_id, username=username, domain=host, path=None,
+                allowed=False, reason="dns_tier_denied", device_id=device_id,
+            )
+            conn.commit()
+        except Exception:
+            # Best-effort: a DB hiccup here (including db.get_conn() itself
+            # failing) should never take down the actual block page a kid
+            # is looking at -- log and move on, same "never let logging
+            # break the real response" posture logging_util's own callers
+            # already have (they're allowed to raise, but this server has
+            # no equivalent of Squid retrying the whole connection on a
+            # helper failure).
+            log.warning("failed to log block-page hit for %s", host, exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
+
     def _respond(self) -> None:
         host = self.headers.get("Host", "this site")
         # Strip a trailing :port from the Host header -- browsers
         # include it for a non-default port, but showing "site.com:80"
         # to a kid asking a parent about it is just noise.
         host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        self._log_block(host)
         body = _PAGE_TEMPLATE.format(host=host).encode("utf-8")
         self.send_response(403)
         self.send_header("Content-Type", "text/html; charset=utf-8")

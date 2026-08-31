@@ -288,6 +288,85 @@ def test_approve_missing_log_entry_errors(client):
     assert "error=1" in resp.headers["Location"]
 
 
+def test_approve_from_report_scope_device_grants_device_domains_row(client, db_conn):
+    """Added 2026-08-31, GH #9: a device-only row (no user_id at all) can
+    now be approved for that specific device."""
+    import db as db_mod
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, label, created_at) VALUES ('aa:bb:cc:dd:ee:01', 'Living Room TV', ?)",
+        (db_mod.now_iso(),),
+    )
+    db_conn.commit()
+    device_id = db_conn.execute("SELECT id FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:01'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason, device_id) "
+        "VALUES (datetime('now'), NULL, 'Living Room TV', 'newsite.example', NULL, 0, 'domain_not_assigned', ?)",
+        (device_id,),
+    )
+    db_conn.commit()
+    log_id = db_conn.execute("SELECT id FROM access_log").fetchone()["id"]
+
+    resp = client.post("/report/approve", data={"log_id": log_id, "scope": "device"}, headers=_auth_header())
+    assert resp.status_code == 302
+    assert "error=1" not in resp.headers["Location"]
+
+    import matching
+    domain = matching.find_domain(db_conn, "newsite.example")
+    assert domain is not None
+    assert domain["is_global"] == 0
+    assert matching.device_has_domain(db_conn, device_id, domain["id"]) is True
+
+
+def test_approve_from_report_scope_group_requires_device_in_a_group(client, db_conn):
+    """A device with no group_id can't be approved-for-its-group -- there's
+    no group to grant the domain to."""
+    import db as db_mod
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, label, created_at) VALUES ('aa:bb:cc:dd:ee:01', 'Living Room TV', ?)",
+        (db_mod.now_iso(),),
+    )
+    db_conn.commit()
+    device_id = db_conn.execute("SELECT id FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:01'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason, device_id) "
+        "VALUES (datetime('now'), NULL, 'Living Room TV', 'newsite.example', NULL, 0, 'domain_not_assigned', ?)",
+        (device_id,),
+    )
+    db_conn.commit()
+    log_id = db_conn.execute("SELECT id FROM access_log").fetchone()["id"]
+
+    resp = client.post("/report/approve", data={"log_id": log_id, "scope": "group"}, headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_approve_from_report_scope_group_grants_group_domains_row(client, db_conn):
+    import db as db_mod
+    db_conn.execute("INSERT INTO groups (name, created_at) VALUES ('TVs', datetime('now'))")
+    db_conn.commit()
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, label, group_id, created_at) "
+        "VALUES ('aa:bb:cc:dd:ee:01', 'Living Room TV', ?, ?)",
+        (group_id, db_mod.now_iso()),
+    )
+    db_conn.commit()
+    device_id = db_conn.execute("SELECT id FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:01'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason, device_id) "
+        "VALUES (datetime('now'), NULL, 'Living Room TV', 'newsite.example', NULL, 0, 'domain_not_assigned', ?)",
+        (device_id,),
+    )
+    db_conn.commit()
+    log_id = db_conn.execute("SELECT id FROM access_log").fetchone()["id"]
+
+    resp = client.post("/report/approve", data={"log_id": log_id, "scope": "group"}, headers=_auth_header())
+    assert "error=1" not in resp.headers["Location"]
+
+    import matching
+    domain = matching.find_domain(db_conn, "newsite.example")
+    assert matching.group_has_domain(db_conn, group_id, domain["id"]) is True
+
+
 def test_approve_path_not_allowed_redirects_to_prefilled_add_path_form(client, db_conn):
     """GH #6: approving a path-blocked row used to be a silent no-op
     (re-asserting a domain assignment that already existed). It must now
@@ -338,6 +417,81 @@ def test_report_page_lists_logged_rows(client, db_conn):
     resp = client.get("/report", headers=_auth_header())
     assert resp.status_code == 200
     assert b"example.com" in resp.data
+
+
+# ============================================================
+# Report: filter by device/group target (added 2026-08-31, GH #9 --
+# access_log.device_id lets rows with no user_id at all still be
+# filtered/acted on)
+# ============================================================
+
+def _insert_device(db_conn, mac, *, label=None, group_id=None):
+    import db as db_mod
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, label, group_id, created_at) VALUES (?, ?, ?, ?)",
+        (mac, label, group_id, db_mod.now_iso()),
+    )
+    db_conn.commit()
+    return db_conn.execute("SELECT id FROM devices WHERE mac_address = ?", (mac,)).fetchone()["id"]
+
+
+def _insert_logged_for_device(db_conn, domain, device_id, *, username="Living Room TV"):
+    import db as db_mod
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason, device_id) "
+        "VALUES (?, NULL, ?, ?, NULL, 0, 'domain_not_assigned', ?)",
+        (db_mod.now_iso(), username, domain, device_id),
+    )
+    db_conn.commit()
+
+
+def test_report_filters_by_device_target(client, db_conn):
+    device_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:01", label="Living Room TV")
+    other_device_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:02", label="Kitchen Tablet")
+    _insert_logged_for_device(db_conn, "onlythistv.example", device_id)
+    _insert_logged_for_device(db_conn, "othertv.example", other_device_id, username="Kitchen Tablet")
+
+    resp = client.get(f"/report?target=device:{device_id}", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"onlythistv.example" in resp.data
+    assert b"othertv.example" not in resp.data
+
+
+def test_report_filters_by_group_target(client, db_conn):
+    db_conn.execute("INSERT INTO groups (name, created_at) VALUES ('TVs', datetime('now'))")
+    db_conn.commit()
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()["id"]
+    device_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:01", label="Living Room TV", group_id=group_id)
+    ungrouped_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:02", label="Kitchen Tablet")
+    _insert_logged_for_device(db_conn, "grouptv.example", device_id)
+    _insert_logged_for_device(db_conn, "notgrouped.example", ungrouped_id, username="Kitchen Tablet")
+
+    resp = client.get(f"/report?target=group:{group_id}", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"grouptv.example" in resp.data
+    assert b"notgrouped.example" not in resp.data
+
+
+def test_report_legacy_user_param_still_works(client, db_conn):
+    """Regression guard: ?user=<username> (pre-2026-08-31 links/bookmarks)
+    must keep working alongside the new ?target= combobox encoding."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason) "
+        "VALUES (datetime('now'), ?, 'kid1', 'kidsite.example', NULL, 1, 'global_domain')",
+        (user_id,),
+    )
+    db_conn.execute(
+        "INSERT INTO access_log (ts, user_id, username, domain, path, allowed, reason) "
+        "VALUES (datetime('now'), NULL, 'kid2', 'othersite.example', NULL, 1, 'global_domain')"
+    )
+    db_conn.commit()
+
+    resp = client.get("/report?user=kid1", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"kidsite.example" in resp.data
+    assert b"othersite.example" not in resp.data
 
 
 # ============================================================
@@ -1221,8 +1375,8 @@ def _insert_logged(db_conn, domain, allowed):
 
 def test_allowed_and_blocked_stats_link_to_status_filter(client, db_conn):
     resp = client.get("/report", headers=_auth_header())
-    assert b'href="/report?user=&amp;status=allowed&amp;days=7"' in resp.data
-    assert b'href="/report?user=&amp;status=blocked&amp;days=7"' in resp.data
+    assert b'href="/report?target=&amp;status=allowed&amp;days=7"' in resp.data
+    assert b'href="/report?target=&amp;status=blocked&amp;days=7"' in resp.data
 
 
 def test_clicking_allowed_stat_filters_page_to_allowed_only(client, db_conn):
@@ -1234,7 +1388,7 @@ def test_clicking_allowed_stat_filters_page_to_allowed_only(client, db_conn):
     assert b"blockedsite.example" not in resp.data
     # The Blocked stat link should still be present so the admin can pivot
     # straight to the other side without going through "Clear filters" first.
-    assert b'href="/report?user=&amp;status=blocked&amp;days=7"' in resp.data
+    assert b'href="/report?target=&amp;status=blocked&amp;days=7"' in resp.data
 
 
 def test_clicking_blocked_stat_filters_page_to_blocked_only(client, db_conn):
@@ -1248,8 +1402,10 @@ def test_clicking_blocked_stat_filters_page_to_blocked_only(client, db_conn):
 
 def test_stat_link_preserves_current_kid_and_days_filter(client, db_conn):
     client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()["id"]
     resp = client.get("/report?user=kid1&days=30", headers=_auth_header())
-    assert b'href="/report?user=kid1&amp;status=allowed&amp;days=30"' in resp.data
+    expected = f'href="/report?target=user:{user_id}&amp;status=allowed&amp;days=30"'.encode()
+    assert expected in resp.data
 
 
 def test_clear_filters_button_hidden_on_default_view(client):
@@ -1334,6 +1490,87 @@ def test_update_device_sets_flags_and_assigns_to_a_kid(client, db_conn):
     assert row["ignored"] == 0
     assert row["bump_enabled"] == 1
     assert row["bypass_login"] == 0
+
+
+def test_update_device_turning_on_bypass_login_defaults_to_ignored(client, db_conn):
+    """2026-08-31, project owner's explicit direction -- same default as
+    the quick-action bypass_login_device() route, but via the full edit
+    form: turning bypass_login on with no assignment picked defaults the
+    device to ignored."""
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:60"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+
+    resp = client.post(
+        "/devices/update",
+        data={"device_id": device_id, "label": "", "assignment": "", "bypass_login": "on"},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["bypass_login"] == 1
+    assert row["ignored"] == 1
+
+
+def test_update_device_bypass_login_default_does_not_override_explicit_assignment(client, db_conn):
+    """Turning bypass_login on in the SAME submission as an explicit
+    group assignment must respect that explicit choice, not silently
+    force ignored=1 over it."""
+    client.post("/groups/add", data={"name": "TVs"}, headers=_auth_header())
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()["id"]
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:61"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+
+    resp = client.post(
+        "/devices/update",
+        data={
+            "device_id": device_id, "label": "", "assignment": f"group:{group_id}",
+            "bypass_login": "on",
+        },
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["bypass_login"] == 1
+    assert row["group_id"] == group_id
+    assert row["ignored"] == 0
+
+
+def test_update_device_bypass_login_default_does_not_refire_on_a_later_save(client, db_conn):
+    """The default only fires on the actual 0->1 transition -- once set,
+    an admin's own later 'actually, assign it to a group' edit (while
+    bypass_login stays on) must stick, not get fought back to ignored on
+    every subsequent save."""
+    client.post("/groups/add", data={"name": "TVs"}, headers=_auth_header())
+    group_id = db_conn.execute("SELECT id FROM groups WHERE name = 'TVs'").fetchone()["id"]
+    client.post("/devices/add", data={"mac_address": "AA:BB:CC:DD:EE:62"}, headers=_auth_header())
+    device_id = db_conn.execute("SELECT id FROM devices").fetchone()[0]
+
+    # First save: bypass_login turns on, no assignment -> defaults to ignored.
+    client.post(
+        "/devices/update",
+        data={"device_id": device_id, "label": "", "assignment": "", "bypass_login": "on"},
+        headers=_auth_header(),
+    )
+    assert db_conn.execute("SELECT ignored FROM devices WHERE id = ?", (device_id,)).fetchone()["ignored"] == 1
+
+    # Second save: admin explicitly un-ignores it by assigning a group,
+    # bypass_login stays on the whole time.
+    resp = client.post(
+        "/devices/update",
+        data={
+            "device_id": device_id, "label": "", "assignment": f"group:{group_id}",
+            "bypass_login": "on",
+        },
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["bypass_login"] == 1
+    assert row["group_id"] == group_id
+    assert row["ignored"] == 0
 
 
 def test_device_detail_page_reminds_about_the_ca_cert_before_bump_enable(client, db_conn):
@@ -1495,6 +1732,37 @@ def test_bypass_login_requires_admin_auth(client, db_conn):
     assert db_conn.execute(
         "SELECT bypass_login FROM devices WHERE id = ?", (device_id,)
     ).fetchone()["bypass_login"] == 0
+
+
+def test_bypass_login_defaults_an_unassigned_device_to_ignored(client, db_conn):
+    """2026-08-31, project owner's explicit direction: a device that will
+    never log in commonly has no real assignment either, so bypassing it
+    defaults it straight to `ignored` (AdGuard's baseline-protection
+    exemption) too, in one action."""
+    device_id = _add_pending_device(db_conn, "aa:bb:cc:dd:ee:49")
+
+    client.post("/devices/bypass_login", data={"device_id": device_id}, headers=_auth_header())
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["bypass_login"] == 1
+    assert row["ignored"] == 1
+
+
+def test_bypass_login_does_not_override_an_existing_assignment(client, db_conn):
+    """The ignored-default is a default, not a forced override -- a
+    device already assigned to a user (or group) keeps that assignment."""
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()["id"]
+    device_id = _add_pending_device(db_conn, "aa:bb:cc:dd:ee:50")
+    db_conn.execute("UPDATE devices SET user_id = ? WHERE id = ?", (user_id, device_id))
+    db_conn.commit()
+
+    client.post("/devices/bypass_login", data={"device_id": device_id}, headers=_auth_header())
+
+    row = db_conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["bypass_login"] == 1
+    assert row["user_id"] == user_id
+    assert row["ignored"] == 0
 
 
 # ============================================================

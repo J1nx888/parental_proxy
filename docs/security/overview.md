@@ -242,12 +242,11 @@ answer, and therefore no way to challenge for a per-request login anymore.
 
 ### The replacement: resolve identity from the client's IP, not a credential
 
-`common/device_identity.py`'s `resolve_user(conn, client_ip)`:
+`common/device_identity.py`'s `resolve_device(conn, client_ip)`:
 
 ```sql
-SELECT u.* FROM device_bindings b
+SELECT d.* FROM device_bindings b
 JOIN devices d ON d.id = b.device_id
-JOIN users u ON u.id = d.user_id
 WHERE b.ipv4_address = ? AND b.active = 1
 ORDER BY b.last_seen_at DESC LIMIT 1
 ```
@@ -255,25 +254,47 @@ ORDER BY b.last_seen_at DESC LIMIT 1
 Both `sni_helper.py` (`handle_splice`, `handle_block_page`) and
 `authz_helper.py` (`decide`) call this with `%>a` (the client's source IP,
 still available on an intercepted connection) in place of the old `%LOGIN`
-field, and treat `None` — no active binding for that IP, or an unassigned
-device — exactly like the old "empty/absent `%LOGIN`" case: denied,
-logged as unidentified where the old code logged `"(unauthenticated)"`.
+field. A `None` result here — no active binding for that IP at all, a
+genuinely never-seen device — is treated exactly like the old "empty/absent
+`%LOGIN`" case: denied, logged as unidentified where the old code logged
+`"(unauthenticated)"`.
+
+**Fixed 2026-08-31 — a real, previously-shipped bug**: this used to be a
+single `resolve_user(conn, client_ip)` function that INNER JOINed straight
+through to `users` via `devices.user_id` in one query — so a device
+assigned to a GROUP (not a person) had no `users` row to join to and
+resolved to `None`, indistinguishable from "never seen at all," and was
+denied everything unconditionally. Split into `resolve_device()` above
+(the binding lookup, unchanged in behavior) plus a separate
+`resolve_user_for_device(conn, device)` (`devices.user_id -> users`, or
+`None` for an unassigned *or* group-assigned device) specifically so those
+two very different cases — "no identity resolved at all" vs. "a real,
+resolvable device identity that just isn't a *person*" — can never be
+conflated again. `common/matching.py`'s `device_domain_reason(conn, device,
+domain)` is the actual authorization check now: `is_global`, or an explicit
+`user_domains`/`group_domains`/`device_domains` grant via the device's
+user, its group, or the device itself directly. A resolved device with no
+user at all can still be fully authorized this way — see
+`proxy/authz_helper.py`'s new `reason="show_requires_user"` for the one
+remaining case that can't be evaluated without a real user (Crunchyroll's
+`user_shows` has no group/device equivalent).
 
 **This is not itself a new authentication mechanism — it deliberately has
 none.** There is no credential check anywhere in this path. "Identity" here
-means *whichever device currently holds this IP, and whichever user that
-device is administratively assigned to* (via the dashboard's `/devices`
-page, or eventually Phase 4's captive portal) — a standing assignment, not
-a per-request proof of identity. See §6 below for the trust-boundary
-consequence of that.
+means *whichever device currently holds this IP, and whichever user, group,
+or direct grant that device is administratively assigned to* (via the
+dashboard's `/devices` and `/domains` pages, or the Phase 4 captive portal)
+— a standing assignment, not a per-request proof of identity. See §6 below
+for the trust-boundary consequence of that.
 
 ### Why this is safe to rely on despite IPs changing (DHCP)
 
 `device_bindings` is keyed by MAC address, not IP — `common/identity.py`'s
 `record_binding()` handles a device's IP changing (DHCP renewal) by
 deactivating the stale `(mac, old_ip)` row and activating a fresh
-`(mac, new_ip)` one, so `resolve_user()`'s `WHERE ... AND active = 1` always
-targets whichever IP is *currently* live for that MAC, not a stale one.
+`(mac, new_ip)` one, so `resolve_device()`'s `WHERE ... AND active = 1`
+always targets whichever IP is *currently* live for that MAC, not a stale
+one.
 
 **The gap this depends on -- narrowed further, 2026-08-31**: something has
 to actually call `record_binding()` regularly when a device's IP changes
@@ -297,7 +318,7 @@ plain UDP `sendto()` to a closed port, since the controller holds no
 `CAP_NET_RAW` -- see `docs/architecture/overview.md`), letting the same
 snapshot/rtnetlink sources pick up a real device that's still on the LAN
 but hasn't generated fresh traffic on its own. During whatever window
-remains before any of these sources catches a new IP, `resolve_user()`
+remains before any of these sources catches a new IP, `resolve_device()`
 for that IP returns `None` -- the device fails toward *less* access
 (denied, not misattributed to a different user), which is the safe
 direction, but it's still a real, bounded-but-nonzero gap, not a
@@ -372,6 +393,133 @@ the one confirmed shape (key present, value `null`) and still raises
 `AdGuardError` — which `run_loop()` reports via `on_error` without
 touching AdGuard, i.e. fails closed — for a missing key or non-object
 response.
+
+### The shared authorization resolver, and closing two real gaps at once (2026-08-31, GH #9)
+
+Everything in this section so far is about the `bump`-mode hard-deny
+invariant. A separate, previously-unenforced concern: whether a device is
+even allowed a given `splice`-mode domain at all, based on the Domains
+page's per-user/group/device/everyone assignment
+(`user_domains`/`group_domains`/`device_domains`/`domains.is_global`).
+
+**Two real gaps, found together while scoping "tighter Squid/AdGuard
+integration" per the project owner's request**, both traced back to the
+same root cause and fixed with the same shared function:
+
+1. **A live bug on Squid itself, not an AdGuard-only issue.** The old
+   `resolve_user(conn, client_ip)` (§3 above, since replaced) resolved
+   straight through to a `users` row via `devices.user_id` in one query —
+   a device assigned to a **group** had no such row and resolved to
+   `None`, indistinguishable from "never seen at all," and was denied
+   unconditionally by both `authz_helper.decide()` and
+   `sni_helper.handle_splice()` before ever reaching a domain check. Even
+   a user-resolved device could never benefit from a `group_domains` or
+   `device_domains` grant — `common/matching.py`'s `group_has_domain()`
+   and `device_has_domain()` existed (built for the dashboard's Domains
+   page) but were never called from any enforcement path at all; their own
+   docstrings said so explicitly.
+2. **AdGuard enforced none of this at all.** `controller/adguard_sync.py`
+   (the module §3.4 above describes) did exactly one thing before this
+   fix: the `bump`-mode hard-deny. `splice`-mode domain assignment — the
+   content control most devices actually rely on, since bump is a
+   deliberately small curated set — was completely unenforced at the DNS
+   tier. A domain assigned to one kid was reachable by every device on the
+   LAN as long as it went through AdGuard instead of Squid.
+
+**The fix**: `common/matching.py`'s `device_domain_reason(conn, device,
+domain)` is now the single authorization check, used everywhere instead of
+each call site inlining its own version — `is_global`, then the device's
+own `user_domains` grant (if it has a `user_id`), then its `group_domains`
+grant (if it has a `group_id`), then a direct `device_domains` grant,
+first match wins. `common/device_identity.py`'s `resolve_user()` was split
+into `resolve_device()` (the binding lookup) and
+`resolve_user_for_device()` (derives the user, if any, from an
+already-resolved device) specifically so "no identity at all" and "a real
+device identity with no *person* attached" are never conflated again.
+`proxy/authz_helper.py` and `proxy/sni_helper.py` both now resolve the
+device first and call `device_domain_reason()`; `controller/adguard_sync.py`
+gained `build_splice_deny_rules()`, using the exact same `$client=`-scoped
+rule mechanism §3.4 already describes, now covering `mode='splice',
+is_global=0` domains too, pushed in the same managed block alongside the
+existing bump hard-deny.
+
+**Scope deliberately still excludes a domain with no `domains` row at
+all** — that stays default-allow at the DNS tier, unchanged from before
+this fix. Making AdGuard default-deny for a totally unconfigured domain
+(mirroring Squid's own `block_page_mode` posture) was considered and
+explicitly deferred to a separate future decision, since it's a much
+bigger behavior change (every new site anyone visits needs an explicit
+approve) that wasn't part of this pass's confirmed scope.
+
+**A second, smaller logging gap closed alongside this**:
+`dashboard/block_page_server.py` (AdGuard's kid-facing block page) wrote
+nothing to `access_log` at all before this fix — not even the block
+itself, per its own module docstring at the time ("AdGuard never touches
+this project's database at all"). It now resolves identity the same way
+the Squid helpers do and logs a row with `reason="dns_tier_denied"`,
+wrapped in a try/except so a DB hiccup there can never break the actual
+page a kid is looking at. `access_log` gained a `device_id` column (see
+`docs/database/schema.md`) so a device- or group-only row (no `user_id` at
+all) can still be filtered and reactively approved from the Report page —
+`dashboard.py`'s `approve_from_report()` now accepts `scope=device` and
+`scope=group` alongside the existing `user`/`global`, granting
+`device_domains`/`group_domains` instead of `user_domains`.
+
+### Rework, same day: AdGuard now checks domain assignment for bump-eligible devices too
+
+The section above describes the state right after GH #9 first landed:
+`build_rules()` (bump hard-deny) and `build_splice_deny_rules()` (splice
+assignment) as two separate concerns, the first keyed purely on
+bump-eligibility. **Before committing any of it, the project owner
+reviewed and corrected that model** — a bump-eligible device was still
+getting a free DNS pass to *any* `bump`-mode domain, with the actual
+per-domain assignment check left entirely to Squid's own
+`authz_helper.decide()`, after decryption. Five explicit points, the
+one that actually changed behavior: *"If a user has a device subject to
+SSL Bump, AdGuard should check the domain first and verify it is
+allowed... If the domain is not allowed it should still be blocked by
+AdGuard, never going to SSL Bump."*
+
+`build_rules()` and `build_splice_deny_rules()` are now both thin
+wrappers around one shared engine, `_build_domain_deny_rules(conn, mode,
+require_bump_eligible, ...)`. A device is authorized for a domain when
+`device_domain_reason()` returns non-`None` **and**, only when
+`require_bump_eligible=True` (i.e. `mode='bump'`), `bump_eligible()` is
+*also* true. `is_global` on a bump-mode domain still only ever means
+"assigned to everyone" — it does not skip the bump-eligibility gate; a
+non-bump-eligible device is denied a global bump domain exactly as
+before this rework. The net effect: a bump-eligible device now only gets
+a clean DNS resolution for a bump-mode domain that's actually assigned
+to it (globally, or via its user/group/device) — an unassigned one is
+blocked by AdGuard outright, and the connection never reaches Squid to
+be decrypted and denied there.
+
+**A fourth point surfaced a distinction this project already had, just
+never enforced anywhere**: *"AdGuard DNS should apply a baseline of
+protection against all devices/users/groups unless the device/user/group
+is set to bypass/ignore."* `common/policy_class.py`'s `classify_device()`
+already distinguishes `ignored` (BYPASS — "outside the whole system,
+for good") from `bypass_login` (only skips the captive-portal login
+step; the device "can still belong to a user or group" and its domain
+rules still apply — see that function's own docstring). Confirmed with
+the project owner that "bypass/ignore" here means `ignored` specifically,
+not `bypass_login`. `_build_domain_deny_rules()` now excludes any
+`classify_device() == BYPASS` device from every rule it builds, on
+either mode — defense-in-depth, since an `ignored` device's packets
+already never reach AdGuard's redirected port at all under normal
+ARP-spoofed interception (nftables' `bypass_v4` `return`).
+
+**A related UI default, the project owner's own explicit follow-up**:
+"anything that gets bypass_login should be added to ignore by default
+but give me the ability to change that later." `dashboard.py`'s
+`update_device()` and `bypass_login_device()` now default a device to
+`ignored=1` the moment `bypass_login` is newly turned on — but only as a
+default: skipped if the same submission (or the device's existing state)
+already carries a real `user_id`/`group_id`, and only fires on the actual
+0→1 transition, so it never fights a later, deliberate "actually, assign
+it somewhere" edit. This is a dashboard-side convenience, not something
+`_build_domain_deny_rules()` itself enforces — the two flags remain
+independently readable and settable at all times.
 
 ---
 
@@ -559,7 +707,7 @@ per-failure-only counter would leave open. This was built alongside the
 login form itself, not retrofitted, per this project's own standing
 security-by-design practice. It resets on a dashboard process restart
 (in-memory, no new DB table for a first pass) and would need revisiting
-if this surface is ever exposed beyond the LAN (Phase 6) — but for a
+if this surface is ever exposed beyond the LAN (Phase 7) — but for a
 LAN-scoped captive-portal login, an attacker who already needs local
 network access to even reach it is a meaningfully smaller threat model
 than an internet-facing one.
@@ -620,7 +768,7 @@ IP against the `local_network` setting — one or more space-separated CIDRs
 explicitly a second, independent layer on top of per-person proxy
 authentication — a correct username/password from outside the configured
 range was still denied. With that per-request credential gone, this check
-is now, alongside `device_identity.resolve_user()`'s device-assignment
+is now, alongside `device_identity.resolve_device()`'s device-assignment
 lookup, one of the only two things standing between arbitrary traffic
 reaching Squid's intercept ports and being treated as a specific user's
 (the third, upstream layer is nftables only ever redirecting a

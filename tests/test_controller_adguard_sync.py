@@ -13,21 +13,25 @@ import pytest
 import adguard_sync
 
 
-def _insert_domain(conn, pattern: str, mode: str = "bump") -> None:
+def _insert_domain(conn, pattern: str, mode: str = "bump", is_global: bool = True) -> int:
     conn.execute(
         "INSERT INTO domains (pattern, mode, kind, is_global, created_at) "
-        "VALUES (?, ?, 'generic', 1, datetime('now'))",
-        (pattern, mode),
+        "VALUES (?, ?, 'generic', ?, datetime('now'))",
+        (pattern, mode, int(is_global)),
     )
     conn.commit()
+    return conn.execute("SELECT id FROM domains WHERE pattern = ?", (pattern,)).fetchone()["id"]
 
 
 def _insert_device_with_binding(
-    conn, mac: str, ip: str, *, bump_enabled: bool, active: bool = True, is_authenticated: bool = True
-) -> None:
+    conn, mac: str, ip: str, *, bump_enabled: bool = False, active: bool = True,
+    is_authenticated: bool = True, user_id: int | None = None, group_id: int | None = None,
+    ignored: bool = False,
+) -> int:
     conn.execute(
-        "INSERT INTO devices (mac_address, bump_enabled, is_authenticated, created_at) VALUES (?, ?, ?, datetime('now'))",
-        (mac, int(bump_enabled), int(is_authenticated)),
+        "INSERT INTO devices (mac_address, bump_enabled, is_authenticated, user_id, group_id, ignored, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+        (mac, int(bump_enabled), int(is_authenticated), user_id, group_id, int(ignored)),
     )
     device_id = conn.execute("SELECT id FROM devices WHERE mac_address = ?", (mac,)).fetchone()["id"]
     conn.execute(
@@ -37,6 +41,13 @@ def _insert_device_with_binding(
         (device_id, mac, ip, int(active)),
     )
     conn.commit()
+    return device_id
+
+
+def _insert_group(conn, name: str) -> int:
+    conn.execute("INSERT INTO groups (name, created_at) VALUES (?, datetime('now'))", (name,))
+    conn.commit()
+    return conn.execute("SELECT id FROM groups WHERE name = ?", (name,)).fetchone()["id"]
 
 
 # ============================================================
@@ -143,6 +154,146 @@ def test_build_rules_emits_one_rule_per_bump_domain(conn):
     assert len(rules) == 2
     assert any("crunchyroll" in r for r in rules)
     assert any("some-other-bump-site" in r for r in rules)
+
+
+def test_build_rules_denies_a_bump_eligible_device_from_an_unassigned_non_global_domain(conn):
+    """The core 2026-08-31 rework: a bump-eligible device used to get a
+    free DNS pass to ANY bump-mode domain -- now AdGuard also checks
+    whether this SPECIFIC domain is actually assigned to it, same as
+    Squid's own authz_helper.decide() does after decryption."""
+    domain_id = _insert_domain(conn, "example\\.com", is_global=False)
+    _insert_device_with_binding(
+        conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=True, is_authenticated=True,
+    )
+
+    rules = adguard_sync.build_rules(conn)
+
+    assert len(rules) == 1
+    assert "192.168.1.10" in rules[0]
+
+
+def test_build_rules_allows_a_bump_eligible_device_once_the_domain_is_assigned(conn):
+    domain_id = _insert_domain(conn, "example\\.com", is_global=False)
+    device_id = _insert_device_with_binding(
+        conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=True, is_authenticated=True,
+    )
+    conn.execute("INSERT INTO device_domains (device_id, domain_id) VALUES (?, ?)", (device_id, domain_id))
+    conn.commit()
+
+    assert adguard_sync.build_rules(conn) == []
+
+
+def test_build_rules_still_denies_a_non_bump_eligible_device_even_on_a_global_domain(conn):
+    """is_global on a bump-mode domain means "assigned to everyone" --
+    it must never also mean "skip the bump-eligibility gate"."""
+    _insert_domain(conn, "example\\.com", is_global=True)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=False)
+
+    rules = adguard_sync.build_rules(conn)
+
+    assert len(rules) == 1
+    assert "192.168.1.10" in rules[0]
+
+
+def test_build_rules_excludes_an_ignored_device(conn):
+    """2026-08-31, project owner's explicit direction: "AdGuard should
+    apply a baseline of protection... unless the device/user/group is
+    set to bypass/ignore." An ignored device must never appear in a deny
+    rule, even one that would otherwise clearly be denied."""
+    _insert_domain(conn, "example\\.com", is_global=False)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=False, ignored=True)
+
+    assert adguard_sync.build_rules(conn) == []
+
+
+# ============================================================
+# build_splice_deny_rules (added 2026-08-31, see its own docstring / GH #9)
+# ============================================================
+
+def test_build_splice_deny_rules_denies_a_device_with_no_assignment(conn):
+    _insert_domain(conn, "example\\.com", mode="splice", is_global=False)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10")
+
+    rules = adguard_sync.build_splice_deny_rules(conn)
+
+    assert len(rules) == 1
+    assert "192.168.1.10" in rules[0]
+
+
+def test_build_splice_deny_rules_excludes_a_user_assigned_device(conn):
+    conn.execute(
+        "INSERT INTO users (username, display_name, password_hash, created_at) "
+        "VALUES ('kid1', 'kid1', 'x', datetime('now'))"
+    )
+    conn.commit()
+    user_id = conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()["id"]
+    domain_id = _insert_domain(conn, "example\\.com", mode="splice", is_global=False)
+    conn.execute("INSERT INTO user_domains (user_id, domain_id) VALUES (?, ?)", (user_id, domain_id))
+    conn.commit()
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", user_id=user_id)
+
+    assert adguard_sync.build_splice_deny_rules(conn) == []
+
+
+def test_build_splice_deny_rules_excludes_a_group_assigned_device(conn):
+    """The other half of the same fix common/matching.py's
+    device_domain_reason() shipped for Squid -- AdGuard now respects a
+    group_domains grant too, not just user_domains."""
+    group_id = _insert_group(conn, "TVs")
+    domain_id = _insert_domain(conn, "example\\.com", mode="splice", is_global=False)
+    conn.execute("INSERT INTO group_domains (group_id, domain_id) VALUES (?, ?)", (group_id, domain_id))
+    conn.commit()
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", group_id=group_id)
+
+    assert adguard_sync.build_splice_deny_rules(conn) == []
+
+
+def test_build_splice_deny_rules_ignores_global_domains(conn):
+    _insert_domain(conn, "example\\.com", mode="splice", is_global=True)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10")
+    assert adguard_sync.build_splice_deny_rules(conn) == []
+
+
+def test_build_splice_deny_rules_ignores_bump_mode_domains(conn):
+    """Bump-mode domains are build_rules()'s own job -- this function only
+    ever touches splice-mode, is_global=0 domains."""
+    _insert_domain(conn, "crunchyroll\\.com", mode="bump", is_global=False)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10")
+    assert adguard_sync.build_splice_deny_rules(conn) == []
+
+
+def test_build_splice_deny_rules_empty_when_no_device_has_an_ip(conn):
+    _insert_domain(conn, "example\\.com", mode="splice", is_global=False)
+    assert adguard_sync.build_splice_deny_rules(conn) == []
+
+
+def test_build_splice_deny_rules_excludes_an_ignored_device(conn):
+    """Same exclusion as build_rules() -- see its own test and
+    _build_domain_deny_rules()'s docstring."""
+    _insert_domain(conn, "example\\.com", mode="splice", is_global=False)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", ignored=True)
+
+    assert adguard_sync.build_splice_deny_rules(conn) == []
+
+
+def test_sync_once_pushes_both_bump_and_splice_rule_sets(conn, monkeypatch):
+    _insert_domain(conn, "crunchyroll\\.com", mode="bump")
+    _insert_domain(conn, "example\\.com", mode="splice", is_global=False)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=False)
+
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: [])
+    pushed = {}
+    monkeypatch.setattr(
+        adguard_sync.adguard_client, "set_custom_rules",
+        lambda base_url, u, p, rules: pushed.setdefault("rules", rules),
+    )
+
+    count = adguard_sync.sync_once(conn, "http://127.0.0.1:3000", "admin", "x")
+
+    assert count == 2  # one bump hard-deny + one splice deny, same device denied both ways
+    managed = pushed["rules"][1:-1]  # strip the begin/end markers
+    assert any("crunchyroll" in r for r in managed)
+    assert any("example" in r for r in managed)
 
 
 # ============================================================
