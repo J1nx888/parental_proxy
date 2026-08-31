@@ -69,7 +69,42 @@ yet** — it's admin bookkeeping ahead of Phase 3, the same way
 Along the way: a scalable combobox-style search/select widget replaced
 the original chip/checkbox/radio pickers everywhere a user/group/device
 needs to be chosen, so the UI doesn't degrade as the number of tracked
-entities grows past a handful.
+entities grows past a handful. That widget replaced an earlier one built
+around native `<select multiple>`/checkbox lists — dropped after the
+user asked "will holding Ctrl even work?"; the answer was to remove the
+need for Ctrl/Cmd entirely (a searchable click-to-add combobox) rather
+than explain it, which is why nothing in this app uses a native
+multi-select today.
+
+**Key decisions from this phase** (migrated 2026-08-31 from a
+since-deleted local handoff doc, `MEMORY.md`, whose narrower prose is
+folded in here rather than kept as a second, easily-stale "state of the
+project" file alongside this one and `AGENTS.md`):
+
+- **`devices.user_id`/`group_id`/`ignored` are the only source of truth
+  for assignment — deliberately no separate `assignment` enum column.**
+  An enum + `CHECK` constraint would conflict with the `ON DELETE SET
+  NULL` cascades on both foreign keys: deleting a user could leave
+  `assignment='user'` with `user_id` now `NULL`, violating a naive
+  CHECK. `CHECK (user_id IS NULL OR group_id IS NULL)` stays valid under
+  cascades because `SET NULL` only ever makes that OR-condition *more*
+  true, never less.
+- **Domain access grants use full-replace semantics.** `POST
+  /domains/access` deletes every existing grant for that domain and
+  re-inserts exactly what was submitted — granting and revoking are the
+  same action (check/uncheck a box, then save), not separate endpoints.
+- **One composite value encoding is reused everywhere a single
+  "assign to X" choice is needed** — device assignment, the Domains
+  page's owner filter, etc.: `""` (none/all) / `"ignored"` /
+  `"user:{id}"` / `"group:{id}"` / `"device:{id}"`, with one shared
+  parsing function rather than a separate boolean/id pair per field.
+- **Migration discipline**: while a table/column hasn't been pushed to
+  `origin/main` yet, its `CREATE TABLE` can just be rewritten directly.
+  Once it's live, further schema changes go through a real `ALTER
+  TABLE` inside `common/db.py`'s `_migrate()` instead (see that
+  function's own docstring), with a dedicated test that builds the
+  pre-migration shape by hand and proves the migration path works
+  against it.
 
 ---
 
