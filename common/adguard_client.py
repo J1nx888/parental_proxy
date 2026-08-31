@@ -57,6 +57,15 @@ import path, three separate Squid startup bugs this same session):
   (wrong endpoint, incompatible AdGuard version) rather than the
   confirmed benign case -- those still raise `AdGuardError` and fail
   closed, exactly as before this fix existed.
+- `/control/querylog?limit=N` (GET) returns `{"data": [...], "oldest":
+  "<timestamp>"}`, newest-first -- confirmed live 2026-08-31 by
+  generating real DNS queries against a running instance and reading
+  the response back. Each entry's `client` field is a plain IP string
+  (no MAC -- DNS carries no link-layer information) and `time` is
+  ISO8601 UTC with variable-precision fractional seconds (commonly
+  9-digit/nanosecond, e.g. `"2026-08-31T13:17:13.089285447Z"`) -- see
+  `normalize_query_log_time` below for why that can't be compared as a
+  plain string against this project's own `db.now_iso()` timestamps.
 
 No third-party dependencies -- matches common/cr_api.py's own
 urllib-based pattern, mirrored here, rather than adding `requests` to a
@@ -66,6 +75,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -229,3 +239,73 @@ def refresh_filters(base_url: str, username: str, password: str, timeout: float 
     if not isinstance(updated, int):
         raise AdGuardError("AdGuard Home's filtering/refresh response had no 'updated' count")
     return updated
+
+
+# RoadMap.md's discovery precedence: "AdGuard query-log observations
+# (confirms active IP usage)" -- the shape below is confirmed live
+# 2026-08-31 against a real AdGuard Home instance (`/control/querylog`),
+# not assumed from documentation, matching this module's own established
+# discipline.
+_QUERYLOG_TIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z$")
+
+
+def normalize_query_log_time(raw: str) -> str:
+    """AdGuard's querylog `time` field is ISO8601 UTC with variable-
+    precision fractional seconds and a bare `Z` suffix -- confirmed
+    live 2026-08-31 (e.g. `"2026-08-31T13:17:13.089285447Z"`, 9-digit/
+    nanosecond precision). `common/db.py`'s own `now_iso()` never
+    carries fractional seconds at all (`"2026-08-31T13:17:13Z"`).
+    Comparing the two formats as plain strings is unsafe: ASCII `.`
+    (0x2E) sorts before `Z` (0x5A), so a same-second fractional
+    timestamp compares as "earlier" than a whole-second one that
+    actually occurred first -- e.g. `"...13.5Z" < "...13Z"` as strings,
+    backwards from real time. Every AdGuard timestamp is truncated to
+    whole seconds through this function before it is ever stored in or
+    compared against `last_seen_at`, so the column stays uniformly
+    comparable regardless of which discovery source last touched it.
+
+    Raises AdGuardError (not a bare regex/parsing exception) if `raw`
+    doesn't match AdGuard's own confirmed shape -- a change to that
+    shape should fail loudly here rather than silently corrupt
+    last_seen_at ordering.
+    """
+    match = _QUERYLOG_TIME_RE.match(raw)
+    if not match:
+        raise AdGuardError(f"unexpected AdGuard querylog timestamp shape: {raw!r}")
+    return match.group(1) + "Z"
+
+
+def get_query_log(
+    base_url: str, username: str, password: str, limit: int = 100, timeout: float = DEFAULT_TIMEOUT
+) -> list[dict]:
+    """The most recent `limit` querylog entries, newest first -- matches
+    AdGuard's own confirmed-live ordering (`/control/querylog?limit=N`).
+    Returns the raw `data` list as-is (each entry at least has `client`
+    -- the querying device's plain IP string, no MAC, since DNS queries
+    carry no link-layer information -- and `time`, see
+    normalize_query_log_time above); callers needing anything else from
+    an entry can read it directly rather than this module re-shaping
+    every field AdGuard happens to return.
+
+    Deliberately does NOT support pagination (`older_than`) -- the one
+    caller (controller/adguard_discovery.py) only needs "what's new
+    since last poll," and a modest, fixed-size page covers normal query
+    volume between polls; missing entries within a single burst that
+    exceeds `limit` is an acceptable gap for a source whose whole role
+    is a soft freshness signal, not primary discovery (RoadMap.md's
+    discovery precedence).
+    """
+    body = _request(
+        f"{base_url.rstrip('/')}/control/querylog?limit={int(limit)}",
+        method="GET",
+        username=username,
+        password=password,
+        timeout=timeout,
+    )
+    try:
+        decoded = json.loads(body)
+    except ValueError as exc:
+        raise AdGuardError(f"malformed JSON from {base_url}/control/querylog: {exc}") from exc
+    if not isinstance(decoded, dict) or not isinstance(decoded.get("data"), list):
+        raise AdGuardError(f"{base_url}/control/querylog didn't return the expected {{'data': [...]}} shape")
+    return decoded["data"]

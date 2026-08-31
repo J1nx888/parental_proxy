@@ -50,8 +50,10 @@ _common_dir = Path(__file__).resolve().parent.parent / "common"
 if _common_dir.is_dir():
     sys.path.insert(0, str(_common_dir))
 
+import adguard_discovery
 import adguard_sync
 import discovery
+import readiness
 import rtnetlink_listener
 import health
 import sdnotify
@@ -90,10 +92,13 @@ def run(
     discovery_interval: float | None = None,
     enable_rtnetlink: bool = False,
     adguard_interval: float | None = None,
+    adguard_discovery_interval: float | None = None,
     adguard_url: str | None = None,
     adguard_username: str | None = None,
     adguard_password: str | None = None,
     block_page_ip: str | None = None,
+    worker_ready_timeout: float = 30.0,
+    adguard_ready_timeout: float = 30.0,
 ) -> None:
     """The main control loop. Runs until SIGTERM/SIGINT.
 
@@ -136,6 +141,16 @@ def run(
     the `finally` block alongside the heartbeat pacer and discovery
     task. adguard_url/adguard_username/adguard_password are required
     together with it -- see main()'s own argument validation.
+    adguard_discovery_interval, if given (not None), starts
+    controller/adguard_discovery.py's periodic querylog correlation on
+    its own background thread and its own DB connection (same reasoning
+    as discovery_interval above) -- Milestone 4's "AdGuard query-log
+    observations (confirms active IP usage)" discovery source. Only
+    refreshes last_seen_at for bindings another source already created;
+    never creates one on its own (AdGuard's query log has no MAC).
+    Independent of adguard_interval -- one pushes hard-deny rules TO
+    AdGuard, the other only reads FROM it -- both require adguard_url/
+    adguard_username/adguard_password when set.
     block_page_ip, if given, is threaded through to
     adguard_sync.build_rules() so hard-deny rules also carry a
     $dnsrewrite pointing at that IP's port 80 (see
@@ -187,17 +202,24 @@ def run(
     bug. A future pass could add a lock around client reads/writes if
     the noise proves annoying in practice.
 
-    Known race, accepted rather than fixed here given the scope of this
-    pass: the heartbeat pacer runs on its own thread and reads `client`
-    from this closure at call time. If it fires in the narrow window
-    between closing a dead client and a fresh one being assigned, its
-    heartbeat call raises AttributeError on None -- HeartbeatPacer's own
-    broad exception handling logs it via on_error rather than crashing,
-    so this is a harmless, if noisy, cosmetic race, not a correctness
-    bug. A future pass could add a lock around client reads/writes if
-    the noise proves annoying in practice.
+    worker_ready_timeout/adguard_ready_timeout (Milestone 6's readiness
+    gates, added 2026-08-31 -- see controller/readiness.py) bound how
+    long this call blocks waiting for each real dependency to actually
+    answer, rather than just having started: the initial worker connect
+    below retries for up to worker_ready_timeout seconds instead of
+    failing on the very first attempt (closing the ordinary "arp-worker
+    hasn't created its socket file yet" startup race docker-compose.yml's
+    own comment already documented as an accepted one-restart-cycle gap
+    -- this makes that restart far less often necessary, it doesn't
+    remove Docker's restart policy as the fallback if the worker is
+    genuinely never going to come up). adguard_ready_timeout similarly
+    bounds a best-effort wait for AdGuard before starting the periodic
+    sync loop and calling sdnotify.ready() -- but, unlike the worker
+    socket, never raises: AdGuard isn't required for the rest of this
+    function, and adguard_sync.py's own run_loop() already retries
+    forever on its own schedule regardless of this gate's outcome.
     """
-    client = WorkerClient.connect(socket_path)
+    client = readiness.wait_for_worker(socket_path, timeout=worker_ready_timeout)
     applied: AppliedState | None = None
     sequence = 0
     stop = False
@@ -254,6 +276,9 @@ def run(
 
     adguard_task = None
     if adguard_interval is not None:
+        readiness.wait_for_adguard(
+            adguard_url, adguard_username, adguard_password, timeout=adguard_ready_timeout
+        )
         adguard_task = adguard_sync.run_loop(
             adguard_interval,
             adguard_url,
@@ -261,6 +286,16 @@ def run(
             adguard_password,
             block_page_ip=block_page_ip,
             on_error=lambda exc: log.warning("adguard sync failed: %s", exc),
+        )
+
+    adguard_discovery_task = None
+    if adguard_discovery_interval is not None:
+        adguard_discovery_task = adguard_discovery.run_loop(
+            adguard_discovery_interval,
+            adguard_url,
+            adguard_username,
+            adguard_password,
+            on_error=lambda exc: log.warning("adguard discovery correlation failed: %s", exc),
         )
 
     sdnotify.ready()
@@ -297,6 +332,8 @@ def run(
             rtnetlink_task.stop()
         if adguard_task is not None:
             adguard_task.stop()
+        if adguard_discovery_task is not None:
+            adguard_discovery_task.stop()
         try:
             client.shutdown("controller_requested")
         except WorkerConnectionError:
@@ -406,6 +443,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--heartbeat-interval", type=float, default=2.0)
     parser.add_argument("--poll-interval", type=float, default=5.0)
     parser.add_argument(
+        "--worker-ready-timeout", type=float, default=30.0,
+        help="Seconds to retry connecting to --socket before giving up "
+        "(controller/readiness.py, Milestone 6) -- turns the ordinary "
+        "arp-worker-hasn't-created-its-socket-yet startup race into a fast "
+        "in-process retry instead of a full container restart cycle.",
+    )
+    parser.add_argument(
+        "--adguard-ready-timeout", type=float, default=30.0,
+        help="Seconds to wait for AdGuard's API to answer before starting the "
+        "periodic sync loop anyway (controller/readiness.py, Milestone 6). "
+        "Only relevant when --adguard-url is set; never blocks startup "
+        "indefinitely or fails hard -- the periodic sync keeps retrying on "
+        "its own schedule regardless of this timeout's outcome.",
+    )
+    parser.add_argument(
         "--db-path",
         help="Use the real devices/device_bindings tables (Milestone 4) as the "
         "desired-state source instead of the placeholder, and enable health/"
@@ -452,6 +504,20 @@ def main(argv: list[str] | None = None) -> int:
         "at all if --adguard-url is set).",
     )
     parser.add_argument(
+        "--adguard-discovery-interval", type=float, default=60.0,
+        help="Seconds between controller/adguard_discovery.py querylog "
+        "correlation cycles -- Milestone 4's 'confirms active IP usage' "
+        "discovery source (only runs at all if --adguard-url is set). Longer "
+        "than --adguard-interval by default since this is a soft freshness "
+        "signal, not enforcement.",
+    )
+    parser.add_argument(
+        "--no-adguard-discovery", action="store_true",
+        help="Disable the querylog correlation loop even when --adguard-url is "
+        "set -- e.g. if AdGuard's query log is disabled/rotated too fast to be "
+        "useful in a given deployment.",
+    )
+    parser.add_argument(
         "--dashboard-url",
         help="Same value as the dashboard's own DASHBOARD_URL env var, e.g. "
         "http://192.168.1.50:8787 -- if set (and its host is a plain IPv4 "
@@ -474,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     discovery_interval: float | None = None
     enable_rtnetlink = False
     adguard_interval: float | None = None
+    adguard_discovery_interval: float | None = None
     if args.db_path:
         if not args.gateway_ip or not args.gateway_mac:
             parser.error("--db-path requires --gateway-ip and --gateway-mac")
@@ -497,6 +564,12 @@ def main(argv: list[str] | None = None) -> int:
             # opens its own connection internally, reading the DB
             # policy-state discovery already keeps current.
             adguard_interval = args.adguard_interval
+            if not args.no_adguard_discovery:
+                # adguard_discovery.run_loop() opens its own connection
+                # internally too, same reasoning as discovery_interval
+                # above -- only meaningful alongside adguard_interval
+                # since both require the same adguard_url/credentials.
+                adguard_discovery_interval = args.adguard_discovery_interval
     else:
         provider = placeholder_desired_state
 
@@ -510,10 +583,13 @@ def main(argv: list[str] | None = None) -> int:
         discovery_interval=discovery_interval,
         enable_rtnetlink=enable_rtnetlink,
         adguard_interval=adguard_interval,
+        adguard_discovery_interval=adguard_discovery_interval,
         adguard_url=args.adguard_url,
         adguard_username=args.adguard_username,
         adguard_password=args.adguard_password,
         block_page_ip=_parse_block_page_ip(args.dashboard_url),
+        worker_ready_timeout=args.worker_ready_timeout,
+        adguard_ready_timeout=args.adguard_ready_timeout,
     )
     return 0
 

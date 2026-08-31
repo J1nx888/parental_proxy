@@ -137,6 +137,49 @@ def active_binding_ip(conn: sqlite3.Connection, device_id: int) -> str | None:
     return row["ipv4_address"] if row is not None else None
 
 
+def touch_binding_by_ip(
+    conn: sqlite3.Connection,
+    ipv4_address: str,
+    seen_at: str,
+    source: str = "adguard",
+) -> bool:
+    """Refreshes last_seen_at for the currently-ACTIVE device_bindings
+    row for this IP -- WITHOUT creating a new binding and WITHOUT
+    touching its mac_address/device_id/confidence -- for sources that
+    only ever observe an IP, never a MAC (AdGuard's query log is the
+    only caller today: DNS queries carry no link-layer information), so
+    they can never discover a brand-new binding on their own, only
+    confirm an already-known one is still actively in use (RoadMap.md's
+    discovery precedence: "AdGuard query-log observations (confirms
+    active IP usage)"). Contrast with record_binding above, which
+    always has a MAC and can create/reassign bindings.
+
+    Only updates if `seen_at` is strictly newer than the binding's
+    current last_seen_at -- a page of query-log history can include
+    entries a previous poll already accounted for, and this must never
+    regress last_seen_at backward. Callers must pass `seen_at` already
+    normalized to this project's own db.now_iso() format (see
+    common/adguard_client.py's normalize_query_log_time) -- comparing
+    differently-shaped ISO8601 timestamps as plain strings is unsafe.
+
+    Returns whether it actually updated anything (no active binding for
+    this IP at all, or seen_at wasn't newer, both return False) -- purely
+    informational for the caller's own logging/counting, not required
+    for correctness.
+    """
+    row = conn.execute(
+        "SELECT id, last_seen_at FROM device_bindings WHERE ipv4_address = ? AND active = 1",
+        (ipv4_address,),
+    ).fetchone()
+    if row is None or seen_at <= row["last_seen_at"]:
+        return False
+    conn.execute(
+        "UPDATE device_bindings SET last_seen_at = ?, source = ? WHERE id = ?",
+        (seen_at, source, row["id"]),
+    )
+    return True
+
+
 def record_network_event(
     conn: sqlite3.Connection,
     event_type: str,

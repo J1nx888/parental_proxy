@@ -226,3 +226,74 @@ def test_refresh_filters_rejects_a_response_with_no_updated_count(monkeypatch):
     monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({}))
     with pytest.raises(adguard_client.AdGuardError, match="updated"):
         adguard_client.refresh_filters("http://127.0.0.1:3000", "admin", "x")
+
+
+# ============================================================
+# normalize_query_log_time
+# ============================================================
+
+def test_normalize_query_log_time_truncates_nanosecond_fraction():
+    # The exact shape confirmed live 2026-08-31 against a real AdGuard
+    # Home instance's /control/querylog response.
+    assert (
+        adguard_client.normalize_query_log_time("2026-08-31T13:17:13.089285447Z")
+        == "2026-08-31T13:17:13Z"
+    )
+
+
+def test_normalize_query_log_time_handles_no_fractional_seconds_at_all():
+    assert adguard_client.normalize_query_log_time("2026-08-31T13:17:13Z") == "2026-08-31T13:17:13Z"
+
+
+def test_normalize_query_log_time_handles_short_fractional_seconds():
+    assert adguard_client.normalize_query_log_time("2026-08-31T13:17:13.5Z") == "2026-08-31T13:17:13Z"
+
+
+def test_normalize_query_log_time_rejects_unexpected_shape():
+    with pytest.raises(adguard_client.AdGuardError, match="timestamp shape"):
+        adguard_client.normalize_query_log_time("not-a-timestamp")
+
+
+def test_normalize_query_log_time_rejects_missing_z_suffix():
+    with pytest.raises(adguard_client.AdGuardError, match="timestamp shape"):
+        adguard_client.normalize_query_log_time("2026-08-31T13:17:13.089285447+00:00")
+
+
+# ============================================================
+# get_query_log
+# ============================================================
+
+def test_get_query_log_returns_the_data_list(monkeypatch):
+    entries = [
+        {"client": "192.168.1.10", "time": "2026-08-31T13:17:13.089285447Z"},
+        {"client": "192.168.1.11", "time": "2026-08-31T13:17:12Z"},
+    ]
+    monkeypatch.setattr(
+        adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({"data": entries, "oldest": ""})
+    )
+    assert adguard_client.get_query_log("http://127.0.0.1:3000", "admin", "x") == entries
+
+
+def test_get_query_log_uses_the_limit_query_param(monkeypatch):
+    captured = {}
+
+    def fake_open(request, timeout=None):
+        captured["url"] = request.full_url
+        return _json_response({"data": [], "oldest": ""})
+
+    monkeypatch.setattr(adguard_client._OPENER, "open", fake_open)
+    adguard_client.get_query_log("http://127.0.0.1:3000", "admin", "x", limit=25)
+
+    assert captured["url"] == "http://127.0.0.1:3000/control/querylog?limit=25"
+
+
+def test_get_query_log_rejects_a_response_missing_the_data_list(monkeypatch):
+    monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({"oldest": ""}))
+    with pytest.raises(adguard_client.AdGuardError, match="data"):
+        adguard_client.get_query_log("http://127.0.0.1:3000", "admin", "x")
+
+
+def test_get_query_log_rejects_a_non_dict_top_level_response(monkeypatch):
+    monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response(["not", "a", "dict"]))
+    with pytest.raises(adguard_client.AdGuardError, match="data"):
+        adguard_client.get_query_log("http://127.0.0.1:3000", "admin", "x")

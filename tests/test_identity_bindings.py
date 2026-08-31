@@ -185,3 +185,58 @@ def test_record_network_event_stores_arbitrary_payload_as_json(conn):
     row = _events(conn)[0]
     assert row["event_type"] == "device_seen"
     assert json.loads(row["payload_json"]) == {"band": "5ghz", "attached_to": "satellite-1"}
+
+
+# ------------------------------------------------------------- touch_binding_by_ip
+# (Milestone 4's AdGuard query-log discovery source -- see
+# controller/adguard_discovery.py, which is the one real caller.)
+
+def test_touch_binding_by_ip_refreshes_last_seen_at_for_an_active_binding(conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink", seen_at="2026-08-29T00:00:00Z")
+
+    updated = identity.touch_binding_by_ip(conn, IP_1, "2026-08-29T01:00:00Z")
+
+    assert updated is True
+    row = _bindings(conn)[0]
+    assert row["last_seen_at"] == "2026-08-29T01:00:00Z"
+    assert row["source"] == "adguard"
+    assert row["mac_address"] == MAC_A  # unchanged -- this call never touches identity
+
+
+def test_touch_binding_by_ip_does_not_regress_last_seen_at_backward(conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink", seen_at="2026-08-29T02:00:00Z")
+
+    updated = identity.touch_binding_by_ip(conn, IP_1, "2026-08-29T01:00:00Z")
+
+    assert updated is False
+    row = _bindings(conn)[0]
+    assert row["last_seen_at"] == "2026-08-29T02:00:00Z"
+    assert row["source"] == "rtnetlink"  # unchanged -- the stale touch never applied
+
+
+def test_touch_binding_by_ip_is_a_no_op_when_seen_at_is_not_strictly_newer(conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink", seen_at="2026-08-29T00:00:00Z")
+
+    updated = identity.touch_binding_by_ip(conn, IP_1, "2026-08-29T00:00:00Z")
+
+    assert updated is False
+
+
+def test_touch_binding_by_ip_returns_false_when_no_active_binding_exists_for_the_ip(conn):
+    assert identity.touch_binding_by_ip(conn, "192.168.1.99", "2026-08-29T00:00:00Z") is False
+
+
+def test_touch_binding_by_ip_ignores_an_inactive_binding_for_the_same_ip(conn):
+    # IP_1 gets reassigned from MAC_A to MAC_B -- record_binding's own
+    # conflict handling deactivates MAC_A's binding for IP_1.
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink", seen_at="2026-08-29T00:00:00Z")
+    identity.record_binding(conn, MAC_B, IP_1, source="rtnetlink", seen_at="2026-08-29T01:00:00Z")
+
+    updated = identity.touch_binding_by_ip(conn, IP_1, "2026-08-29T02:00:00Z")
+
+    assert updated is True
+    rows = {row["mac_address"]: row for row in _bindings(conn)}
+    assert rows[MAC_A]["active"] == 0
+    assert rows[MAC_A]["last_seen_at"] == "2026-08-29T00:00:00Z"  # untouched
+    assert rows[MAC_B]["active"] == 1
+    assert rows[MAC_B]["last_seen_at"] == "2026-08-29T02:00:00Z"  # this is the one that got touched
