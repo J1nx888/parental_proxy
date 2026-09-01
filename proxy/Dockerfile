@@ -9,7 +9,18 @@ FROM debian:bookworm-slim
 # The sed below forces the base image's apt sources to HTTPS -- see
 # controller/Dockerfile's own comment on this same fix for the full
 # story (a live-confirmed plain-HTTP apt fetch corruption against
-# deb.debian.org, HTTPS unaffected).
+# deb.debian.org, HTTPS unaffected). debian:bookworm-slim ships with NO
+# ca-certificates package at all (confirmed live: zero files under
+# /etc/ssl/certs, dpkg has no ca-certificates entry) -- switching it
+# straight to HTTPS is a chicken-and-egg problem, since apt can't
+# TLS-verify the mirror to fetch the very package that would let it
+# verify anything. Bootstrapped by copying the CA bundle from
+# python:3.12-slim (already used elsewhere in this repo's own images,
+# confirmed to already carry a real, current `ca-certificates` package)
+# -- a plain file copy of a standard root bundle, not a relaxation of
+# TLS verification. The real `ca-certificates` package below then
+# installs/reconciles it properly via apt for everything after this.
+COPY --from=python:3.12-slim /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update && apt-get install -y --no-install-recommends \
         squid-openssl \

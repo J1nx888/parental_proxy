@@ -15,9 +15,15 @@ FROM debian:bookworm-slim
 # The sed below forces the base image's apt sources to HTTPS -- see
 # controller/Dockerfile's own comment on this same fix for the full
 # story (a live-confirmed plain-HTTP apt fetch corruption against
-# deb.debian.org, HTTPS unaffected).
+# deb.debian.org, HTTPS unaffected). debian:bookworm-slim ships with no
+# ca-certificates at all, a chicken-and-egg problem for switching it to
+# HTTPS -- bootstrapped by copying the CA bundle from python:3.12-slim
+# (see proxy/Dockerfile's own copy of this comment for the full
+# reasoning: a plain file copy of a standard root bundle, not a
+# relaxation of TLS verification).
+COPY --from=python:3.12-slim /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
-    && apt-get update && apt-get install -y --no-install-recommends nftables \
+    && apt-get update && apt-get install -y --no-install-recommends ca-certificates nftables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /pp-nftables-manager /usr/local/bin/pp-nftables-manager
 
