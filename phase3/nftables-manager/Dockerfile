@@ -12,7 +12,12 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /pp-nftables-manager ./cmd/pp-nftables-manager
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends nftables \
+# The sed below forces the base image's apt sources to HTTPS -- see
+# controller/Dockerfile's own comment on this same fix for the full
+# story (a live-confirmed plain-HTTP apt fetch corruption against
+# deb.debian.org, HTTPS unaffected).
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends nftables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /pp-nftables-manager /usr/local/bin/pp-nftables-manager
 

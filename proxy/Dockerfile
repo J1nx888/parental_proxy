@@ -6,7 +6,12 @@ FROM debian:bookworm-slim
 # http_port option 'ssl-bump'" on the plain package. squid-openssl is the
 # same version, built --with-openssl instead, and is what this project's
 # entire ssl_bump config depends on.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# The sed below forces the base image's apt sources to HTTPS -- see
+# controller/Dockerfile's own comment on this same fix for the full
+# story (a live-confirmed plain-HTTP apt fetch corruption against
+# deb.debian.org, HTTPS unaffected).
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
         squid-openssl \
         openssl \
         python3 \
@@ -41,7 +46,7 @@ RUN mkdir -p /opt/parental-proxy/defaults /config \
 
 COPY common/*.py /opt/parental-proxy/
 COPY proxy/sni_helper.py proxy/authz_helper.py /opt/parental-proxy/
-COPY defaults/seed_defaults.py /opt/parental-proxy/defaults/
+COPY defaults/seed_defaults.py defaults/ai_sites_seed.py /opt/parental-proxy/defaults/
 COPY proxy/squid.conf.template /etc/squid/squid.conf.template
 COPY proxy/entrypoint.sh /entrypoint.sh
 

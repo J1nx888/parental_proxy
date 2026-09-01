@@ -13,7 +13,20 @@ FROM python:3.12-slim
 # or directory: 'ip'", silently (discovery.run_loop's own on_error just
 # logs a warning and keeps retrying, so this never crashed the
 # container -- it just never actually discovered anything).
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+#
+# The sed below forces the base image's apt sources to HTTPS. Confirmed
+# live 2026-09-01 on the smoke-test VM: plain `http://deb.debian.org`
+# consistently failed apt's clearsign parser ("Clearsigned file isn't
+# valid, got 'NOSPLIT'") while `curl`-fetching the exact same URL over
+# plain HTTP from the VM's host network returned the identical
+# (byte-for-byte diffed) file every time -- something between this
+# Docker host's container network path and the mirror mangles the plain
+# HTTP response specifically for apt's fetcher, not a corrupted upstream
+# file. HTTPS to the same host is unaffected. Not investigated further
+# (a Docker-layer or intermediate-network HTTP quirk, orthogonal to this
+# project); routing apt around it is the pragmatic fix.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

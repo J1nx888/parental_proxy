@@ -23,7 +23,13 @@ COPY dashboard/static /app/static
 # equivalent in practice and is the standard fix for a non-root
 # interpreter needing a privileged port (the same pattern node/python
 # images needing port 80/443 commonly use).
-RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin \
+#
+# The sed below forces the base image's apt sources to HTTPS -- see
+# controller/Dockerfile's own comment on this same fix for the full
+# story (a live-confirmed plain-HTTP apt fetch corruption against
+# deb.debian.org, HTTPS unaffected).
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends libcap2-bin \
     && rm -rf /var/lib/apt/lists/* \
     && setcap 'cap_net_bind_service=+ep' "$(readlink -f "$(which python3)")"
 
