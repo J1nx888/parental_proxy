@@ -578,7 +578,8 @@ admin auth required, and an imported row lands exactly as
 `add_device()`'s own plain-Unassigned shape (no user/group/ignored).
 First file-upload test in this suite -- Flask's test client accepts a
 `(BytesIO, filename)` tuple for a multipart field with no new fixtures
-needed. 675 passed, 30 skipped (Windows), zero regressions. Live-verified
+needed. 675 passed, 30 skipped (Windows), 705 passed/0 skipped on
+Linux, zero regressions. Live-verified
 against the real smoke-test VM the same day: a real `curl -F
 csv_file=@...` multipart upload against the actual running dashboard
 (valid row, valid row, invalid-MAC row, duplicate row) came back with

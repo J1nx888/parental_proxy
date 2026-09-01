@@ -3031,7 +3031,8 @@ label/assignment. 9 new tests in `tests/test_dashboard.py` (header
 auto-detection, headerless CSV, duplicate-skip-without-clobbering,
 invalid-MAC-row skipping, empty-file and no-file error paths, admin-auth
 required, imported rows are plain unassigned). 675 passed, 30 skipped
-(Windows), zero regressions.
+(Windows), 705 passed/0 skipped on Linux (confirmed on the smoke-test
+VM the same day), zero regressions.
 
 **Live-verified 2026-09-01** against the real smoke-test VM: a real CSV
 (`aa:bb:cc:dd:ee:f1,Living Room TV` / `aa:bb:cc:dd:ee:f2,Kids Tablet` /
