@@ -5,7 +5,11 @@ tree as of 2026-08-28, **updated 2026-08-30 for Squid's move to intercept
 mode** (see `docs/review-2026-08-28.md` for the earlier live-testing
 bugfix history referenced throughout this doc, and RoadMap.md's "Squid:
 explicit-proxy-with-login -> transparent intercept" section for the
-architecture change itself).
+architecture change itself). **Re-audited 2026-09-02** against the
+merged `fix/cross-tier-domain-enforcement` branch (Phase 8 categories/
+schedules, G3/G6, the Events page) -- §1's file tree, §7's route groups,
+and the dashboard's line count were the parts that had actually gone
+stale; everything else held up.
 
 This is a parental-control **transparent, intercepting proxy**: a single
 Squid instance with SSL-Bump enabled, sitting between LAN clients and the
@@ -25,22 +29,73 @@ assigned to which user and which are SSL-Bump-enabled.
 ```
 common/                      shared Python modules, imported by both containers
   db.py                        SQLite schema (SCHEMA string) + get_conn()/init_db()
-  auth.py                      PBKDF2-SHA256 password hashing (hash_password/verify_password)
+  auth.py                      PBKDF2-SHA256 password hashing (hash_password/verify_password),
+                                verify_admin_credentials() (shared by dashboard.py's Basic-Auth
+                                check and captive_portal_server.py's portal-side admin action)
   matching.py                  domain/path regex matching, LAN CIDR check;
                                 device_domain_reason(conn, device, domain) -- the shared
                                 is_global/user/group/device authorization check (added
                                 2026-08-31), used by both proxy helpers and
-                                controller/adguard_sync.py's build_splice_deny_rules()
+                                controller/adguard_sync.py's build_splice_deny_rules();
+                                also category_applies_to_device()/schedule_applies_to_device()
+                                (Phase 8) and MAX_SCOPED_CATEGORY_DOMAINS (the 5,000-domain
+                                per-client-scoping threshold)
   device_identity.py           resolve_device(conn, client_ip) -- source IP -> device_bindings ->
                                 the devices row itself (Squid's identity source since 2026-08-30);
                                 resolve_user_for_device(conn, device) -- devices.user_id -> users row,
                                 or None for an unassigned/group-assigned device (split from a single
                                 resolve_user() 2026-08-31 -- see matching.device_domain_reason())
+  identity.py                   record_binding() -- the discovery-side write path into
+                                device_bindings, MAC/IP conflict handling, and Phase 4's
+                                auto-gate-new-devices behavior (see §9)
+  policy_class.py               PolicyClass enum + classify_device() (bypass > quarantine >
+                                authenticated/preauth precedence) and bump_eligible() --
+                                consumed by controller/policy_state.py, not the proxy directly
   logging_util.py              log_access() -- deduped access-log writer
   squid_helper.py              shared stdin/stdout protocol loop (run())
   series_resolve.py            Crunchyroll object-id -> series-id cache (resolve_series_ids())
   cr_api.py                    Crunchyroll CMS API client (TokenManager, SeriesResolver)
   cr_urls.py                   Crunchyroll URL classifier (classify(), RequestKind enum)
+  adguard_client.py             stdlib REST client for AdGuard Home's control API -- custom
+                                filtering rules, SafeSearch, native filter-list subscriptions
+                                (add_url/remove_url/set_url), query-log reads
+  system_events.py              log_event()/failure_recovery_callbacks() -- the admin-visible
+                                Events page's write side (Phase 11, see §9)
+  schedule_eval.py               Phase 8: schedule_is_active()/is_full_lockout_active(), stdlib
+                                zoneinfo, handles an overnight window (e.g. bedtime) explicitly
+  blocklist_parser.py           Phase 8: parse_hostlist() -- the three real subscription-list
+                                formats (bare domain-per-line, hosts-file, AdGuard/adblock)
+  category_fetch.py             Phase 8: fetch_and_sync_category() -- HTTP GETs a category's
+                                subscription_url, replaces only its source='subscription' rows
+  sdnotify.py                    stdlib-only systemd sd_notify client (READY=1/WATCHDOG=1),
+                                used by the controller's heartbeat pacer
+
+controller/                   Python control-plane container (added 2026-08-30, see
+                                docker-compose.yml's "interception" profile below)
+  main.py                       run()/run_cycle() -- the real control loop: worker IPC,
+                                heartbeat pacer, and every periodic sync/discovery task below,
+                                each wired through system_events.failure_recovery_callbacks()
+  policy_state.py               compute_desired_policy() -- classify_device() per device plus
+                                Phase 8's lockout_all schedule overlay, written to
+                                interception_runtime.desired_policy_json for the Go side to read
+  desired_state.py              db_backed_desired_state() -- which devices are real ARP-worker
+                                targets at all (active device_bindings, non-ignored)
+  reconcile.py                  order-insensitive idempotent reconciliation against the worker
+  ipc_client.py / lease.py      WorkerClient (Unix-socket IPC to phase3/arp-worker) / HeartbeatPacer
+  discovery.py                  periodic `ip neigh` snapshot -> identity.record_binding()
+  rtnetlink_listener.py         live kernel neighbor-table event listener (pyroute2) -- the
+                                highest-precedence discovery source, no discrete per-cycle
+                                success concept (see §9)
+  active_scan.py                rate-limited active ARP nudge for stale/onboarding bindings
+  adguard_sync.py                build_rules()/build_splice_deny_rules()/
+                                build_category_deny_rules()/sync_category_subscriptions()/
+                                sync_safesearch() -- everything pushed to AdGuard's custom
+                                rules + native filter/SafeSearch settings (see §2's AdGuard bullet)
+  adguard_discovery.py           reads AdGuard's own query log to refresh device_bindings.last_seen_at
+  health.py / readiness.py      interception_runtime health-column writer / worker+AdGuard
+                                startup readiness waits
+  periodic.py                    PeriodicTask -- the shared interval-task primitive every loop
+                                above builds on (on_error/on_success callbacks)
 
 proxy/                        Squid container
   Dockerfile                    debian:bookworm-slim + squid-openssl
@@ -52,9 +107,16 @@ proxy/                        Squid container
   authz_helper.py               external_acl_type for the HTTP-layer decision (decide())
 
 dashboard/                    Flask container
-  dashboard.py                  all routes: users, domains, paths, shows, report, settings, /ca-cert
+  dashboard.py                  all routes: users, domains, categories, schedules, devices,
+                                groups, paths, shows, report, events, health, settings, /ca-cert
+  captive_portal_server.py      Phase 4: the forced-enrollment login server (see §9)
+  block_page_server.py          the kid-facing block page, run as its own process (see §9's
+                                network_mode: host note)
+  dev_server.py                  local-only launcher for manual/visual testing against a real
+                                browser without a full Docker stack -- not part of any image
   Dockerfile                    python:3.12-slim + waitress
-  requirements.txt              flask>=3.0, waitress>=3.0
+  requirements.txt              flask>=3.0, waitress>=3.0, tzdata>=2024.1 (Phase 8 -- see
+                                controller/requirements.txt's own comment on the same package)
 
 defaults/
   seed_defaults.py              idempotent first-run seed data (seed())
@@ -380,14 +442,22 @@ the dashboard (running as the same `proxy` user) ever opens the database.
   called by every entry point (`squid_helper.run()`, `dashboard.get_db()`,
   `seed_defaults.py main()`), so schema creation is idempotent and doesn't
   depend on ordering between containers.
-- Tables: `settings` (key/value, e.g. `local_network`, `block_page_mode`,
-  `admin_username`, `admin_password_hash`, `secret_key`), `users`, `domains`
-  (`mode` CHECK IN splice/bump/trusted, `kind` CHECK IN generic/crunchyroll,
-  `is_global`), `user_domains` (per-user domain grants), `domain_paths`
-  (per-domain allowed-path regexes, not per-user), `user_shows` (per-user
-  approved Crunchyroll `series_id`s), `series_cache` (object_id -> series_id,
-  with `expires_at`), `access_log` (the report page's data source, indexed on
-  `ts DESC` and a dedupe composite index).
+- Core Phase 1/2 tables: `settings` (key/value, e.g. `local_network`,
+  `block_page_mode`, `admin_username`, `admin_password_hash`, `secret_key`),
+  `users`, `domains` (`mode` CHECK IN splice/bump/trusted, `kind` CHECK IN
+  generic/crunchyroll, `is_global`), `user_domains` (per-user domain
+  grants), `domain_paths` (per-domain allowed-path regexes, not per-user),
+  `user_shows` (per-user approved Crunchyroll `series_id`s), `series_cache`
+  (object_id -> series_id, with `expires_at`), `access_log` (the report
+  page's data source, indexed on `ts DESC` and a dedupe composite index),
+  `groups`/`group_domains`/`devices`/`device_domains` (shared-device
+  categories and per-device identity/assignment).
+  **Full current schema, including Phase 3's `device_bindings`/
+  `interception_runtime`/`network_events`, Phase 8's `categories`/
+  `category_domains`/`category_overrides`/`schedules`/`schedule_categories`
+  (block-list polarity, see §9), and Phase 11's `system_events`, lives in
+  [`docs/database/schema.md`](../database/schema.md) -- this list is not
+  kept exhaustive here, don't treat it as the full table count.**
 - There is **no caching layer** in front of the DB anywhere in the request
   path -- every `external_acl_type` line in `squid.conf.template` is declared
   with `ttl=0 negative_ttl=0`, so Squid calls the helper (and thus queries
@@ -596,8 +666,8 @@ back to the raw id).
 
 ## 7. Dashboard (`dashboard/dashboard.py`)
 
-Single-file Flask app (~1100 lines), imports `adguard_client`, `auth`,
-`cr_api`, `db`, `matching` from `common/` (via
+Single-file Flask app (~4000 lines), imports `adguard_client`, `auth`,
+`category_fetch`, `cr_api`, `db`, `matching`, `schedule_eval` from `common/` (via
 `sys.path.insert(0, str(Path(__file__).parent))`, since the Dockerfile
 copies `common/*.py` flat into `/app/` alongside `dashboard.py`). Served
 by `waitress.serve()` in `main()`, not Flask's dev server, bound to
@@ -630,9 +700,30 @@ Route groups (see the numbered `# ====` section banners in the file):
   parses out a series id.
 - **Domains** (`/domains`, `/domains/add`, `/domains/add-url`,
   `/domains/delete`, `/domains/<id>`, `/domains/update`,
-  `/domains/toggle-user`, `/domains/paths/add`, `/domains/paths/delete`):
+  `/domains/access`, `/domains/paths/add`, `/domains/paths/delete`):
   CRUD on `domains`, `user_domains`, and `domain_paths`; `path_to_pattern()`
   converts a pasted URL path into a stored regex pattern.
+  `update_domain_access()` replaces a domain's entire grant set (Everyone
+  + users + groups + devices) in one call, rather than a per-assignment
+  toggle -- see `docs/dashboard/routes.md` for the full route reference.
+- **Categories** (`/categories`, `/schedules`, Phase 8, opposite polarity
+  from Domains -- assignment means BLOCK, not allow, see §9): CRUD on
+  `categories`/`category_domains`/`category_overrides` and
+  `schedules`/`schedule_categories`, plus the size-threshold-aware
+  `update_category_access()` (rejects a non-global assignment once
+  `domain_count` exceeds `matching.MAX_SCOPED_CATEGORY_DOMAINS`) and
+  "Sync now" buttons calling `category_fetch.py`.
+- **Devices and groups** (`/devices`, `/groups`): a device's
+  `user_id`/`group_id`/`bump_enabled`/`bypass_login`/`quarantined_at`
+  assignment -- consumed by `common/device_identity.py`,
+  `common/policy_class.py`, and (once Phase 3 is deployed) nftables.
+  Includes CSV bulk import (`/devices/import`, G7) and the ad-hoc
+  pause/resume routes (`/devices/pause`, `/devices/pause-all`,
+  `/users/pause`, G6) that write `devices.quarantined_at`.
+- **Events** (`/events`, Phase 11): read-only historical trail of every
+  background loop's real failures and recoveries, from `system_events`
+  (written by `controller/main.py`, never by the dashboard itself) --
+  see §9.
 - **Report** (`/report`, `/report/approve`): reads `access_log`, and
   `approve_from_report()` implements the one-click-approve flow -- for a
   domain-level denial it creates a `user_domains` row (creating the `domains`
@@ -653,9 +744,17 @@ Route groups (see the numbered `# ====` section banners in the file):
   itself. See `docs/dashboard/routes.md`'s own "Health" section for the
   full route reference.
 - **Settings** (`/settings`, `/settings/local-network`,
-  `/settings/block-page-mode`, `/settings/admin`): editable
-  `local_network`, `block_page_mode`, and admin credentials -- all live
-  edits to the `settings` table, no container restart needed.
+  `/settings/block-page-mode`, `/settings/admin`, `/settings/adguard`,
+  `/settings/adguard/refresh`, `/settings/safesearch` (G3),
+  `/settings/household-time-zone` (Phase 8),
+  `/settings/device-stale-days`): editable `local_network`,
+  `block_page_mode`, admin credentials, AdGuard connection settings,
+  SafeSearch/Restricted-Mode intent, the default schedule time zone, and
+  the stale-device cleanup threshold -- all live edits to the `settings`
+  table, no container restart needed. Several of these (AdGuard filter
+  refresh, SafeSearch) write *intent* only; a `controller/` background
+  loop is what actually reconciles it against AdGuard on its own next
+  cycle -- see `adguard_sync.py` in §1's controller/ listing.
 - `/ca-cert`: unauthenticated `send_file()` of `PP_CA_CERT_PATH`
   (`/config/ssl_cert/ca_cert.pem`) for device onboarding.
 - `/blocked`: unauthenticated, the target of `deny_info` for `redirect`-mode

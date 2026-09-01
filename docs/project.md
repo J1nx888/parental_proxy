@@ -4,33 +4,42 @@
 
 ## Overview
 
-Parental Proxy v2 is a from-scratch rewrite of an earlier Crunchyroll-only whitelist proxy. It's built around three ideas: everything is configured live from a web dashboard (no config files to hand-edit, no Squid restarts for rule changes); every person in the household has their own site/show permissions, applied per-request based on which assigned device their traffic comes from (not a per-request login, since 2026-08-30 -- see below); and every allow/block decision is logged with who/what/when, with a one-click "Approve" action on any blocked report entry.
+Parental Proxy v2 is a from-scratch rewrite of an earlier Crunchyroll-only whitelist proxy, now grown into a self-hosted replacement for a commercial whole-home filter (Bark Home). It's built around three ideas: everything is configured live from a web dashboard (no config files to hand-edit, no restarts for rule changes); every person in the household has their own site/show permissions, applied per-request based on which assigned device their traffic comes from (not a per-request login, since 2026-08-30 -- see below); and every allow/block decision is logged with who/what/when, with a one-click "Approve" action on any blocked report entry.
 
-The system is two Docker containers sharing one SQLite database: a Squid proxy container that does the actual traffic filtering (via `external_acl_type` helper scripts, not Squid's native ACL language), and a Flask dashboard container that's the only place an admin ever touches configuration. Squid's SSL-Bump feature lets the proxy selectively decrypt specific domains ("bump" mode) to enforce path-level and show-level rules (e.g. which Crunchyroll series a kid may watch), while most domains stay in cheaper, privacy-preserving "splice" mode (SNI-only, never decrypted, domain-level allow/deny only).
+The system has two enforcement tiers, not one: a **DNS tier** (AdGuard Home, `adguard/`) that gives every device on the LAN baseline content filtering — domain assignment, block-list categories, SafeSearch/Restricted Mode, time-based schedules — with zero per-device setup at all; and a smaller, deliberately curated **SSL-Bump tier** (Squid, `proxy/`) for the handful of devices/domains that need path- or show-level rules (e.g. which Crunchyroll series a kid may watch), via `external_acl_type` helper scripts rather than Squid's native ACL language. Both tiers, plus the Flask admin dashboard (`dashboard/`), read and write one shared SQLite database. A third piece, the network-level **interception layer** (`phase3/arp-worker`, `phase3/nftables-manager`, `controller/`), is what gets a device's traffic to either tier at all without any per-device proxy configuration — fully built and tested in isolation, but never yet run against a real household network (see [G1 runbook](deployment/g1-runbook.md)).
 
-The project is currently mid-way through a larger v2 redesign aimed at replacing a commercial whole-home filter (Bark Home): adding a DNS-based filtering tier for devices that can't run a proxy at all (game consoles, smart TVs), a captive-portal-style forced-enrollment flow, and expanding the Crunchyroll-style show-level filtering pattern to YouTube channels. None of that is built yet — see [`../RoadMap.md`](../RoadMap.md) for the full plan. **This documentation describes the system as it exists in code today**, not the in-progress redesign.
+The remaining work — YouTube channel/creator-level filtering, and the real-network validation above — is tracked in [`../RoadMap.md`](../RoadMap.md), which is the authoritative status on what's built vs. planned; **this documentation describes the system as it exists in code today**, including everything shipped so far, not just the original Phase 1/2 scope its earlier revisions covered.
 
 ## How it works
 
-A bump-enabled device's port 80/443 traffic reaches Squid's intercept ports (`http_port 3129 intercept` / `https_port 3130 intercept ssl-bump`) via NAT redirection -- no per-device proxy configuration, just a trusted CA certificate (see `docs/architecture/overview.md` for what does that redirecting; it's Phase 3's interception layer, outside this repo's proxy/dashboard tree). At the TLS layer, Squid peeks at the SNI hostname and asks `proxy/sni_helper.py` (one of four modes: `bump`/`trusted`/`splice`/`block_page`) whether to decrypt, splice through untouched, or terminate — consulting `common/matching.py` and the shared SQLite database for the domain's configured mode and the requesting device's assigned user's permissions (identity resolved from the client's source IP via `common/device_identity.py` → `device_bindings` → `devices.user_id`, replacing a per-request Basic-Auth login as of 2026-08-30). If a domain is in `bump` mode, the now-decrypted HTTP-layer request is additionally checked by `proxy/authz_helper.py`, which for Crunchyroll resolves the actual show being requested (`common/cr_urls.py` → `common/series_resolve.py` → `common/cr_api.py`) and checks it against that user's approved-shows list. Every decision is logged via `common/logging_util.py`. The Flask dashboard (`dashboard/dashboard.py`) reads and writes the same database to manage users, domains, devices, per-user assignments, and the report/approve workflow.
+**DNS tier (every device, no setup):** the interception layer redirects port 53 to AdGuard Home, which enforces domain assignment, block-list categories, and time-based schedules by computing per-client (or global, for large lists) filtering rules and pushing them via its own API (`controller/adguard_sync.py`) -- see [Architecture](architecture/overview.md) for the size-threshold split between the two enforcement mechanisms. This is the baseline every device gets, matching Bark Home's own coverage, and it's what most of Phase 8-11's newer features (categories, schedules, SafeSearch, ad-hoc pause) actually enforce through.
+
+**SSL-Bump tier (a curated subset of devices/domains):** a bump-enabled device's port 80/443 traffic reaches Squid's intercept ports (`http_port 3129 intercept` / `https_port 3130 intercept ssl-bump`) via NAT redirection -- no per-device proxy configuration, just a trusted CA certificate (see `docs/architecture/overview.md` for what does that redirecting; it's Phase 3's interception layer, outside this repo's proxy/dashboard tree). At the TLS layer, Squid peeks at the SNI hostname and asks `proxy/sni_helper.py` (one of four modes: `bump`/`trusted`/`splice`/`block_page`) whether to decrypt, splice through untouched, or terminate — consulting `common/matching.py` and the shared SQLite database for the domain's configured mode and the requesting device's assigned user's permissions (identity resolved from the client's source IP via `common/device_identity.py` → `device_bindings` → `devices.user_id`, replacing a per-request Basic-Auth login as of 2026-08-30). If a domain is in `bump` mode, the now-decrypted HTTP-layer request is additionally checked by `proxy/authz_helper.py`, which for Crunchyroll resolves the actual show being requested (`common/cr_urls.py` → `common/series_resolve.py` → `common/cr_api.py`) and checks it against that user's approved-shows list. Every decision is logged via `common/logging_util.py`. The Flask dashboard (`dashboard/dashboard.py`) reads and writes the same database to manage users, domains, devices, per-user assignments, and the report/approve workflow.
 
 ## Repository layout
 
 ```
-common/        Shared Python modules used by BOTH containers (flat-copied into each image)
-  auth.py            password hashing/verification (PBKDF2)
-  db.py              SQLite schema (SCHEMA string) + init_db()
-  matching.py        domain/user/LAN-permission lookup logic
+common/        Shared Python modules, flat-copied into whichever image(s) need them
+  db.py              SQLite schema (SCHEMA string) + init_db() -- 27 tables total, see
+                      docs/database/schema.md for the full current list
+  auth.py            password hashing/verification (PBKDF2), verify_admin_credentials()
+  matching.py        domain/user/LAN-permission lookup logic, category/schedule targeting
   device_identity.py resolve_device(conn, client_ip) + resolve_user_for_device(conn, device)
                       -- Squid's identity source since 2026-08-30 (split into two
                       functions 2026-08-31, see docs/security/overview.md §3)
+  identity.py        record_binding() -- the discovery-side device_bindings writer
+  policy_class.py    classify_device()/bump_eligible() -- the interception layer's policy model
   squid_helper.py    shared external_acl_type request/response protocol plumbing
   logging_util.py    deduped access-log writer
   cr_urls.py         Crunchyroll URL classification (playback/series/season/episode)
   series_resolve.py  resolves a Crunchyroll URL's ids to a series_id (with caching)
   cr_api.py          Crunchyroll CMS API client (anonymous token flow)
+  adguard_client.py  AdGuard Home REST client (custom rules, SafeSearch, filter subscriptions)
+  system_events.py   admin-visible failure/recovery log, written by controller/'s loops
+  schedule_eval.py, blocklist_parser.py, category_fetch.py -- Phase 8 (categories/schedules)
+  sdnotify.py        stdlib systemd sd_notify client, used by controller/'s heartbeat pacer
 
-proxy/         The Squid container
+proxy/         The Squid container (SSL-Bump tier)
   squid.conf.template   Squid config: intercept-mode ports, ssl_bump rules, http_access,
                          external_acl_type wiring (see RoadMap.md's intercept-mode section)
   sni_helper.py          external_acl_type handler for ssl_bump step2 (bump/trusted/splice/block_page)
@@ -38,14 +47,30 @@ proxy/         The Squid container
   entrypoint.sh          generates the CA cert, fixes volume ownership, starts Squid
   Dockerfile             squid-openssl (NOT plain squid -- required for SSL-Bump)
 
+adguard/       The AdGuard Home container (DNS tier), thin wrapper + first-run bootstrap
+
 dashboard/     The Flask admin container
-  dashboard.py       every route + inline Jinja2 templates (single file, ~1100 lines)
-  Dockerfile         flattens common/*.py + dashboard.py into one /app directory
+  dashboard.py             every route + inline Jinja2 templates (single file, ~4000 lines)
+  captive_portal_server.py forced-enrollment login server (Phase 4)
+  block_page_server.py     kid-facing DNS-tier block page
+  Dockerfile               flattens common/*.py + dashboard.py into one /app directory
+
+controller/    Python control-plane container (the interception layer's brains,
+               "interception" compose profile only) -- policy computation, AdGuard sync,
+               device discovery (rtnetlink/snapshot/active-scan), health reporting.
+               See docs/architecture/overview.md §1 for the full module list.
+
+phase3/        Go components of the interception layer (own "interception" profile)
+  arp-worker/         ARP-spoofing daemon, real CAP_NET_RAW, speaks Unix-socket IPC to controller/
+  nftables-manager/   reads desired policy from the shared SQLite DB, reconciles real nftables
 
 defaults/
-  seed_defaults.py   idempotent first-run seed data (global domains, Crunchyroll config)
+  seed_defaults.py   idempotent first-run seed data (global domains, Crunchyroll config,
+                      Phase 8's starter categories)
+  ai_sites_seed.py   the "AI" category's manually-curated starter domain list
 
-tests/         Tier-1 pytest suite (358 tests as of 2026-08-30, no Docker/network required)
+tests/         Tier-1 pytest suite (722 passed / 0 skipped on Linux as of 2026-09-01,
+               no Docker/network required -- Windows skips ~30 AF_UNIX-only tests)
 docs/          This documentation
 ```
 
@@ -79,7 +104,7 @@ pip install -r requirements-dev.txt -r dashboard/requirements.txt
 pytest
 ```
 
-Dashboard defaults to `http://127.0.0.1:8787` (not LAN-reachable until `DASHBOARD_BIND` is changed). Squid listens on its intercept ports (3129/3130) but no device configures a proxy setting at all -- traffic reaches them via Phase 3's NAT redirection once deployed; the only per-device manual step is trusting the CA cert.
+Dashboard defaults to `http://127.0.0.1:8787` (not LAN-reachable until `DASHBOARD_BIND` is changed). The command above starts only `proxy`/`adguard`/`dashboard` -- no device configures a proxy setting at all; the only per-device manual step is trusting the CA cert. The interception layer (`arp-worker`/`nftables-manager`/`controller`, what actually gets real household traffic to these containers with zero per-device config) is a separate, explicit `docker compose --profile interception up -d` -- see [G1 runbook](deployment/g1-runbook.md) before ever pointing that at a real LAN.
 
 ## Key technical decisions
 
@@ -90,6 +115,8 @@ Dashboard defaults to `http://127.0.0.1:8787` (not LAN-reachable until `DASHBOAR
 - **Crunchyroll show-resolution is deliberately special-cased**, not built as a generic "any site" feature — nothing else in scope has a documented API to resolve "this URL belongs to this show," so generalizing the pattern prematurely would have added complexity with no second user.
 - **No rate-limiting/lockout on the dashboard admin login** — a known, accepted gap for the current LAN-only deployment model; see [Security overview](security/overview.md) section 6 before any internet-facing exposure.
 - **Squid identity is device-based, not credential-based** (since 2026-08-30) — a client's source IP is resolved through `device_bindings` to a `devices.user_id`, replacing the old per-request Basic-Auth login. This is what makes "no per-device proxy configuration, just a CA cert" possible, at the cost of a different trust boundary (whoever controls a bump-enabled device's IP is treated as its assigned user, with no credential check) — see [Security overview](security/overview.md) section 3 for the full tradeoff.
+- **"Two independent axes" as a recurring pattern, not a one-off** — bump-eligibility layered on top of base classification, a scheduled `lockout_all` overlay layered on top of (never mutating) an admin's own manual quarantine, category assignment separate from schedule gating. Each pair composes rather than one silently overriding the other's own state.
+- **Categories/schedules are a block-list, the opposite polarity from every other domain-assignment table** — `domains`/`user_domains`/etc. are allow-lists (denied unless assigned); assigning a category or schedule means *block*. Same junction-table shape, reused deliberately, inverted meaning — see [Architecture](architecture/overview.md) §9 before assuming "assigned" means "allowed" anywhere in that code.
 
 ## Where the v2 redesign discussion lives
 

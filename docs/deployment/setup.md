@@ -184,7 +184,12 @@ enable this profile fails loudly and immediately rather than guessing.
 Actually enabling the `interception` profile is the real "start
 intercepting this LAN" decision; see RoadMap.md's live-verification
 section for how this was proven end-to-end on a disposable Docker-bridge
-test network, never the real production box.
+test network, never the real production box. **Before enabling it
+against a real household LAN for the first time**, run
+[`docs/deployment/g1-runbook.md`](g1-runbook.md) — real-network
+validation of the ARP interception mechanism against the actual mesh
+router is the one remaining gate before that decision, per
+RoadMap.md's "Path to deployment" section.
 
 ### Startup order dependency
 

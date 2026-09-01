@@ -1,6 +1,6 @@
 # Dashboard: routes and UI reference
 
-Source of truth: `dashboard/dashboard.py` (~1100 lines). This is the **entire**
+Source of truth: `dashboard/dashboard.py` (~4000 lines). This is the **entire**
 web app -- one Flask file with routes and Jinja2 templates defined as Python
 string constants, rendered via `render_template_string`. There is no separate
 JSON API, no frontend build, no static template files. To change the UI you
@@ -10,7 +10,12 @@ Supporting modules it imports (all copied from `common/` into the same
 container directory at build time -- see "Build/deploy layout" below):
 `auth.py` (password hashing), `cr_api.py` (Crunchyroll metadata lookups),
 `db.py` (SQLite schema/connection/settings), `matching.py` (domain/path
-matching helpers shared with the proxy's own request-time checks).
+matching helpers shared with the proxy's own request-time checks),
+`adguard_client.py` (AdGuard's REST API, used by the Settings page's
+"check for filter updates now" and SafeSearch toggle), `category_fetch.py`
+(Phase 8's "Sync now" button), `schedule_eval.py` (Phase 8, only for
+`zoneinfo.available_timezones()` validation on the Schedules forms --
+the actual schedule-is-active evaluation runs in `controller/`, not here).
 
 ## Build/deploy layout (why `import auth`/`import db` work)
 
@@ -214,6 +219,21 @@ admin's next action is one edit + submit rather than starting from scratch:
 ### General / unauthenticated
 
 - `GET /` -> `index()` -- redirects to `report`.
+- `GET /logout` -> `logout()` -- **not a real server-side logout** (HTTP
+  Basic Auth has no session to revoke). The nav's Logout link points here
+  with a deliberately wrong credential embedded in the URL
+  (`http://logout:logout@host/logout`), overwriting whatever the browser
+  cached for this origin; `@require_admin` then 401s it like any other bad
+  credential, and the browser's own response to a 401 on a top-level
+  navigation is to show a fresh native sign-in prompt. The route body only
+  ever runs in the practically-impossible case the real credentials happen
+  to literally be `logout`/`logout`.
+- `GET /sw.js` -> `service_worker()` -- serves the PWA service worker from
+  the root path (not `/static/sw.js`), specifically so its default scope
+  covers the whole app -- a service worker can only control paths at or
+  below where it's served from. `Cache-Control: no-cache` so an updated
+  worker is picked up promptly rather than being stuck behind a stale
+  cached copy.
 - `GET /ca-cert` -> `ca_cert()` -- **unauthenticated on purpose** (see file
   docstring: it's a public certificate, every client device needs it).
   Serves `CA_CERT_PATH` (env `PP_CA_CERT_PATH`, default
@@ -223,14 +243,32 @@ admin's next action is one edit + submit rather than starting from scratch:
 - `GET /blocked` -> `blocked()` -- static unauthenticated 403 HTML page shown
   to end users (not the admin) when Squid redirects a blocked bump-mode
   request here; inlined HTML, no shared `BASE`/template constant since it's
-  a deliberately separate, minimal page.
+  a deliberately separate, minimal page. Looks up the most recent denied
+  `access_log` row with a `user_id` from the last
+  `BLOCKED_REQUEST_LOOKBACK_SECONDS` (30s) -- correlated by recency, not
+  request identity, since passing the original URL through Squid's
+  `deny_info` redirect isn't verified version-specific behavior. If that
+  row hasn't already requested approval, shows a "Request approval" button.
+- `POST /blocked/request-approval` -> `request_approval()` -- **also
+  unauthenticated on purpose**, same reasoning as `/blocked` itself:
+  whoever got blocked is the one clicking it, and the worst-case abuse is
+  dashboard noise (an extra pending-request row), not a data leak or an
+  access grant. Form field `log_id`; sets `approval_requested_at` on that
+  `access_log` row only if it's still denied and hasn't already been
+  requested. Surfaces as the "Pending approval requests" card on `/report`.
 
 ### Users (`/users`)
 
 - `GET /users` -> `users()` -- lists all users with computed `domain_count`
   (global domains + explicit `user_domains` assignments, matching what the
   "N assigned" link's `?user_id=` filter actually shows on `/domains`) and
-  `show_count`. Renders `USERS_BODY`.
+  `show_count`. Renders `USERS_BODY`, including the CA-certificate download
+  banner unless previously dismissed (see next route).
+- `POST /users/dismiss-cert-banner` -> `dismiss_cert_banner()` -- no form
+  fields. Sets the `cert_banner_dismissed` setting to `"1"` so the banner
+  stops showing on `/users`; the cert itself is still always reachable via
+  `/ca-cert` or the Settings page. There's no way to un-dismiss it from the
+  UI (would need a direct `settings` table edit).
 - `POST /users/add` -> `add_user()` -- form fields `username`, `display_name`
   (optional, defaults to username), `password`. Validates username against
   `^[A-Za-z0-9_.-]+$`, requires both username and password, hashes the
@@ -305,11 +343,18 @@ admin's next action is one edit + submit rather than starting from scratch:
   `mode`, `is_global` (checkbox), `note`. No validation on `mode` here
   (unlike `add_domain`) -- it's a `<select>` so the browser constrains the
   value in practice. Updates the row, redirects to `domain_detail`.
-- `POST /domains/toggle-user` -> `toggle_user_domain()` -- form fields
-  `domain_id`, `user_id`, `action` (`"add"` or `"remove"`, driven by a
-  hidden input whose value is computed in the template from whether the
-  user is currently assigned). Inserts or deletes the corresponding
-  `user_domains` row. Redirects to `domain_detail`.
+- `POST /domains/access` -> `update_domain_access()` -- **stale-doc
+  correction (2026-09-01): this replaced a per-assignment
+  `/domains/toggle-user` route from the GH #8 combobox redesign; that
+  route no longer exists in code.** Form fields `domain_id`, `is_global`
+  (checkbox), `user_ids`/`group_ids`/`device_ids` (multi-value, from the
+  `BLOCK_ACCESS_SELECTS`-style combobox). Replaces the domain's **entire**
+  access grant in one call -- deletes every existing `user_domains`/
+  `group_domains`/`device_domains` row for this domain and re-inserts
+  exactly what was submitted, so granting and revoking are the same
+  action (a changed selection), not separate add/remove endpoints per
+  assignment. Same shape as `update_category_access()` and
+  `update_schedule_access()` below. Redirects to `domain_detail`.
 - `POST /domains/paths/add` -> `add_path()` -- form fields `domain_id`,
   `pattern`. Validates non-empty, <= 200 chars, and compiles as a regex.
   `INSERT OR IGNORE` into `domain_paths`. Redirects to `domain_detail`.

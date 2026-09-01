@@ -15,28 +15,36 @@ gets through), rebuilt around four features:
    change) -- there's no per-request Basic-Auth credential to manage
    anymore. Site/show permissions are assigned per person -- kid1 can
    reach `xyz.com` but not `abc.com`; kid2 can reach both.
-3. **DNS-tier ad/tracker/malware blocking (AdGuard Home).** Curated
-   uBlockOrigin/uAssets filter lists on top of AdGuard's own defaults,
+3. **DNS-tier filtering (AdGuard Home) for every device, zero setup.**
+   Domain assignment, block-list content categories (Adult, Gambling,
+   Social Media, AI, ...), SafeSearch/YouTube Restricted Mode, and
+   time-based schedules (school hours, bedtime lockout) -- plus curated
+   uBlockOrigin/uAssets ad/tracker lists on top of AdGuard's own defaults,
    with a weekly auto-refresh and an on-demand "check now" button from
-   Settings -- see "Ad-blocking" below. A separate, deliberately narrower
-   SSL-Bump tier gets path- and show-level rules (Crunchyroll today).
+   Settings. A separate, deliberately narrower SSL-Bump tier gets
+   path- and show-level rules (Crunchyroll today).
 4. **Reporting, with one-click approve -- and the kid can ask.** Every
    allow/block decision is logged with who, what, and when, filterable by
    kid and by date range (1/7/14/30 days) with at-a-glance graphs. A
    blocked entry gets Approve / Approve for everyone / Dismiss buttons, and
    the block page itself has a "Request approval" button -- a kid doesn't
    need to know the dashboard exists for their request to show up as a
-   pending alert an admin can act on immediately.
+   pending alert an admin can act on immediately. An admin-visible Events
+   page and an ad-hoc "pause the internet" control (per-device, per-kid,
+   or whole-house) round out day-to-day operation.
 
 This README describes the system **as it exists in code today**. Getting
-a device's traffic to Squid at all -- so #2/#3 work without configuring
-anything on the device itself -- is the job of a separate network-level
-interception layer (ARP-based redirect plus an `nftables` policy engine):
-it's built, containerized, and verified against a disposable test VM, but
-is an opt-in Docker Compose profile (`--profile interception`) and has not
-yet been run against a real household LAN. Until it is, or on a device you
-haven't added there, filtering will not apply. A captive-portal enrollment
-flow and YouTube channel-level filtering are designed but not yet built.
+a device's traffic to Squid/AdGuard at all -- so #2/#3 work without
+configuring anything on the device itself -- is the job of a separate
+network-level interception layer (ARP-based redirect plus an `nftables`
+policy engine): it's built, containerized, and verified against a
+disposable test VM, but is an opt-in Docker Compose profile
+(`--profile interception`) and has not yet been run against a real
+household LAN (see [docs/deployment/g1-runbook.md](docs/deployment/g1-runbook.md)
+for that validation plan). Until it is, or on a device you haven't added
+there, filtering will not apply. A captive-portal forced-enrollment flow
+IS built (new devices are gated by default until a login or admin
+bypass); YouTube channel-level filtering is designed but not yet built.
 See [RoadMap.md](RoadMap.md) for the full plan and current status of each
 piece.
 

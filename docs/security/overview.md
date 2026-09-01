@@ -874,9 +874,13 @@ when the category currently applies to every eligible device. A category
 over that threshold is enforced via AdGuard's own native filter-list
 subscription mechanism instead (`sync_category_subscriptions()`,
 `common/adguard_client.py`'s `add_filter_url`/`set_filter_url_enabled`)
-— **this half is not yet live-verified** (built from AdGuard's published
-OpenAPI spec, no running instance available when written; see
-`common/adguard_client.py`'s own module note). Both paths exclude
+— **live-verified 2026-09-01** against a real running AdGuard Home
+v0.107.79: every request/response shape in `common/adguard_client.py`'s
+docstrings matched on the first try, and `sync_category_subscriptions()`
+itself was run end-to-end against a real scratch 5,001-domain category
+(correctly added+enabled on `is_global=1`, correctly disabled once
+flipped off with no gating schedule) — see RoadMap.md's Phase 8 entry
+for the full writeup. Both paths exclude
 `BYPASS` (`ignored=1`) devices, same baseline-protection rule §3's
 `device_domain_reason()` already applies to domain assignment.
 

@@ -1,42 +1,43 @@
 {
   "version": 1,
-  "last_run": "2026-09-01T19:00:00Z",
+  "last_run": "2026-09-01T16:57:00Z",
   "sections": {
     "architecture": {
       "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "adguard/", "defaults/", "dashboard/", "controller/", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile"],
-      "fingerprint": "44b5644c1d1446adefb9b48583ca6f15bc69b3361a3f857e75d6ff3f95dfd5da",
+      "fingerprint": "17b927634e2a5c76fd1930dd71b628fc4ec272b2a7260cfffb6b25f32015df3a",
       "doc_path": "docs/architecture/overview.md",
-      "last_updated": "2026-09-01T19:00:00Z"
+      "last_updated": "2026-09-01T16:57:00Z"
     },
     "dashboard": {
       "source_paths": ["dashboard/", "common/db.py", "common/matching.py"],
-      "fingerprint": "82cb3d00d005bed8fa66055c433cffd46a9d2b9b8fb7d6b77b85fcc1ac1cc9ae",
+      "fingerprint": "405e692bbdd73c3c50618d6a0435120e3377c1fd3514391809f27325c21c9714",
       "doc_path": "docs/dashboard/routes.md",
-      "last_updated": "2026-09-01T19:00:00Z"
+      "last_updated": "2026-09-01T16:57:00Z"
     },
     "database": {
       "source_paths": ["common/db.py", "defaults/seed_defaults.py", "defaults/ai_sites_seed.py"],
       "fingerprint": "2aca51cb4b558da750c8b3b11c88e9536a25fb14a1458e2906ee076cffcfabb6",
       "doc_path": "docs/database/schema.md",
-      "last_updated": "2026-09-01T19:00:00Z"
+      "last_updated": "2026-09-01T16:57:00Z"
     },
     "deployment": {
       "source_paths": ["docker-compose.yml", "proxy/Dockerfile", "adguard/Dockerfile", "adguard/entrypoint.sh", "dashboard/Dockerfile", "controller/Dockerfile", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile", "proxy/entrypoint.sh", "setup.sh", ".env.example", ".github/workflows/tests.yml", "README.md"],
-      "fingerprint": "6dac28752b186b1c0d5a930e6e50caefa65ceed0e763fd3043b267dd697dae77",
+      "fingerprint": "5e922a80b0b30b08add095ca50ba0f397a5b60a9dd8becafe50769cb11cf6912",
       "doc_path": "docs/deployment/setup.md",
-      "last_updated": "2026-09-01T17:00:00Z"
+      "last_updated": "2026-09-01T16:57:00Z"
     },
     "security": {
       "source_paths": ["common/auth.py", "proxy/authz_helper.py", "proxy/sni_helper.py", "common/squid_helper.py", "proxy/entrypoint.sh", "proxy/squid.conf.template", "dashboard/dashboard.py", "dashboard/block_page_server.py", "dashboard/captive_portal_server.py", "common/device_identity.py", "common/adguard_client.py", "controller/adguard_sync.py", "controller/main.py", "adguard/entrypoint.sh"],
-      "fingerprint": "8c1e2ff9eed79a895add94f79ad87f657658387a32b22dfc27a6e220e9e421ac",
+      "fingerprint": "81dfe970ea1f8a43cd3b92cbc7a61cb846e1f77d7f1f42ae89b3b9b294d58130",
       "doc_path": "docs/security/overview.md",
-      "last_updated": "2026-09-01T19:00:00Z"
+      "last_updated": "2026-09-01T16:57:00Z"
     },
     "testing": {
       "source_paths": ["tests/", "pytest.ini", "requirements-dev.txt", ".github/workflows/tests.yml"],
-      "fingerprint": "c3073749fe102a71b923567cc6c04a3a9f32797c2b6ab9b5c0e3d324967c5967",
+      "fingerprint": "e36819a4309a72e8d3a505d97e83afe3dafb7f7bfd0896973bce5d940ca0ff8f",
       "doc_path": "docs/testing/overview.md",
-      "last_updated": "2026-09-01T19:00:00Z"
+      "last_updated": "2026-09-01T16:57:00Z"
     }
+  },
+  "fingerprint_method_note": "Fingerprints exclude __pycache__/*.pyc (find ... ! -path '*__pycache__*' ! -name '*.pyc' | sort | xargs sha256sum | sha256sum). Earlier fingerprints in this file's history included pycache artifacts, which caused false-positive drift signals when a local pytest run added/changed .pyc files under a source_paths directory with no real .py change -- recomputed clean as of the 2026-09-02 full documentation audit."
   }
-}

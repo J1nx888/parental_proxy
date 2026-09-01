@@ -132,6 +132,9 @@ common/     Shared Python, imported by BOTH containers. NOT a package —
               auth.py            PBKDF2 password hashing (stdlib-only, so the proxy needs no pip)
               cr_api.py / cr_urls.py / series_resolve.py   Crunchyroll CMS resolution + cache
               adguard_client.py  HTTP client for AdGuard Home's admin API
+              policy_class.py    classify_device()/bump_eligible() — the interception policy model
+              system_events.py   admin-visible failure/recovery log (Events page, written by controller/)
+              schedule_eval.py / blocklist_parser.py / category_fetch.py   Phase 8 (categories/schedules)
 
 proxy/      The Squid container. squid-openssl (NOT plain squid — Debian's
             is GnuTLS-built and cannot SSL-Bump at all). Native intercept
@@ -142,7 +145,7 @@ proxy/      The Squid container. squid-openssl (NOT plain squid — Debian's
               authz_helper.py   external_acl_type for the decrypted HTTP-layer decision
               squid.conf.template / entrypoint.sh
 
-dashboard/  Single-file Flask app (~1100 lines, inline Jinja2), served by
+dashboard/  Single-file Flask app (~4000 lines, inline Jinja2), served by
             waitress on :8787. The ONLY place an admin edits config.
 
 defaults/seed_defaults.py   idempotent first-run seed data
