@@ -1,2 +1,7 @@
 flask>=3.0
 waitress>=3.0
+
+# Phase 8 (2026-08-31): the Schedules page needs a real IANA time zone list
+# and common/schedule_eval.py's zoneinfo-based evaluation -- see
+# controller/requirements.txt's own comment on this same package for why.
+tzdata>=2024.1

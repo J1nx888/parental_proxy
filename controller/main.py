@@ -53,6 +53,7 @@ if _common_dir.is_dir():
 import active_scan
 import adguard_discovery
 import adguard_sync
+import category_fetch
 import discovery
 import readiness
 import rtnetlink_listener
@@ -116,6 +117,7 @@ def run(
     active_scan_interval: float | None = None,
     active_scan_stale_after: float = 300.0,
     active_scan_limit: int = 5,
+    category_fetch_interval: float | None = None,
 ) -> None:
     """The main control loop. Runs until SIGTERM/SIGINT.
 
@@ -185,6 +187,17 @@ def run(
     be before a binding is nudged and how many bindings get nudged per
     cycle -- the rate limit that keeps this from becoming a scan storm
     on a large household LAN.
+    category_fetch_interval, if given (not None), starts
+    common/category_fetch.py's periodic subscription-blocklist refresh
+    (Phase 8) on its own background thread and its own DB connection
+    (same reasoning as discovery_interval above) -- requires no
+    adguard_url/credentials (same as active_scan_interval above) since it
+    only fetches each category's OWN subscription_url and writes
+    category_domains; it never talks to AdGuard itself (that's
+    adguard_sync.py's build_category_deny_rules()/
+    sync_category_subscriptions(), already running whenever
+    adguard_interval is set).
+
     block_page_ip, if given, is threaded through to
     adguard_sync.build_rules() so hard-deny rules also carry a
     $dnsrewrite pointing at that IP's port 80 (see
@@ -356,6 +369,13 @@ def run(
             on_error=lambda exc: log.warning("active ARP scan failed: %s", exc),
         )
 
+    category_fetch_task = None
+    if category_fetch_interval is not None:
+        category_fetch_task = category_fetch.run_loop(
+            category_fetch_interval,
+            on_error=lambda exc: log.warning("category subscription fetch failed: %s", exc),
+        )
+
     sdnotify.ready()
 
     def _reconnect(reason: str) -> None:
@@ -397,6 +417,8 @@ def run(
             adguard_discovery_task.stop()
         if active_scan_task is not None:
             active_scan_task.stop()
+        if category_fetch_task is not None:
+            category_fetch_task.stop()
         try:
             client.shutdown("controller_requested")
         except WorkerConnectionError:
@@ -612,6 +634,22 @@ def main(argv: list[str] | None = None) -> int:
         "to disable it independently.",
     )
     parser.add_argument(
+        "--category-fetch-interval", type=float, default=86400.0,
+        help="Seconds between common/category_fetch.py subscription-blocklist "
+        "refreshes (Phase 8) -- only runs at all if --db-path is set. Requires "
+        "no AdGuard config, same as --active-scan-interval, since this only "
+        "fetches each category's own subscription_url and writes "
+        "category_domains; see --no-category-fetch to disable it "
+        "independently. Defaults to once a day -- category lists change far "
+        "less often than AdGuard's own bundled ad/tracker lists.",
+    )
+    parser.add_argument(
+        "--no-category-fetch", action="store_true",
+        help="Disable the subscription-blocklist refresh loop even when "
+        "--db-path is set -- categories stay whatever was last fetched (or "
+        "manual-only, for a category with no subscription_url).",
+    )
+    parser.add_argument(
         "--active-scan-stale-after", type=float, default=300.0,
         help="Seconds a device_bindings row's last_seen_at must be older than "
         "before controller/active_scan.py nudges it -- distinct from "
@@ -653,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
     adguard_interval: float | None = None
     adguard_discovery_interval: float | None = None
     active_scan_interval: float | None = None
+    category_fetch_interval: float | None = None
     if args.db_path:
         if not args.gateway_ip or not args.gateway_mac:
             parser.error("--db-path requires --gateway-ip and --gateway-mac")
@@ -688,6 +727,12 @@ def main(argv: list[str] | None = None) -> int:
             # adguard_discovery above, this needs no adguard_url/
             # credentials gate since it never touches AdGuard at all.
             active_scan_interval = args.active_scan_interval
+        if not args.no_category_fetch:
+            # category_fetch.run_loop() opens its own connection
+            # internally too, same reasoning as active_scan above -- this
+            # also never touches AdGuard at all, only the category's own
+            # subscription_url and the shared DB.
+            category_fetch_interval = args.category_fetch_interval
     else:
         provider = placeholder_desired_state
 
@@ -711,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         active_scan_interval=active_scan_interval,
         active_scan_stale_after=args.active_scan_stale_after,
         active_scan_limit=args.active_scan_limit,
+        category_fetch_interval=category_fetch_interval,
     )
     return 0
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -48,6 +49,36 @@ def _insert_group(conn, name: str) -> int:
     conn.execute("INSERT INTO groups (name, created_at) VALUES (?, datetime('now'))", (name,))
     conn.commit()
     return conn.execute("SELECT id FROM groups WHERE name = ?", (name,)).fetchone()["id"]
+
+
+def _insert_category(conn, name: str, *, is_global: bool = False, subscription_url: str | None = None) -> int:
+    conn.execute(
+        "INSERT INTO categories (name, subscription_url, is_global, created_at) VALUES (?, ?, ?, datetime('now'))",
+        (name, subscription_url, int(is_global)),
+    )
+    conn.commit()
+    return conn.execute("SELECT id FROM categories WHERE name = ?", (name,)).fetchone()["id"]
+
+
+def _insert_category_domains(conn, category_id: int, patterns: list[str], source: str = "manual") -> None:
+    conn.executemany(
+        "INSERT INTO category_domains (category_id, pattern, source, created_at) VALUES (?, ?, ?, datetime('now'))",
+        [(category_id, p, source) for p in patterns],
+    )
+    conn.commit()
+
+
+def _insert_schedule(
+    conn, name: str, *, is_global: bool = False, lockout_all: bool = False,
+    days: str = "mon", start: str = "00:00", end: str = "23:59",
+) -> int:
+    conn.execute(
+        "INSERT INTO schedules (name, days_of_week, start_time, end_time, time_zone, "
+        "lockout_all, is_global, created_at) VALUES (?, ?, ?, ?, 'UTC', ?, ?, datetime('now'))",
+        (name, days, start, end, int(lockout_all), int(is_global)),
+    )
+    conn.commit()
+    return conn.execute("SELECT id FROM schedules WHERE name = ?", (name,)).fetchone()["id"]
 
 
 # ============================================================
@@ -444,3 +475,195 @@ def test_run_loop_reports_sync_errors_via_on_error_without_dying(conn, monkeypat
     with lock:
         got = len(errors)
     assert got >= 2, f"expected the loop to keep retrying (and reporting) after failures, got {got}"
+
+
+# ============================================================
+# Phase 8: build_category_deny_rules
+# ============================================================
+
+def test_build_category_deny_rules_global_category_produces_unscoped_rules(conn):
+    category = _insert_category(conn, "Gambling", is_global=True)
+    _insert_category_domains(conn, category, [r"bet\.example\.com"])
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.11")
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:02", "192.168.1.12")
+
+    rules = adguard_sync.build_category_deny_rules(conn)
+
+    assert rules == ["/(?i)(?:^|\\.)(?:bet\\.example\\.com)$/"]
+
+
+def test_build_category_deny_rules_scoped_to_one_user_only_denies_their_devices(conn):
+    category = _insert_category(conn, "Social Media")
+    _insert_category_domains(conn, category, [r"social\.example\.com"])
+    conn.execute(
+        "INSERT INTO users (username, display_name, password_hash, created_at) "
+        "VALUES ('kid1', 'Kid One', 'x', datetime('now'))"
+    )
+    conn.commit()
+    user_id = conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()["id"]
+    kid_device = _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:03", "192.168.1.13", user_id=user_id)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:04", "192.168.1.14")
+    conn.execute("INSERT INTO category_users (category_id, user_id) VALUES (?, ?)", (category, user_id))
+    conn.commit()
+
+    rules = adguard_sync.build_category_deny_rules(conn)
+
+    assert rules == ["/(?i)(?:^|\\.)(?:social\\.example\\.com)$/$client=192.168.1.13"]
+    assert "192.168.1.14" not in rules[0]
+
+
+def test_build_category_deny_rules_override_excludes_that_domain(conn):
+    category = _insert_category(conn, "Gambling", is_global=True)
+    _insert_category_domains(conn, category, [r"bet\.example\.com", r"casino\.example\.com"])
+    conn.execute(
+        "INSERT INTO category_overrides (category_id, pattern, created_at) VALUES (?, ?, datetime('now'))",
+        (category, r"casino\.example\.com"),
+    )
+    conn.commit()
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:05", "192.168.1.15")
+
+    rules = adguard_sync.build_category_deny_rules(conn)
+
+    assert rules == ["/(?i)(?:^|\\.)(?:bet\\.example\\.com)$/"]
+
+
+def test_build_category_deny_rules_excludes_an_ignored_device_from_a_global_category(conn):
+    category = _insert_category(conn, "Gambling", is_global=True)
+    _insert_category_domains(conn, category, [r"bet\.example\.com"])
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:06", "192.168.1.16")
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:07", "192.168.1.17", ignored=True)
+
+    rules = adguard_sync.build_category_deny_rules(conn)
+
+    # Still unscoped -- the ignored device was never "eligible" to begin
+    # with, so the remaining one eligible device is still "everyone".
+    assert rules == ["/(?i)(?:^|\\.)(?:bet\\.example\\.com)$/"]
+
+
+def test_build_category_deny_rules_skips_a_category_over_the_scoping_threshold(conn, monkeypatch):
+    monkeypatch.setattr(adguard_sync, "MAX_SCOPED_CATEGORY_DOMAINS", 1)
+    category = _insert_category(conn, "Porn", is_global=True)
+    _insert_category_domains(conn, category, [r"a\.example\.com", r"b\.example\.com"])
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:08", "192.168.1.18")
+
+    rules = adguard_sync.build_category_deny_rules(conn)
+
+    assert rules == []
+
+
+def test_build_category_deny_rules_schedule_gated_category_only_active_in_window(conn):
+    category = _insert_category(conn, "Gaming")
+    _insert_category_domains(conn, category, [r"games\.example\.com"])
+    device = _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:09", "192.168.1.19")
+    schedule = _insert_schedule(conn, "School hours", is_global=True, days="mon", start="08:00", end="15:00")
+    conn.execute(
+        "INSERT INTO schedule_categories (schedule_id, category_id) VALUES (?, ?)", (schedule, category)
+    )
+    conn.commit()
+
+    during = datetime(2026, 8, 31, 10, 0, tzinfo=timezone.utc)  # Monday 10:00 -- in window
+    outside = datetime(2026, 8, 31, 20, 0, tzinfo=timezone.utc)  # Monday 20:00 -- outside window
+
+    assert adguard_sync.build_category_deny_rules(conn, now=during) == [
+        "/(?i)(?:^|\\.)(?:games\\.example\\.com)$/"
+    ]
+    assert adguard_sync.build_category_deny_rules(conn, now=outside) == []
+
+
+def test_build_category_deny_rules_no_applicable_devices_contributes_nothing(conn):
+    category = _insert_category(conn, "Vaping")  # no is_global, no assignment at all
+    _insert_category_domains(conn, category, [r"vape\.example\.com"])
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:10", "192.168.1.20")
+
+    assert adguard_sync.build_category_deny_rules(conn) == []
+
+
+# ============================================================
+# Phase 8: sync_category_subscriptions
+# ============================================================
+
+class _FakeAdGuardClient:
+    """Records calls instead of hitting the network -- swapped in via
+    monkeypatch.setattr(adguard_sync, "adguard_client", ...)."""
+
+    DEFAULT_TIMEOUT = 5.0
+
+    def __init__(self, existing_filters=None):
+        self.filters = list(existing_filters or [])
+        self.calls = []
+
+    def get_filters_status(self, base_url, username, password, timeout=None):
+        return self.filters
+
+    def add_filter_url(self, base_url, username, password, name, url, timeout=None):
+        self.calls.append(("add", name, url))
+        self.filters.append({"id": len(self.filters) + 1, "enabled": True, "name": name, "url": url})
+
+    def set_filter_url_enabled(self, base_url, username, password, url, name, enabled, timeout=None):
+        self.calls.append(("set_enabled", url, enabled))
+        for f in self.filters:
+            if f["url"] == url:
+                f["enabled"] = enabled
+
+
+def test_sync_category_subscriptions_skips_categories_at_or_under_threshold(conn, monkeypatch):
+    category = _insert_category(conn, "Small", is_global=True, subscription_url="https://example.invalid/small.txt")
+    _insert_category_domains(conn, category, [r"a\.example\.com"])
+    fake = _FakeAdGuardClient()
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    adguard_sync.sync_category_subscriptions(conn, "http://x", "admin", "pw")
+
+    assert fake.calls == []
+
+
+def test_sync_category_subscriptions_adds_a_new_global_category_enabled(conn, monkeypatch):
+    monkeypatch.setattr(adguard_sync, "MAX_SCOPED_CATEGORY_DOMAINS", 0)
+    category = _insert_category(conn, "Porn", is_global=True, subscription_url="https://example.invalid/porn.txt")
+    _insert_category_domains(conn, category, [r"a\.example\.com"])
+    fake = _FakeAdGuardClient()
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    adguard_sync.sync_category_subscriptions(conn, "http://x", "admin", "pw")
+
+    assert fake.calls == [("add", "Porn", "https://example.invalid/porn.txt")]
+    assert fake.filters[0]["enabled"] is True
+
+
+def test_sync_category_subscriptions_enables_only_during_an_active_gating_schedule(conn, monkeypatch):
+    monkeypatch.setattr(adguard_sync, "MAX_SCOPED_CATEGORY_DOMAINS", 0)
+    category = _insert_category(conn, "Gaming", is_global=False, subscription_url="https://example.invalid/gaming.txt")
+    _insert_category_domains(conn, category, [r"a\.example\.com"])
+    schedule = _insert_schedule(conn, "School hours", is_global=True, days="mon", start="08:00", end="15:00")
+    conn.execute("INSERT INTO schedule_categories (schedule_id, category_id) VALUES (?, ?)", (schedule, category))
+    conn.commit()
+    fake = _FakeAdGuardClient()
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    outside = datetime(2026, 8, 31, 20, 0, tzinfo=timezone.utc)
+    adguard_sync.sync_category_subscriptions(conn, "http://x", "admin", "pw", now=outside)
+    assert fake.calls == [
+        ("add", "Gaming", "https://example.invalid/gaming.txt"),
+        ("set_enabled", "https://example.invalid/gaming.txt", False),
+    ]
+
+    fake.calls.clear()
+    during = datetime(2026, 8, 31, 10, 0, tzinfo=timezone.utc)
+    adguard_sync.sync_category_subscriptions(conn, "http://x", "admin", "pw", now=during)
+    assert fake.calls == [("set_enabled", "https://example.invalid/gaming.txt", True)]
+
+
+def test_sync_category_subscriptions_never_removes_an_existing_filter(conn, monkeypatch):
+    monkeypatch.setattr(adguard_sync, "MAX_SCOPED_CATEGORY_DOMAINS", 0)
+    category = _insert_category(conn, "Porn", is_global=False, subscription_url="https://example.invalid/porn.txt")
+    _insert_category_domains(conn, category, [r"a\.example\.com"])
+    fake = _FakeAdGuardClient(
+        existing_filters=[{"id": 1, "enabled": True, "name": "Porn", "url": "https://example.invalid/porn.txt"}]
+    )
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    adguard_sync.sync_category_subscriptions(conn, "http://x", "admin", "pw")
+
+    # is_global=False and no gating schedule -- should be disabled, not removed.
+    assert fake.calls == [("set_enabled", "https://example.invalid/porn.txt", False)]
+    assert len(fake.filters) == 1

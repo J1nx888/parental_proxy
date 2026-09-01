@@ -8,6 +8,7 @@ def _counts(conn):
     return {
         "domains": conn.execute("SELECT COUNT(*) c FROM domains").fetchone()["c"],
         "domain_paths": conn.execute("SELECT COUNT(*) c FROM domain_paths").fetchone()["c"],
+        "categories": conn.execute("SELECT COUNT(*) c FROM categories").fetchone()["c"],
     }
 
 
@@ -23,6 +24,35 @@ def test_seed_is_idempotent_on_row_counts(conn):
     assert first == second
     assert first["domains"] > 0
     assert first["domain_paths"] == len(seed_defaults.CRUNCHYROLL_PATHS)
+    assert first["categories"] == len(seed_defaults.DEFAULT_CATEGORIES)
+
+
+def test_default_categories_seeded_not_global_with_no_domains_yet(conn):
+    """Seeding a category row alone blocks nothing -- is_global defaults
+    to 0, and no category_domains rows exist until something actually
+    calls common/category_fetch.py's fetch_and_sync_category() (the
+    controller's own daily loop, or the dashboard's "Sync now" button)."""
+    seed_defaults.seed(conn)
+    conn.commit()
+    rows = conn.execute("SELECT name, subscription_url, is_global FROM categories ORDER BY name").fetchall()
+    assert len(rows) == len(seed_defaults.DEFAULT_CATEGORIES)
+    assert all(r["is_global"] == 0 for r in rows)
+    ai_row = conn.execute("SELECT subscription_url FROM categories WHERE name = 'AI'").fetchone()
+    assert ai_row["subscription_url"] is None
+    assert conn.execute("SELECT COUNT(*) c FROM category_domains").fetchone()["c"] == 0
+
+
+def test_seed_twice_leaves_a_category_admin_edit_untouched(conn):
+    seed_defaults.seed(conn)
+    conn.commit()
+    conn.execute("UPDATE categories SET is_global = 1 WHERE name = 'Adult'")
+    conn.commit()
+
+    seed_defaults.seed(conn)
+    conn.commit()
+
+    row = conn.execute("SELECT is_global FROM categories WHERE name = 'Adult'").fetchone()
+    assert row["is_global"] == 1
 
 
 def test_seed_twice_leaves_admin_edits_untouched(conn):

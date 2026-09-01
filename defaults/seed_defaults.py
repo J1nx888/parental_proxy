@@ -79,6 +79,49 @@ CRUNCHYROLL_PATHS = [
 ]
 
 
+# Phase 8 starter categories. URLs are all from The Block List Project
+# (https://github.com/blocklistproject/Lists, MIT, actively maintained) --
+# confirmed LIVE 2026-08-31/09-01 (not assumed from its README alone): each
+# fetched, format-checked (AdGuard/adblock rule syntax, matching
+# common/blocklist_parser.py), and entry-counted. Counts shift as the
+# upstream lists update; the ones noted below are what was true when this
+# was written, kept only to explain the is_global/scoped split the
+# dashboard's category routes actually enforce
+# (matching.MAX_SCOPED_CATEGORY_DOMAINS = 5000):
+#   - Porn (953,393), Gambling (278,856), Drugs (26,029), Fraud (256,268),
+#     Facebook (22,362) are all already over the threshold -- Everyone-only,
+#     regardless of what an admin later tries to scope them to.
+#   - TikTok (3,725), Twitter/X (1,193), WhatsApp (226) are small enough to
+#     scope to a specific kid/device if wanted.
+# None are seeded `is_global` by default -- an admin has to actually decide
+# to turn a category on (and for whom) from the Categories page; seeding
+# the row alone blocks nothing. None have any `category_domains` rows yet
+# either -- that only happens once something calls
+# `common/category_fetch.py`'s `fetch_and_sync_category()` (the
+# controller's own daily background loop, or the dashboard's "Sync now"
+# button), same as a freshly-seeded row with no data until its first real
+# fetch.
+#
+# No public blocklist exists for "AI" or "Weapons" (confirmed via research
+# the same session) -- both seeded with subscription_url=None,
+# manual-curation-only, ready for an admin (or a future pass) to add
+# domains to directly from the category's Manage page.
+_BLOCKLISTPROJECT_ADGUARD = "https://blocklistproject.github.io/Lists/adguard/{}-ags.txt"
+
+DEFAULT_CATEGORIES = [
+    ("Adult", _BLOCKLISTPROJECT_ADGUARD.format("porn")),
+    ("Gambling", _BLOCKLISTPROJECT_ADGUARD.format("gambling")),
+    ("Drugs", _BLOCKLISTPROJECT_ADGUARD.format("drugs")),
+    ("Fraud & Scams", _BLOCKLISTPROJECT_ADGUARD.format("fraud")),
+    ("Facebook", _BLOCKLISTPROJECT_ADGUARD.format("facebook")),
+    ("TikTok", _BLOCKLISTPROJECT_ADGUARD.format("tiktok")),
+    ("Twitter/X", _BLOCKLISTPROJECT_ADGUARD.format("twitter")),
+    ("WhatsApp", _BLOCKLISTPROJECT_ADGUARD.format("whatsapp")),
+    ("AI", None),
+    ("Weapons", None),
+]
+
+
 def seed(conn) -> None:
     for pattern, note in GLOBAL_SPLICE_DOMAINS:
         conn.execute(
@@ -115,6 +158,13 @@ def seed(conn) -> None:
                 "INSERT OR IGNORE INTO domain_paths (domain_id, pattern) VALUES (?, ?)",
                 (cr_row["id"], pattern),
             )
+
+    for name, subscription_url in DEFAULT_CATEGORIES:
+        conn.execute(
+            "INSERT OR IGNORE INTO categories (name, subscription_url, is_global, created_at) "
+            "VALUES (?, ?, 0, ?)",
+            (name, subscription_url, db.now_iso()),
+        )
 
 
 def main() -> int:

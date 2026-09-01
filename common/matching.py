@@ -137,6 +137,85 @@ def device_domain_reason(conn: sqlite3.Connection, device: sqlite3.Row, domain: 
     return None
 
 
+# Phase 8, confirmed live 2026-08-31: real category blocklists range from
+# tens to ~953K domains. Scoping a list that size to a subset of clients
+# via AdGuard's `$client=` custom-rule modifier is exactly what AdGuard's
+# own team calls "unworkable" for per-client blocklist assignment
+# (AdguardTeam/AdGuardHome#8103) -- a category at or under this many
+# domains can be assigned to a specific user/group/device
+# (controller/adguard_sync.py's build_category_deny_rules(), same
+# `$client=` mechanism as domain-level rules); a category over it can only
+# ever be `is_global` (enforced by dashboard/dashboard.py's category
+# routes), pushed to AdGuard as one of its OWN native filter subscriptions
+# instead (controller/adguard_sync.py's sync_category_subscriptions()).
+# Shared here (not just in adguard_sync.py) since dashboard.py -- a
+# separate container image, see tests/conftest.py's own note on what's
+# copied where -- needs the same number for its own validation and can
+# only import from common/.
+MAX_SCOPED_CATEGORY_DOMAINS = 5000
+
+
+def category_applies_to_device(conn: sqlite3.Connection, device: sqlite3.Row, category: sqlite3.Row) -> bool:
+    """Whether `category` is blocked for `device` -- Phase 8's category
+    model, the OPPOSITE polarity from device_domain_reason() above (that's
+    an allow-list; this is a block-list). True if `category.is_global`, or
+    device's user/group/id has a row in category_users/category_groups/
+    category_devices. Mirrors device_domain_reason()'s explicit per-axis
+    style rather than one generic parameterized helper, matching this
+    module's own established idiom."""
+    if category["is_global"]:
+        return True
+    if device["user_id"] is not None:
+        row = conn.execute(
+            "SELECT 1 FROM category_users WHERE category_id = ? AND user_id = ?",
+            (category["id"], device["user_id"]),
+        ).fetchone()
+        if row is not None:
+            return True
+    if device["group_id"] is not None:
+        row = conn.execute(
+            "SELECT 1 FROM category_groups WHERE category_id = ? AND group_id = ?",
+            (category["id"], device["group_id"]),
+        ).fetchone()
+        if row is not None:
+            return True
+    row = conn.execute(
+        "SELECT 1 FROM category_devices WHERE category_id = ? AND device_id = ?",
+        (category["id"], device["id"]),
+    ).fetchone()
+    return row is not None
+
+
+def schedule_applies_to_device(conn: sqlite3.Connection, device: sqlite3.Row, schedule: sqlite3.Row) -> bool:
+    """Whether `schedule` targets `device` -- same shape as
+    category_applies_to_device() above, checked against
+    schedule_users/schedule_groups/schedule_devices instead. Says nothing
+    about whether the schedule's time window is currently active -- see
+    common/schedule_eval.py's schedule_is_active() for that, a deliberately
+    separate concern (this is "who," that is "when")."""
+    if schedule["is_global"]:
+        return True
+    if device["user_id"] is not None:
+        row = conn.execute(
+            "SELECT 1 FROM schedule_users WHERE schedule_id = ? AND user_id = ?",
+            (schedule["id"], device["user_id"]),
+        ).fetchone()
+        if row is not None:
+            return True
+    if device["group_id"] is not None:
+        row = conn.execute(
+            "SELECT 1 FROM schedule_groups WHERE schedule_id = ? AND group_id = ?",
+            (schedule["id"], device["group_id"]),
+        ).fetchone()
+        if row is not None:
+            return True
+    row = conn.execute(
+        "SELECT 1 FROM schedule_devices WHERE schedule_id = ? AND device_id = ?",
+        (schedule["id"], device["id"]),
+    ).fetchone()
+    return row is not None
+
+
 def user_has_show(conn: sqlite3.Connection, user_id: int, series_id: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM user_shows WHERE user_id = ? AND series_id = ?",

@@ -766,3 +766,27 @@ playback goes through `www.crunchyroll.com/playback`, already covered.
   `series_resolve.resolve_series_ids()` returns `None` (which
   `authz_helper.decide()` treats as a hard deny) for any object id with no
   usable cache history at all.
+- **Phase 8's `categories`/`schedules` are a BLOCK-list, the opposite
+  polarity from every domain-assignment table above them** (`domains`/
+  `user_domains`/`group_domains`/`device_domains` are an allow-list,
+  denied unless assigned). Same junction-table shape, reused deliberately
+  (down to the dashboard's combobox widget, relabeled
+  `BLOCK_ACCESS_SELECTS`), opposite meaning -- see
+  `docs/security/overview.md` §8 and `docs/database/schema.md`'s Phase 8
+  section before assuming "assigned" means "allowed" anywhere in that
+  code.
+- **A module needed by both the dashboard and controller images must live
+  in `common/`, never duplicated under both `common/` and `controller/`
+  with the same filename.** Both Dockerfiles flat-copy `common/*.py` then
+  their own directory's `*.py` into the SAME `/app/` directory (see
+  `controller/Dockerfile`'s own comment) -- a same-named file in both
+  would silently collide (whichever `COPY` ran last wins in that image).
+  `common/category_fetch.py` (Phase 8) is the concrete example: it needs
+  `controller/periodic.py`'s `PeriodicTask` for its own `run_loop()`, but
+  that import is done lazily INSIDE `run_loop()`, not at module level,
+  specifically so `dashboard.py` can `import category_fetch` and call its
+  other functions (the "Sync now" button) even though
+  `controller/periodic.py` was never copied into the dashboard image at
+  all -- the same reason `common/adguard_client.py` (the REST client) and
+  `controller/adguard_sync.py` (the scheduling/business logic on top of
+  it) are already split the way they are.

@@ -309,3 +309,110 @@ def get_query_log(
     if not isinstance(decoded, dict) or not isinstance(decoded.get("data"), list):
         raise AdGuardError(f"{base_url}/control/querylog didn't return the expected {{'data': [...]}} shape")
     return decoded["data"]
+
+
+# ==========================================================================
+# Phase 8 (2026-08-31): native filter-list subscriptions -- for a `categories`
+# row over controller/adguard_sync.py's per-target rule-count threshold
+# (confirmed live 2026-08-31: real category lists run up to ~953K domains --
+# AdGuard's own team calls per-client scoping of a list that size via custom
+# rules "unworkable," see AdguardTeam/AdGuardHome#8103), the category's own
+# subscription_url is pushed as one of AdGuard's OWN managed filter lists
+# instead -- letting AdGuard's engine (built for exactly this) match it,
+# rather than this project expanding it into a `$client=`-scoped custom-rule
+# line per domain the way build_category_deny_rules() does for a small,
+# per-target category.
+#
+# **NOT yet verified live** (unlike every function above this point in this
+# module, all confirmed 2026-08-30/31 against a real running instance) --
+# these three functions are built from AdGuard Home's published
+# openapi.yaml, not confirmed against a real running instance (no
+# Docker available locally when written; the project's smoke-test VM was
+# offline). Treat the request/response shapes below as a strong draft, not
+# confirmed fact, until checked against a live instance -- same "verify
+# live, don't trust docs alone" discipline this module's own docstring
+# describes learning the hard way, repeatedly, on every function above.
+# ==========================================================================
+
+def get_filters_status(
+    base_url: str, username: str, password: str, timeout: float = DEFAULT_TIMEOUT
+) -> list[dict]:
+    """The `filters` array from `/control/filtering/status` -- each entry
+    at least `id`/`enabled`/`name`/`url`/`rules_count` per AdGuard's
+    openapi.yaml (NOT yet confirmed live -- see module note above)."""
+    body = _request(
+        f"{base_url.rstrip('/')}/control/filtering/status",
+        method="GET",
+        username=username,
+        password=password,
+        timeout=timeout,
+    )
+    try:
+        decoded = json.loads(body)
+    except ValueError as exc:
+        raise AdGuardError(f"malformed JSON from {base_url}/control/filtering/status: {exc}") from exc
+    filters = decoded.get("filters") if isinstance(decoded, dict) else None
+    if not isinstance(filters, list):
+        raise AdGuardError(f"{base_url}/control/filtering/status had no 'filters' list")
+    return filters
+
+
+def add_filter_url(
+    base_url: str, username: str, password: str, name: str, url: str, timeout: float = DEFAULT_TIMEOUT
+) -> None:
+    """Subscribes AdGuard Home to `url` as a new managed filter list named
+    `name` -- per openapi.yaml (NOT yet confirmed live -- see module note
+    above), `POST /control/filtering/add_url` with body
+    `{"name", "url", "whitelist": false}`. Behavior when `url` is already
+    subscribed is unconfirmed -- callers (adguard_sync.py) should check
+    `get_filters_status()` first rather than relying on this being a safe
+    no-op if it's already present."""
+    _request(
+        f"{base_url.rstrip('/')}/control/filtering/add_url",
+        method="POST",
+        username=username,
+        password=password,
+        json_body={"name": name, "url": url, "whitelist": False},
+        timeout=timeout,
+    )
+
+
+def remove_filter_url(
+    base_url: str, username: str, password: str, url: str, timeout: float = DEFAULT_TIMEOUT
+) -> None:
+    """Unsubscribes AdGuard Home from `url` -- `POST
+    /control/filtering/remove_url` with body `{"url", "whitelist": false}`
+    (NOT yet confirmed live -- see module note above)."""
+    _request(
+        f"{base_url.rstrip('/')}/control/filtering/remove_url",
+        method="POST",
+        username=username,
+        password=password,
+        json_body={"url": url, "whitelist": False},
+        timeout=timeout,
+    )
+
+
+def set_filter_url_enabled(
+    base_url: str, username: str, password: str, url: str, name: str, enabled: bool,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> None:
+    """Toggles an already-subscribed filter's `enabled` state without
+    removing it -- `POST /control/filtering/set_url` with body
+    `{"url", "whitelist": false, "data": {"enabled", "name", "url"}}`,
+    identified by URL rather than id per openapi.yaml (NOT yet confirmed
+    live -- see module note above). This is what lets a schedule-gated
+    global category (adguard_sync.py) turn its subscription on/off as the
+    schedule's window opens/closes, without adding/removing it from
+    AdGuard's filter list entirely each time. `name` must be passed again
+    here even though it isn't changing -- per the documented request
+    shape, `data` fully replaces the filter's editable fields, not a
+    partial patch."""
+    _request(
+        f"{base_url.rstrip('/')}/control/filtering/set_url",
+        method="POST",
+        username=username,
+        password=password,
+        json_body={"url": url, "whitelist": False, "data": {"enabled": enabled, "name": name, "url": url}},
+        timeout=timeout,
+    )

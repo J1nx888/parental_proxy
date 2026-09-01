@@ -456,6 +456,103 @@ This is the "outbox events" RoadMap.md's Milestone 4 refers to. Written by
 
 Indexed on `observed_at DESC` and on `device_id`.
 
+## Phase 8 tables (categories, schedules)
+
+**Opposite polarity from every table above**: `domains`/`user_domains`/
+`group_domains`/`device_domains` are an ALLOW-list (denied unless
+assigned). `categories`/`schedules` are a BLOCK-list — assigning one to a
+user/group/device (or `is_global`) means block, not allow. Same
+junction-table shape as the domain tables (reused deliberately, including
+the dashboard's `ACCESS_SELECTS` widget, relabeled `BLOCK_ACCESS_SELECTS`
+for the copy), opposite meaning.
+
+### `categories`
+| Column             | Type    | Constraints |
+|---|---|---|
+| `id`                | INTEGER | PRIMARY KEY |
+| `name`              | TEXT    | UNIQUE NOT NULL |
+| `subscription_url`  | TEXT    | nullable -- NULL means manual-curation-only (e.g. "AI", "Weapons" -- no public blocklist exists for either) |
+| `last_synced_at`    | TEXT    | nullable -- when `common/category_fetch.py` last successfully fetched `subscription_url` |
+| `is_global`         | INTEGER | NOT NULL DEFAULT 0 -- blocked for everyone |
+| `created_at`        | TEXT    | NOT NULL |
+
+### `category_domains`
+The resolved domain list for a category. `source` lets a re-sync
+(`common/category_fetch.py`) replace only `'subscription'` rows for a
+category, leaving every `'manual'` row untouched.
+
+| Column         | Type    | Constraints |
+|---|---|---|
+| `id`            | INTEGER | PRIMARY KEY |
+| `category_id`   | INTEGER | NOT NULL REFERENCES `categories(id)` ON DELETE CASCADE |
+| `pattern`       | TEXT    | NOT NULL -- `re.escape()`d before storage, same convention as `domains.pattern` |
+| `source`        | TEXT    | NOT NULL `CHECK IN ('subscription','manual')` |
+| `created_at`    | TEXT    | NOT NULL |
+
+UNIQUE(`category_id`, `pattern`).
+
+### `category_overrides`
+Admin-added allow-exceptions within a category — a domain matching a
+pattern here is never blocked by that category, even if it's also a
+member. Matched by exact pattern-string equality (see
+`controller/adguard_sync.py`'s `_category_domain_patterns()`), not
+suffix/regex overlap — an MVP-scope limitation.
+
+| Column         | Type    | Constraints |
+|---|---|---|
+| `id`            | INTEGER | PRIMARY KEY |
+| `category_id`   | INTEGER | NOT NULL REFERENCES `categories(id)` ON DELETE CASCADE |
+| `pattern`       | TEXT    | NOT NULL |
+| `note`          | TEXT    | nullable |
+| `created_at`    | TEXT    | NOT NULL |
+
+UNIQUE(`category_id`, `pattern`).
+
+### `category_users` / `category_groups` / `category_devices`
+Same shape as `user_domains`/`group_domains`/`device_domains` (`id`,
+`category_id`, one of `user_id`/`group_id`/`device_id`, all
+`ON DELETE CASCADE`, `UNIQUE(category_id, *_id)`) — which
+user/group/device this category is BLOCKED for.
+
+### `schedules`
+A time window during which its assigned categories (or a full lockout)
+apply to its assigned users/groups/devices.
+
+| Column         | Type    | Constraints |
+|---|---|---|
+| `id`            | INTEGER | PRIMARY KEY |
+| `name`          | TEXT    | UNIQUE NOT NULL |
+| `days_of_week`  | TEXT    | NOT NULL -- comma list of lowercase 3-letter codes, e.g. `"mon,tue,wed,thu,fri"` |
+| `start_time`    | TEXT    | NOT NULL -- `"HH:MM"`, evaluated in `time_zone` |
+| `end_time`      | TEXT    | NOT NULL -- `"HH:MM"`; `end_time < start_time` means an overnight window (e.g. bedtime `"21:00"`→`"06:00"`), handled explicitly by `common/schedule_eval.py` |
+| `time_zone`     | TEXT    | NOT NULL -- IANA name, e.g. `"America/Chicago"`; stored per-schedule so a later change to the household default never moves an existing schedule's meaning |
+| `lockout_all`   | INTEGER | NOT NULL DEFAULT 0 -- 1 = full nftables-tier lockout (see `controller/policy_state.py`'s QUARANTINE overlay), `schedule_categories` ignored; 0 = a normal DNS-tier category block |
+| `is_global`     | INTEGER | NOT NULL DEFAULT 0 |
+| `created_at`    | TEXT    | NOT NULL |
+
+### `schedule_categories`
+Which categories are blocked while a (non-`lockout_all`) schedule is
+active. `id`, `schedule_id` REFERENCES `schedules(id)` ON DELETE CASCADE,
+`category_id` REFERENCES `categories(id)` ON DELETE CASCADE,
+UNIQUE(`schedule_id`, `category_id`).
+
+### `schedule_users` / `schedule_groups` / `schedule_devices`
+Same shape as `category_users`/`category_groups`/`category_devices`
+above — who a schedule applies to.
+
+**Scale note** (`common/matching.py`'s `MAX_SCOPED_CATEGORY_DOMAINS = 5000`):
+real category blocklists range from tens to ~953K domains
+(confirmed live against [The Block List Project](https://github.com/blocklistproject/Lists)).
+A category at or under this many domains can be scoped to a specific
+user/group/device (`controller/adguard_sync.py`'s
+`build_category_deny_rules()`, `$client=`-scoped AdGuard custom rules —
+the same mechanism `domains` assignment already uses). A category over
+it can only ever be `is_global` (enforced by `dashboard/dashboard.py`'s
+`update_category_access()`), pushed to AdGuard as one of its own native
+filter subscriptions instead (`sync_category_subscriptions()`) — AdGuard
+Home has no way to scope a subscribed list that size to a subset of
+clients ([AdguardTeam/AdGuardHome#8103](https://github.com/AdguardTeam/AdGuardHome/discussions/8103)).
+
 ## Relationships (ER summary)
 
 ```
@@ -588,6 +685,20 @@ left it.
    skip-events, playhead tracking, and personalization/recommendation rows
    (`/personalization/v\d+/`, added for GH #4's "Top 10" home-page rows).
    Carried over from v1's flat `allowed_paths.txt`.
+5. **`DEFAULT_CATEGORIES`** (Phase 8, 10 entries) -- Adult, Gambling,
+   Drugs, Fraud & Scams, Facebook, TikTok, Twitter/X, WhatsApp (each with
+   a real, live-verified `subscription_url` from
+   [The Block List Project](https://github.com/blocklistproject/Lists)),
+   plus AI and Weapons (`subscription_url=None` -- no public blocklist
+   exists for either, manual-curation-only). **None are seeded
+   `is_global`** -- the row existing blocks nothing on its own; an admin
+   still has to turn one on and choose who it applies to from the
+   Categories page. **No `category_domains` rows are seeded either** --
+   those only appear once something actually calls
+   `common/category_fetch.py`'s `fetch_and_sync_category()` (the
+   controller's own daily background loop, or the dashboard's "Sync now"
+   button) -- confirmed live: a real, non-mocked sync of the seeded
+   WhatsApp URL fetched 226 real domains end-to-end.
 
 Run directly: `python3 defaults/seed_defaults.py` (imports `db` from the
 same directory via a `sys.path.insert` at the top of the file -- run it

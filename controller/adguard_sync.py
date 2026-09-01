@@ -43,14 +43,34 @@ every sync reads the DB and AdGuard's current rules fresh, computes the
 complete desired managed-rules block (both rule sets combined), and
 replaces it whole -- no incremental add/remove, no assumption about
 what a previous cycle left behind.
+
+**Phase 8 addendum (2026-08-31)**: content-category blocking
+(`build_category_deny_rules()`) adds a THIRD rule source to the same
+managed block, for categories at or under
+`matching.MAX_SCOPED_CATEGORY_DOMAINS` domains. Real category blocklists
+(confirmed live: https://github.com/blocklistproject/Lists) range from
+tens of domains to ~953K -- scoping a list that size to a subset of
+clients via `$client=` is exactly what AdGuard's own team calls
+"unworkable" for per-client blocklist assignment
+(AdguardTeam/AdGuardHome#8103: "requires maintaining thousands of rules
+for each client profile"). A category over that threshold is therefore
+`is_global`-only (enforced by the dashboard, not re-checked here) and
+handled by an entirely separate mechanism, `sync_category_subscriptions()`
+-- pushing the category's own `subscription_url` into AdGuard as one of
+ITS OWN native managed filter lists instead of expanding it into custom
+rules, letting AdGuard's engine (built for exactly this) match it. See
+each function's own docstring.
 """
 from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timezone
 
 import adguard_client
 import matching
+import schedule_eval
+from matching import MAX_SCOPED_CATEGORY_DOMAINS
 from periodic import PeriodicTask
 from policy_class import PolicyClass, bump_eligible, classify_device
 
@@ -94,6 +114,20 @@ def _domain_rule(pattern: str, client_ips: list[str], block_page_ip: str | None 
     rule = f"/{body}/$client={','.join(client_ips)}"
     if block_page_ip:
         rule += f",dnsrewrite=NOERROR;A;{block_page_ip}"
+    return rule
+
+
+def _domain_rule_unscoped(pattern: str, block_page_ip: str | None = None) -> str:
+    """Same regex body as `_domain_rule()` above, with NO `$client=`
+    scope -- for `build_category_deny_rules()`'s case where a category
+    currently applies to literally every non-BYPASS device: one plain
+    rule per domain instead of one `$client=`-scoped rule per domain
+    listing every device's IP is both cheaper and simpler, and is the
+    common case for a category an admin marks "Block for Everyone"."""
+    body = f"(?i)(?:^|\\.)(?:{pattern})$"
+    rule = f"/{body}/"
+    if block_page_ip:
+        rule += f"$dnsrewrite=NOERROR;A;{block_page_ip}"
     return rule
 
 
@@ -276,6 +310,193 @@ def build_splice_deny_rules(conn: sqlite3.Connection, block_page_ip: str | None 
     return _build_domain_deny_rules(conn, "splice", require_bump_eligible=False, block_page_ip=block_page_ip)
 
 
+def _category_domain_patterns(conn: sqlite3.Connection, category_id: int) -> list[str]:
+    """A category's blocked-domain patterns minus anything matching a
+    `category_overrides` row -- allow-exceptions the admin added for a
+    domain the category's own list/manual additions would otherwise
+    catch. Matched by exact pattern-string equality (not suffix/regex
+    overlap) -- an MVP-scope limitation: an override has to name the same
+    pattern that's actually stored in `category_domains`, not a broader
+    or narrower one that happens to overlap it."""
+    overrides = {
+        row["pattern"] for row in conn.execute(
+            "SELECT pattern FROM category_overrides WHERE category_id = ?", (category_id,)
+        )
+    }
+    return [
+        row["pattern"] for row in conn.execute(
+            "SELECT pattern FROM category_domains WHERE category_id = ?", (category_id,)
+        )
+        if row["pattern"] not in overrides
+    ]
+
+
+def build_category_deny_rules(
+    conn: sqlite3.Connection, now: datetime | None = None, block_page_ip: str | None = None
+) -> list[str]:
+    """DNS-tier enforcement for every category AT OR UNDER
+    `matching.MAX_SCOPED_CATEGORY_DOMAINS` -- a category over that many
+    domains is handled entirely by `sync_category_subscriptions()`
+    instead (see this module's docstring's Phase 8 addendum for why a
+    huge list can't go through `$client=`-scoped custom rules the way
+    domain-level rules do).
+
+    For each in-scope category, resolves which currently-bound, non-BYPASS
+    devices it applies to RIGHT NOW -- either unconditionally
+    (`matching.category_applies_to_device()`) or via any currently-active,
+    non-lockout schedule that references it
+    (`schedule_eval.schedule_is_active()` +
+    `matching.schedule_applies_to_device()`). If that set is literally
+    every eligible device, emits one cheap unscoped rule per domain
+    (`_domain_rule_unscoped()`) instead of a `$client=`-scoped one --
+    see that helper's own docstring. A category with zero currently-
+    applicable devices, or zero domains once `category_overrides` are
+    subtracted, contributes nothing.
+
+    `now` defaults to the current UTC instant; tests inject a fixed
+    value, same convention as `controller/policy_state.py`'s
+    `compute_desired_policy()`.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    categories = conn.execute("SELECT * FROM categories").fetchall()
+    if not categories:
+        return []
+
+    devices = conn.execute(
+        """
+        SELECT DISTINCT d.id, d.user_id, d.group_id, d.ignored, d.quarantined_at,
+               d.is_authenticated, d.bump_enabled, d.bypass_login, b.ipv4_address
+        FROM devices d
+        JOIN device_bindings b ON b.device_id = d.id AND b.active = 1
+        ORDER BY b.ipv4_address
+        """
+    ).fetchall()
+    eligible_devices = [row for row in devices if classify_device(row) != PolicyClass.BYPASS]
+    if not eligible_devices:
+        return []
+
+    rules = []
+    for category in categories:
+        domain_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM category_domains WHERE category_id = ?", (category["id"],)
+        ).fetchone()["c"]
+        if domain_count == 0 or domain_count > MAX_SCOPED_CATEGORY_DOMAINS:
+            continue
+
+        patterns = _category_domain_patterns(conn, category["id"])
+        if not patterns:
+            continue
+
+        gating_schedules = conn.execute(
+            "SELECT s.* FROM schedule_categories sc JOIN schedules s ON s.id = sc.schedule_id "
+            "WHERE sc.category_id = ? AND s.lockout_all = 0",
+            (category["id"],),
+        ).fetchall()
+
+        applicable_ips = []
+        for device in eligible_devices:
+            applies = matching.category_applies_to_device(conn, device, category)
+            if not applies:
+                for schedule in gating_schedules:
+                    if schedule_eval.schedule_is_active(schedule, now) and matching.schedule_applies_to_device(
+                        conn, device, schedule
+                    ):
+                        applies = True
+                        break
+            if applies:
+                applicable_ips.append(device["ipv4_address"])
+
+        if not applicable_ips:
+            continue
+
+        if len(applicable_ips) == len(eligible_devices):
+            rules.extend(_domain_rule_unscoped(pattern, block_page_ip) for pattern in patterns)
+        else:
+            rules.extend(_domain_rule(pattern, applicable_ips, block_page_ip) for pattern in patterns)
+
+    return rules
+
+
+def sync_category_subscriptions(
+    conn: sqlite3.Connection, base_url: str, username: str, password: str,
+    now: datetime | None = None, timeout: float = adguard_client.DEFAULT_TIMEOUT,
+) -> None:
+    """Keeps AdGuard Home's own native filter subscriptions in sync for
+    every category OVER `matching.MAX_SCOPED_CATEGORY_DOMAINS` (a category
+    at or under it is handled by `build_category_deny_rules()` instead,
+    and skipped here) -- see this module's docstring's Phase 8 addendum
+    for why a huge list needs AdGuard's own filtering engine rather than
+    this project's `$client=`-scoped custom rules.
+
+    Only two things can make an over-threshold category's subscription
+    ENABLED: `categories.is_global` set directly (always enabled), or an
+    `is_global`, non-`lockout_all` schedule referencing it via
+    `schedule_categories` whose window is currently active
+    (`schedule_eval.schedule_is_active()`) -- enabled only while that
+    window is open. **This function does not, and cannot, enforce a
+    per-user/device/group scoping for an over-threshold category** -- the
+    dashboard's category routes (`dashboard/dashboard.py`) are
+    responsible for never letting one be configured that way in the first
+    place; a category assigned any other way would be silently
+    under-enforced by the two-driver check above, so that configuration
+    must never reach this function.
+
+    Adds a subscription that doesn't exist in AdGuard yet
+    (`adguard_client.add_filter_url()`), or flips `enabled` on one that
+    already exists and disagrees with the computed state
+    (`adguard_client.set_filter_url_enabled()`) -- never removes a
+    subscription once added (disabling is sufficient, and removing would
+    lose AdGuard's own last-fetched/rule-count state for no benefit).
+
+    **NOT yet verified live** -- see `common/adguard_client.py`'s own note
+    on the three functions this calls.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    categories = conn.execute(
+        "SELECT * FROM categories WHERE subscription_url IS NOT NULL AND subscription_url != ''"
+    ).fetchall()
+    over_threshold = []
+    for category in categories:
+        domain_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM category_domains WHERE category_id = ?", (category["id"],)
+        ).fetchone()["c"]
+        if domain_count > MAX_SCOPED_CATEGORY_DOMAINS:
+            over_threshold.append(category)
+    if not over_threshold:
+        return
+
+    current_filters = {
+        f["url"]: f for f in adguard_client.get_filters_status(base_url, username, password, timeout=timeout)
+    }
+
+    for category in over_threshold:
+        should_enable = bool(category["is_global"])
+        if not should_enable:
+            gating_schedules = conn.execute(
+                "SELECT s.* FROM schedule_categories sc JOIN schedules s ON s.id = sc.schedule_id "
+                "WHERE sc.category_id = ? AND s.lockout_all = 0 AND s.is_global = 1",
+                (category["id"],),
+            ).fetchall()
+            should_enable = any(schedule_eval.schedule_is_active(s, now) for s in gating_schedules)
+
+        url = category["subscription_url"]
+        existing = current_filters.get(url)
+        if existing is None:
+            adguard_client.add_filter_url(base_url, username, password, category["name"], url, timeout=timeout)
+            if not should_enable:
+                adguard_client.set_filter_url_enabled(
+                    base_url, username, password, url, category["name"], False, timeout=timeout
+                )
+        elif bool(existing.get("enabled")) != should_enable:
+            adguard_client.set_filter_url_enabled(
+                base_url, username, password, url, category["name"], should_enable, timeout=timeout
+            )
+
+
 def _strip_managed_block(rules: list[str]) -> list[str]:
     """Remove a previously-synced managed block from AdGuard's rules
     list, keeping everything else (an admin's own manually-added rules,
@@ -297,14 +518,22 @@ def _strip_managed_block(rules: list[str]) -> list[str]:
 def sync_once(
     conn: sqlite3.Connection, base_url: str, username: str, password: str, block_page_ip: str | None = None
 ) -> int:
-    """One full sync cycle. Returns the number of managed rules pushed
-    (0 is a normal, healthy state -- see build_rules' own docstring)."""
-    managed = build_rules(conn, block_page_ip) + build_splice_deny_rules(conn, block_page_ip)
+    """One full sync cycle. Returns the number of managed CUSTOM rules
+    pushed (0 is a normal, healthy state -- see build_rules' own
+    docstring) -- does not count native filter-subscription toggles from
+    `sync_category_subscriptions()`, a separate mechanism (Phase 8) with
+    its own success/failure shape."""
+    managed = (
+        build_rules(conn, block_page_ip)
+        + build_splice_deny_rules(conn, block_page_ip)
+        + build_category_deny_rules(conn, block_page_ip=block_page_ip)
+    )
     current = adguard_client.get_custom_rules(base_url, username, password)
     preserved = _strip_managed_block(current)
 
     new_rules = preserved if not managed else preserved + [_MARKER_BEGIN, *managed, _MARKER_END]
     adguard_client.set_custom_rules(base_url, username, password, new_rules)
+    sync_category_subscriptions(conn, base_url, username, password)
     return len(managed)
 
 

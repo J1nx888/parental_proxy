@@ -169,7 +169,11 @@ containing just the inner page content (no `<html>`/`<nav>` -- that's
 | `DOMAINS_BODY` | `domains()` | All domains table (or filtered by `?user_id=`), "Add domain" form, and conditionally the "Approve a specific page for {user}" form. |
 | `DOMAIN_DETAIL_BODY` | `domain_detail()` | One domain's mode/global/note edit form, assigned-users toggle table (only if not global), allowed-paths table + add form (only if mode is `bump`). |
 | `REPORT_BODY` | `report()` | Access-log table with a user/group/device/status GET filter form (combobox, since 2026-08-31) and inline per-row "Approve" actions. |
-| `SETTINGS_BODY` | `settings_page()` | Local network CIDR form, blocked-site experience mode form, admin username/password form. |
+| `SETTINGS_BODY` | `settings_page()` | Local network CIDR form, household time zone form (Phase 8), blocked-site experience mode form, admin username/password form. |
+| `CATEGORIES_BODY` | `categories()` | Phase 8. All categories table, "Add category" form, "Sync all subscriptions now" button (shown only if any category has a `subscription_url`). |
+| `CATEGORY_DETAIL_BODY` | `category_detail()` | Phase 8. Subscription info + "Sync now" (if `subscription_url` set), Blocked-for card (`BLOCK_ACCESS_SELECTS`, or a plain Everyone-only checkbox once over the scoping threshold), domains table + manual-add form, overrides table + add form. |
+| `SCHEDULES_BODY` | `schedules()` | Phase 8. All schedules table, "Add schedule" form (days/time/time-zone/lockout). |
+| `SCHEDULE_DETAIL_BODY` | `schedule_detail()` | Phase 8. When/window edit form, Blocked-for card, categories multi-select card (omitted entirely when `lockout_all` is set). |
 
 All of these live in the same file as their route handlers, directly above
 them (e.g. `USERS_BODY` is defined right before `users()`/`add_user()`).
@@ -314,6 +318,88 @@ admin's next action is one edit + submit rather than starting from scratch:
   row is gone), deletes the `domain_paths` row, redirects to
   `domain_detail` with that `domain_id` (or `None` if the path was already
   gone).
+
+### Categories (`/categories`) -- Phase 8, opposite polarity from Domains
+
+A category BLOCKS domains for whoever it's assigned to (or everyone) --
+see `docs/database/schema.md`'s Phase 8 section and
+`docs/security/overview.md` §8 for why this is the inverse of the
+Domains page's allow-list model, and for the 5,000-domain scoping
+threshold (`matching.MAX_SCOPED_CATEGORY_DOMAINS`) enforced below.
+
+- `GET /categories` -> `categories()` -- lists every category with a
+  computed `domain_count`; a "Sync all subscriptions now" button appears
+  only if at least one category has a `subscription_url`. Renders
+  `CATEGORIES_BODY`.
+- `POST /categories/add` -> `add_category()` -- form fields `name`,
+  `subscription_url` (optional -- blank means manual-only). Redirects to
+  `categories`; duplicate name -> error flash.
+- `POST /categories/delete` -> `delete_category()` -- form field
+  `category_id`. Cascades to every `category_*` junction table.
+- `GET /categories/<int:category_id>` -> `category_detail()` -- the
+  category's domains (source-tagged), overrides, and Access
+  (`BLOCK_ACCESS_SELECTS`) card; shows a "too large to scope" notice
+  instead of the full picker once `domain_count` exceeds the threshold.
+  Renders `CATEGORY_DETAIL_BODY`.
+- `POST /categories/access` -> `update_category_access()` -- form fields
+  `category_id`, `is_global`, `user_ids`/`group_ids`/`device_ids` (same
+  shape as `update_domain_access()`). **Rejects** (error flash, no write)
+  a non-global assignment on a category whose `domain_count` exceeds
+  `matching.MAX_SCOPED_CATEGORY_DOMAINS` -- the one piece of server-side
+  enforcement that makes the threshold real, not just a UI suggestion.
+- `POST /categories/domains/add` -> `add_category_domain()` -- form
+  fields `category_id`, `pattern` (validated non-empty, <=200 chars,
+  compiles as regex, same as `add_domain()`). `INSERT OR IGNORE` with
+  `source='manual'`.
+- `POST /categories/domains/delete` -> `delete_category_domain()` --
+  form field `category_domain_id`. Deletes only if `source='manual'` (a
+  `WHERE ... AND source = 'manual'` clause -- a subscription-sourced row
+  silently survives this call, by design, since it'll just come back on
+  the next sync anyway; remove it from the subscription source itself,
+  or add an override, instead).
+- `POST /categories/overrides/add` / `.../overrides/delete` -> allow-
+  exception CRUD against `category_overrides`, same shape as the domain
+  add/delete pattern.
+- `POST /categories/<int:category_id>/sync` -> `sync_category_now()` --
+  calls `common/category_fetch.py`'s `fetch_and_sync_category()`
+  synchronously (blocks the request on the actual HTTP fetch); a
+  `CategoryFetchError` flashes back to `category_detail` rather than
+  raising a 500.
+- `POST /categories/sync-all` -> `sync_all_categories_now()` -- calls
+  `sync_all_categories()`; one failing source is skipped, never aborts
+  the rest.
+
+### Schedules (`/schedules`) -- Phase 8
+
+- `GET /schedules` -> `schedules()` -- lists every schedule with a
+  computed `category_count`; the add form's default time zone comes from
+  the `household_time_zone` setting. Renders `SCHEDULES_BODY`.
+- `POST /schedules/add` -> `add_schedule()` -- form fields `name`,
+  `days` (multi-value checkbox list, filtered to the 7 valid 3-letter
+  codes and joined with commas -- silently drops anything else rather
+  than rejecting the whole submission), `start_time`/`end_time`
+  (`"HH:MM"`, validated by regex), `time_zone` (validated against
+  `zoneinfo.available_timezones()`), `lockout_all` (checkbox). Requires
+  at least one day.
+- `POST /schedules/delete` -> `delete_schedule()` -- form field
+  `schedule_id`. Cascades to every `schedule_*` junction table.
+- `GET /schedules/<int:schedule_id>` -> `schedule_detail()` -- the
+  when/window edit form, the Access (`BLOCK_ACCESS_SELECTS`) card, and a
+  category multi-select card that's **omitted entirely** (not just
+  disabled) when `lockout_all` is set, since a full lockout blocks
+  everything regardless of any category assignment. Renders
+  `SCHEDULE_DETAIL_BODY`.
+- `POST /schedules/update` -> `update_schedule()` -- same field set/
+  validation as `add_schedule()`, applied to an existing row.
+- `POST /schedules/access` -> `update_schedule_access()` -- same shape
+  as `update_category_access()`, minus the size-threshold check (a
+  schedule's own target set has no domain-count concept itself; that
+  check lives on the category side).
+- `POST /schedules/categories` -> `update_schedule_categories()` --
+  form fields `schedule_id`, `category_ids` (multi-select combobox,
+  posted as a list) -- full replace of `schedule_categories` for that
+  schedule, same grant-and-revoke-are-the-same-action shape as every
+  other access-replace route in this file.
 
 ### Report (`/report`)
 
@@ -492,9 +578,16 @@ shape, not an error).
 
 - `GET /settings` -> `settings_page()` -- reads `local_network`,
   `admin_username`, `block_page_mode` (default `"terminate"`),
-  `adguard_url`, `adguard_username` settings. Renders `SETTINGS_BODY`.
-  (Never reads or displays `admin_password_hash` or `adguard_password`
-  -- both password fields are always blank/write-only.)
+  `adguard_url`, `adguard_username`, `household_time_zone` (Phase 8,
+  default `"UTC"`) settings. Renders `SETTINGS_BODY`. (Never reads or
+  displays `admin_password_hash` or `adguard_password` -- both password
+  fields are always blank/write-only.)
+- `POST /settings/household-time-zone` -> `update_household_time_zone()`
+  (Phase 8) -- form field `household_time_zone`, validated against
+  `zoneinfo.available_timezones()`. Only used as the default a new
+  Schedule's own `time_zone` is created with (see
+  `docs/database/schema.md`'s `schedules` table) -- changing it never
+  moves an already-created schedule's meaning.
 - `POST /settings/local-network` -> `update_local_network()` -- form field
   `local_network` (space-separated CIDRs). No format validation beyond
   `.strip()` -- an invalid CIDR just fails silently at match time in

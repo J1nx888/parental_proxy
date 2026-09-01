@@ -1,3 +1,9 @@
 # Dev-only: not installed in either container image (see dashboard/requirements.txt
 # for the actual runtime deps). Needed to run tests/ (pytest, no Docker required).
 pytest>=8.0
+
+# Windows dev machines (and some minimal Linux images) have no system tz
+# database -- see controller/requirements.txt's comment on this same
+# package. Needed here too so `pytest` exercising common/schedule_eval.py
+# works the same locally as it does in either container.
+tzdata>=2024.1

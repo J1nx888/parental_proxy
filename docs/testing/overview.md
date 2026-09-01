@@ -391,6 +391,87 @@ device that already has an assignment keeping it, an explicit same-submit
 assignment overriding the default, and a later resave not re-forcing
 `ignored` back on. 552 tests total after this pass.
 
+**2026-08-31/09-01, Phase 8 (content categories + time-based schedules)**:
+87 new tests across nine files, none touching existing coverage. Three
+new files for pure logic: `tests/test_schedule_eval.py` (15 tests --
+same-day windows, the overnight-wraparound bedtime case in both legs,
+naive-datetime-as-UTC, a real timezone-shifts-which-calendar-day-it-is
+case for Australia/Sydney, a US DST spring-forward transition day, plus
+`is_full_lockout_active()`'s DB-touching wrapper), `tests/test_blocklist_parser.py`
+(12 tests -- one per real format confirmed live against
+[The Block List Project](https://github.com/blocklistproject/Lists):
+AdGuard/adblock, hosts-file including IPv6 null-routes and multiple
+aliases per line, bare domain-per-line, plus comments/dedup/malformed-line
+skipping), and `tests/test_category_fetch.py` (6 tests, `_OPENER.open`
+faked same as `test_adguard_client.py`'s own pattern -- a re-sync
+replacing only `source='subscription'` rows is the one worth calling
+out, since a bug there would have silently discarded an admin's manual
+additions on every scheduled refresh). `tests/test_matching.py` gained
+7 tests for `category_applies_to_device()`/`schedule_applies_to_device()`
+(is_global, and each of user/group/device targeting, plus a check that
+an unrelated user's grant doesn't leak). `tests/test_adguard_client.py`
+gained 5 tests for the three new native-filter-subscription functions
+(**not yet live-verified** -- see `docs/security/overview.md` §8).
+`tests/test_controller_adguard_sync.py` gained 11 tests: 7 for
+`build_category_deny_rules()` (global category → unscoped rule, a
+user-scoped category denies only that user's devices, an override
+excludes its domain, an ignored device is excluded even from a global
+category, a category over the scoping threshold contributes nothing,
+a schedule-gated category is only active inside its window, zero
+applicable devices contributes nothing) and 4 for
+`sync_category_subscriptions()` against a small `_FakeAdGuardClient`
+that records calls instead of touching the network (skips at-or-under-
+threshold categories entirely, adds a new global category pre-enabled,
+enables/disables strictly on whether a gating schedule is currently
+active, and never removes an existing filter -- only ever toggles
+`enabled`). `tests/test_controller_policy_state.py` gained 6 tests for
+`compute_desired_policy()`'s new schedule-driven QUARANTINE overlay,
+each with an injected fixed `now` (same convention `test_controller_readiness.py`
+established for fake timing): a device under an active global lockout
+schedule lands in `quarantine`; the same device outside the window is
+unaffected; an `ignored` device stays in `bypass` even during an active
+lockout schedule (baseline protection doesn't apply lockout to a device
+that's supposed to be outside the whole system); a manually-
+`quarantined_at` device is unaffected by schedule state in either
+direction (the two-independent-axes proof); a non-`lockout_all` schedule
+never triggers the overlay; and the real-current-time default path
+doesn't raise. `tests/test_dashboard.py` gained 25 tests for the new
+`/categories`/`/schedules`/`/settings/household-time-zone` routes,
+including the one that actually matters most for this feature's whole
+premise: `update_category_access()` rejects scoping an over-threshold
+category to a specific user (error flash, no `category_users` row
+written) while still allowing "Block for Everyone" on that same
+oversized category. 639 tests total after this pass (552 + 87), still
+30 skipped (the same pre-existing Windows-platform gaps --
+`AF_UNIX`/`iproute2` -- unrelated to this feature, confirmed by diffing
+skip reasons before/after).
+
+**Same session, follow-up**: seeding 10 default categories
+(`defaults/seed_defaults.py`'s `DEFAULT_CATEGORIES` -- see
+`docs/database/schema.md`'s Seed data section) added 2 more tests to
+`tests/test_seed_idempotent.py` (all 10 seeded with `is_global=0` and no
+`category_domains` yet; a re-seed never overwrites an admin's own
+`is_global` edit). 641 tests total. Also verified for real, outside the
+test suite entirely: ran `category_fetch.fetch_and_sync_category()`
+against the real, live, seeded WhatsApp URL with no mocks at all --
+fetched 226 real domains, correctly `re.escape()`d and stored, `categories.last_synced_at` set -- the first genuine
+non-mocked proof that the whole fetch → parse → store pipeline works
+against real third-party data, not just the format samples the unit
+tests use.
+
+Also verified live against the seeded dashboard (scratch dev server,
+real seeded SQLite DB), not just the test suite: added a category, added
+a manual domain and an allow-override to it, set "Block for Everyone",
+confirmed all three directly in the DB; added a `lockout_all` bedtime
+schedule and confirmed its detail page correctly omits the categories
+card entirely (not just disables it); zero server-side errors and zero
+new browser-console errors throughout (the one console error present is
+the same pre-existing, unrelated service-worker message already on the
+long-shipped Domains page). **Not yet live-verified, needs the VM**:
+AdGuard Home actually applying a category custom rule or a native filter
+subscription against real DNS queries, and a real device losing
+connectivity via `quarantine_v4` during a simulated bedtime window.
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in

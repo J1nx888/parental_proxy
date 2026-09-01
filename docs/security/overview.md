@@ -857,3 +857,62 @@ use would need to add: TLS on the dashboard, brute-force protection on its
 login (§6), and a reconsideration of what "LAN membership" is even
 supposed to mean as a trust signal once clients aren't all on one
 administratively-controlled network.
+
+## 8. Content-category and schedule enforcement (Phase 8, added 2026-08-31/09-01)
+
+Two new, independent enforcement mechanisms, both built as pure computed
+overlays rather than mutating any existing state:
+
+**DNS-tier category blocking** (`controller/adguard_sync.py`) splits by
+size, confirmed via live research that this split is necessary, not
+optional (see RoadMap.md's Phase 8 entry and `docs/database/schema.md`'s
+scale note): a category at or under `matching.MAX_SCOPED_CATEGORY_DOMAINS`
+(5,000) domains is enforced the same way per-domain assignment already is
+— `$client=`-scoped AdGuard custom rules
+(`build_category_deny_rules()`), emitting a cheap unscoped rule instead
+when the category currently applies to every eligible device. A category
+over that threshold is enforced via AdGuard's own native filter-list
+subscription mechanism instead (`sync_category_subscriptions()`,
+`common/adguard_client.py`'s `add_filter_url`/`set_filter_url_enabled`)
+— **this half is not yet live-verified** (built from AdGuard's published
+OpenAPI spec, no running instance available when written; see
+`common/adguard_client.py`'s own module note). Both paths exclude
+`BYPASS` (`ignored=1`) devices, same baseline-protection rule §3's
+`device_domain_reason()` already applies to domain assignment.
+
+**nftables-tier scheduled lockout** (`controller/policy_state.py`): a
+device under an active `schedules.lockout_all=1` window is reclassified
+to `QUARANTINE` for that one `compute_desired_policy()` cycle —
+**never writing `devices.quarantined_at`**. This is deliberate, not an
+oversight: `quarantined_at` is an admin's own manual, persistent
+isolation flag (see `docs/database/schema.md`'s `devices` comment); a
+scheduled lockout is an ephemeral, time-driven state that must turn
+itself off the moment the window closes, with nothing left over to
+clean up, and must never interact with an admin's independent manual
+quarantine in either direction. Same "two independent axes" pattern this
+project already used for `bump_eligible()` layered on top of
+`classify_device()`. Confirmed via code review of
+`phase3/nftables-manager` (Go) that this needed zero changes there — the
+`quarantine_v4` nftables set is a pure opaque IP bucket with no model of
+*why* an IP is in it, so the Python controller freely deciding
+membership (now including this overlay) was already the sole authority.
+
+**Time-zone handling**: `common/schedule_eval.py` evaluates a schedule's
+window in its own stored IANA `time_zone`, converting the current UTC
+instant via stdlib `zoneinfo` — never the server's local time, never bare
+UTC (a household's "bedtime 21:00" is a wall-clock concept). `zoneinfo`
+has no bundled tz database of its own; `tzdata` (PyPI) was added to
+`controller/requirements.txt`/`dashboard/requirements.txt` as a second
+deliberate, documented exception to this project's stdlib-only
+discipline (pure data, no compiler, same footing as the existing
+`pyroute2` exception) rather than assuming `python:3.12-slim` or a given
+host has system tzdata.
+
+**Block-list vs. allow-list, explicitly**: everything in §3 above
+(`domains`/`user_domains`/etc.) is an allow-list — denied unless
+assigned. `categories`/`schedules` are the opposite polarity — assigning
+one means block. Reusing the identical junction-table shape (and the
+dashboard's combobox widget, relabeled `BLOCK_ACCESS_SELECTS`) for an
+inverted meaning is a deliberate consistency choice, not a naming
+coincidence; the dashboard's copy says "Block for Everyone" specifically
+so this isn't mistaken for the Domains page's grant.

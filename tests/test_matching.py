@@ -205,3 +205,133 @@ def test_user_has_show_is_case_insensitive_on_series_id(conn):
     conn.commit()
     assert matching.user_has_show(conn, user["id"], "gye5k0xvr") is True
     assert matching.user_has_show(conn, user["id"], "OTHERID") is False
+
+
+# --------------------------------------------- category/schedule targeting (Phase 8)
+
+def _add_category(conn, name, is_global=0):
+    conn.execute(
+        "INSERT INTO categories (name, is_global, created_at) VALUES (?, ?, ?)",
+        (name, is_global, db.now_iso()),
+    )
+    conn.commit()
+    return conn.execute("SELECT * FROM categories WHERE name = ?", (name,)).fetchone()
+
+
+def _add_schedule(conn, name, is_global=0):
+    conn.execute(
+        "INSERT INTO schedules (name, days_of_week, start_time, end_time, time_zone, "
+        "lockout_all, is_global, created_at) VALUES (?, 'mon', '08:00', '15:00', 'UTC', 0, ?, ?)",
+        (name, is_global, db.now_iso()),
+    )
+    conn.commit()
+    return conn.execute("SELECT * FROM schedules WHERE name = ?", (name,)).fetchone()
+
+
+def _add_user(conn, username):
+    conn.execute(
+        "INSERT INTO users (username, display_name, password_hash, created_at) "
+        "VALUES (?, ?, 'x', ?)",
+        (username, username, db.now_iso()),
+    )
+    conn.commit()
+    return matching.get_user_by_username(conn, username)
+
+
+def _add_group(conn, name):
+    conn.execute("INSERT INTO groups (name, created_at) VALUES (?, ?)", (name, db.now_iso()))
+    conn.commit()
+    return conn.execute("SELECT * FROM groups WHERE name = ?", (name,)).fetchone()
+
+
+def _add_device(conn, mac, user_id=None, group_id=None):
+    conn.execute(
+        "INSERT INTO devices (mac_address, user_id, group_id, is_authenticated, created_at) "
+        "VALUES (?, ?, ?, 1, ?)",
+        (mac, user_id, group_id, db.now_iso()),
+    )
+    conn.commit()
+    return conn.execute("SELECT * FROM devices WHERE mac_address = ?", (mac,)).fetchone()
+
+
+def test_category_applies_to_device_via_is_global(conn):
+    category = _add_category(conn, "Adult", is_global=1)
+    device = _add_device(conn, "aa:bb:cc:dd:ee:01")
+    assert matching.category_applies_to_device(conn, device, category) is True
+
+
+def test_category_applies_to_device_via_user_assignment(conn):
+    user = _add_user(conn, "kid1")
+    category = _add_category(conn, "Social Media")
+    device = _add_device(conn, "aa:bb:cc:dd:ee:02", user_id=user["id"])
+    assert matching.category_applies_to_device(conn, device, category) is False
+    conn.execute(
+        "INSERT INTO category_users (category_id, user_id) VALUES (?, ?)", (category["id"], user["id"])
+    )
+    conn.commit()
+    assert matching.category_applies_to_device(conn, device, category) is True
+
+
+def test_category_applies_to_device_via_group_assignment(conn):
+    group = _add_group(conn, "TVs")
+    category = _add_category(conn, "Gaming")
+    device = _add_device(conn, "aa:bb:cc:dd:ee:03", group_id=group["id"])
+    assert matching.category_applies_to_device(conn, device, category) is False
+    conn.execute(
+        "INSERT INTO category_groups (category_id, group_id) VALUES (?, ?)", (category["id"], group["id"])
+    )
+    conn.commit()
+    assert matching.category_applies_to_device(conn, device, category) is True
+
+
+def test_category_applies_to_device_via_direct_device_assignment(conn):
+    category = _add_category(conn, "Vaping")
+    device = _add_device(conn, "aa:bb:cc:dd:ee:04")
+    assert matching.category_applies_to_device(conn, device, category) is False
+    conn.execute(
+        "INSERT INTO category_devices (category_id, device_id) VALUES (?, ?)", (category["id"], device["id"])
+    )
+    conn.commit()
+    assert matching.category_applies_to_device(conn, device, category) is True
+
+
+def test_category_applies_to_device_unrelated_user_grant_does_not_leak(conn):
+    other_user = _add_user(conn, "kid_other")
+    category = _add_category(conn, "Gambling")
+    device = _add_device(conn, "aa:bb:cc:dd:ee:05")  # no user/group at all
+    conn.execute(
+        "INSERT INTO category_users (category_id, user_id) VALUES (?, ?)", (category["id"], other_user["id"])
+    )
+    conn.commit()
+    assert matching.category_applies_to_device(conn, device, category) is False
+
+
+def test_schedule_applies_to_device_via_is_global(conn):
+    schedule = _add_schedule(conn, "Bedtime", is_global=1)
+    device = _add_device(conn, "aa:bb:cc:dd:ee:06")
+    assert matching.schedule_applies_to_device(conn, device, schedule) is True
+
+
+def test_schedule_applies_to_device_via_user_group_device_assignment(conn):
+    user = _add_user(conn, "kid2")
+    group = _add_group(conn, "Gaming Computers")
+    device_via_user = _add_device(conn, "aa:bb:cc:dd:ee:07", user_id=user["id"])
+    device_via_group = _add_device(conn, "aa:bb:cc:dd:ee:08", group_id=group["id"])
+    device_via_direct = _add_device(conn, "aa:bb:cc:dd:ee:09")
+    schedule = _add_schedule(conn, "School hours")
+
+    assert matching.schedule_applies_to_device(conn, device_via_user, schedule) is False
+    assert matching.schedule_applies_to_device(conn, device_via_group, schedule) is False
+    assert matching.schedule_applies_to_device(conn, device_via_direct, schedule) is False
+
+    conn.execute("INSERT INTO schedule_users (schedule_id, user_id) VALUES (?, ?)", (schedule["id"], user["id"]))
+    conn.execute("INSERT INTO schedule_groups (schedule_id, group_id) VALUES (?, ?)", (schedule["id"], group["id"]))
+    conn.execute(
+        "INSERT INTO schedule_devices (schedule_id, device_id) VALUES (?, ?)",
+        (schedule["id"], device_via_direct["id"]),
+    )
+    conn.commit()
+
+    assert matching.schedule_applies_to_device(conn, device_via_user, schedule) is True
+    assert matching.schedule_applies_to_device(conn, device_via_group, schedule) is True
+    assert matching.schedule_applies_to_device(conn, device_via_direct, schedule) is True

@@ -297,3 +297,73 @@ def test_get_query_log_rejects_a_non_dict_top_level_response(monkeypatch):
     monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response(["not", "a", "dict"]))
     with pytest.raises(adguard_client.AdGuardError, match="data"):
         adguard_client.get_query_log("http://127.0.0.1:3000", "admin", "x")
+
+
+# ---------------------------- Phase 8: native filter-list subscriptions ----
+
+def test_get_filters_status_returns_the_filters_list(monkeypatch):
+    monkeypatch.setattr(
+        adguard_client._OPENER, "open",
+        lambda r, timeout=None: _json_response({"filters": [{"id": 1, "enabled": True, "name": "Gambling", "url": "https://x"}]}),
+    )
+    filters = adguard_client.get_filters_status("http://127.0.0.1:3000", "admin", "x")
+    assert filters == [{"id": 1, "enabled": True, "name": "Gambling", "url": "https://x"}]
+
+
+def test_get_filters_status_rejects_a_response_missing_the_filters_list(monkeypatch):
+    monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({}))
+    with pytest.raises(adguard_client.AdGuardError, match="filters"):
+        adguard_client.get_filters_status("http://127.0.0.1:3000", "admin", "x")
+
+
+def test_add_filter_url_posts_the_expected_body(monkeypatch):
+    captured = {}
+
+    def fake_open(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["body"] = json.loads(request.data)
+        return FakeResponse(b"")
+
+    monkeypatch.setattr(adguard_client._OPENER, "open", fake_open)
+    adguard_client.add_filter_url("http://127.0.0.1:3000", "admin", "x", "Gambling", "https://example.invalid/gambling.txt")
+
+    assert captured["url"] == "http://127.0.0.1:3000/control/filtering/add_url"
+    assert captured["method"] == "POST"
+    assert captured["body"] == {"name": "Gambling", "url": "https://example.invalid/gambling.txt", "whitelist": False}
+
+
+def test_remove_filter_url_posts_the_expected_body(monkeypatch):
+    captured = {}
+
+    def fake_open(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data)
+        return FakeResponse(b"")
+
+    monkeypatch.setattr(adguard_client._OPENER, "open", fake_open)
+    adguard_client.remove_filter_url("http://127.0.0.1:3000", "admin", "x", "https://example.invalid/gambling.txt")
+
+    assert captured["url"] == "http://127.0.0.1:3000/control/filtering/remove_url"
+    assert captured["body"] == {"url": "https://example.invalid/gambling.txt", "whitelist": False}
+
+
+def test_set_filter_url_enabled_posts_the_expected_body(monkeypatch):
+    captured = {}
+
+    def fake_open(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data)
+        return FakeResponse(b"")
+
+    monkeypatch.setattr(adguard_client._OPENER, "open", fake_open)
+    adguard_client.set_filter_url_enabled(
+        "http://127.0.0.1:3000", "admin", "x", "https://example.invalid/gambling.txt", "Gambling", False
+    )
+
+    assert captured["url"] == "http://127.0.0.1:3000/control/filtering/set_url"
+    assert captured["body"] == {
+        "url": "https://example.invalid/gambling.txt",
+        "whitelist": False,
+        "data": {"enabled": False, "name": "Gambling", "url": "https://example.invalid/gambling.txt"},
+    }

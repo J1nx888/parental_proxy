@@ -175,6 +175,140 @@ CREATE TABLE IF NOT EXISTS device_domains (
     UNIQUE(device_id, domain_id)
 );
 
+-- Phase 8: a named content category (Adult, Gambling, Social Media, AI...).
+-- The OPPOSITE polarity from `domains`/`user_domains`/etc above -- those are
+-- an allow-list (denied unless assigned); a category assignment means
+-- BLOCK for that target. `is_global` = blocked for everyone.
+--   subscription_url: where this category's domain list is fetched from
+--       (controller/category_fetch.py), or NULL for a purely
+--       admin-curated category (e.g. "AI", "Weapons" -- no public list
+--       exists for either, confirmed 2026-08-31).
+--   last_synced_at: when subscription_url was last fetched successfully.
+--       NULL means never synced (or subscription_url is NULL).
+CREATE TABLE IF NOT EXISTS categories (
+    id               INTEGER PRIMARY KEY,
+    name             TEXT UNIQUE NOT NULL,
+    subscription_url TEXT,
+    last_synced_at   TEXT,
+    is_global        INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL
+);
+
+-- A category's resolved domain list. `source` distinguishes a
+-- subscription-fetched row from an admin's manual addition so a re-sync
+-- (controller/category_fetch.py) can replace only 'subscription' rows for
+-- that category and leave every 'manual' row untouched.
+CREATE TABLE IF NOT EXISTS category_domains (
+    id          INTEGER PRIMARY KEY,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    pattern     TEXT NOT NULL,
+    source      TEXT NOT NULL CHECK (source IN ('subscription', 'manual')),
+    created_at  TEXT NOT NULL,
+    UNIQUE(category_id, pattern)
+);
+
+-- Admin-added allow-exceptions within a category -- a domain matching a
+-- pattern here is never blocked by this category's own list, even though
+-- it's otherwise a member (e.g. a specific site the subscribed "Social
+-- Media" list catches but the admin wants to let through regardless).
+CREATE TABLE IF NOT EXISTS category_overrides (
+    id          INTEGER PRIMARY KEY,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    pattern     TEXT NOT NULL,
+    note        TEXT,
+    created_at  TEXT NOT NULL,
+    UNIQUE(category_id, pattern)
+);
+
+-- Which user/group/device this category is blocked for -- same shape as
+-- user_domains/group_domains/device_domains, opposite meaning (block, not
+-- allow). A category over controller/adguard_sync.py's per-target rule-
+-- count threshold can only ever be `categories.is_global` -- see that
+-- module's docstring for why (AdGuard Home has no way to scope a large
+-- subscribed list to a subset of clients).
+CREATE TABLE IF NOT EXISTS category_users (
+    id          INTEGER PRIMARY KEY,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE(category_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS category_groups (
+    id          INTEGER PRIMARY KEY,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    group_id    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    UNIQUE(category_id, group_id)
+);
+
+CREATE TABLE IF NOT EXISTS category_devices (
+    id          INTEGER PRIMARY KEY,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    UNIQUE(category_id, device_id)
+);
+
+-- Phase 8: a time window during which its assigned categories (or a full
+-- lockout) apply to its assigned users/groups/devices.
+--   days_of_week: comma list of lowercase 3-letter day codes, e.g.
+--       "mon,tue,wed,thu,fri". Evaluated in `time_zone`, not UTC -- see
+--       common/schedule_eval.py.
+--   start_time / end_time: "HH:MM" in `time_zone`. end_time < start_time
+--       means an overnight window (e.g. bedtime "21:00" to "06:00") --
+--       common/schedule_eval.py handles the wraparound explicitly.
+--   time_zone: IANA name (e.g. "America/Chicago"). Stored per-schedule
+--       (not read from a global default at evaluation time) so changing
+--       the household default later doesn't silently move an existing
+--       schedule's meaning.
+--   lockout_all: 1 = full nftables-tier lockout (no internet at all) for
+--       this schedule's targets while active -- controller/policy_state.py
+--       reads this, NOT schedule_categories, when it's set. 0 = a normal
+--       DNS-tier category block, using schedule_categories below.
+CREATE TABLE IF NOT EXISTS schedules (
+    id           INTEGER PRIMARY KEY,
+    name         TEXT UNIQUE NOT NULL,
+    days_of_week TEXT NOT NULL,
+    start_time   TEXT NOT NULL,
+    end_time     TEXT NOT NULL,
+    time_zone    TEXT NOT NULL,
+    lockout_all  INTEGER NOT NULL DEFAULT 0,
+    is_global    INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL
+);
+
+-- Which categories are blocked while a (non-lockout_all) schedule is
+-- active. Irrelevant for a lockout_all schedule (everything is blocked
+-- regardless), but not disallowed -- just unused by policy_state.py/
+-- adguard_sync.py in that case.
+CREATE TABLE IF NOT EXISTS schedule_categories (
+    id          INTEGER PRIMARY KEY,
+    schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    UNIQUE(schedule_id, category_id)
+);
+
+-- Who a schedule applies to -- same shape as category_users/groups/devices
+-- above (and user_domains/etc before that).
+CREATE TABLE IF NOT EXISTS schedule_users (
+    id          INTEGER PRIMARY KEY,
+    schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE(schedule_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS schedule_groups (
+    id          INTEGER PRIMARY KEY,
+    schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+    group_id    INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    UNIQUE(schedule_id, group_id)
+);
+
+CREATE TABLE IF NOT EXISTS schedule_devices (
+    id          INTEGER PRIMARY KEY,
+    schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    UNIQUE(schedule_id, device_id)
+);
+
 -- Phase 3 identity model (Milestone 4): every observed MAC<->IPv4
 -- pairing, feeding the interception controller's desired-state
 -- computation (controller/desired_state.py). A device's IP can change

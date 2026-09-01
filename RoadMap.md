@@ -2580,6 +2580,132 @@ raw port forwarding — worth designing the session/auth model correctly
 from the start rather than retrofitting later, even though it's not
 needed yet.
 
+## Phase 8 — Content categories & time-based schedules (built 2026-08-31/09-01)
+
+Requested directly: block by content category (Adult, Gambling, Weapons,
+Social Media, AI, etc. — not individual domains) and time-based
+schedules ("school sites only during school hours," "games OK in free
+time," "bedtime = no internet at all"), citing AdGuard's parental-control
+feature. That link was AdGuard **DNS** (the hosted cloud product, with 20+
+built-in content categories) — this project runs AdGuard **Home**
+(self-hosted), which has no such category concept at all, only a fixed
+catalog of named apps/services. Researched and verified live:
+[The Block List Project](https://github.com/blocklistproject/Lists)
+(MIT, actively maintained) covers a broad, comprehensive category set
+with a ready-made AdGuard-format file per category; no public list exists
+for "Weapons" or "AI," which stay manual-curation-only.
+
+**A real scale finding changed the design mid-build**: fetched real
+category sizes live — Porn 953,393 domains, Abuse 435,119, Gambling
+278,856, Fraud 256,268, down to Vaping 108, Smart TV 77. Expanding a
+953K-domain list into one `$client=`-scoped AdGuard custom rule per
+domain (the mechanism this project already used for per-domain
+assignment) is exactly what AdGuard's own team calls **unworkable** for
+per-client blocklist assignment
+([AdguardTeam/AdGuardHome#8103](https://github.com/AdguardTeam/AdGuardHome/discussions/8103)).
+Resolved with a size split, confirmed with the project owner: a category
+at or under **5,000 domains** can be scoped to a specific
+user/group/device via the existing custom-rule mechanism; a category
+over that can only ever be blocked for Everyone, enforced via AdGuard's
+own native filter-list subscription instead (letting AdGuard's engine,
+built for lists this size, handle it) — the dashboard's category routes
+enforce this at the point of assignment, not just as a suggestion.
+
+**Architecture** (see `docs/database/schema.md`, `docs/security/overview.md`
+for full detail):
+- New tables: `categories`, `category_domains` (subscription- vs.
+  manual-sourced, tracked separately so a re-sync never clobbers a manual
+  addition), `category_overrides` (allow-exceptions within a category),
+  `category_users`/`category_groups`/`category_devices` (block-list
+  targeting — the opposite polarity from `user_domains`/etc., which is an
+  allow-list), and the schedule equivalents: `schedules`
+  (days/start/end/time_zone/`lockout_all`/`is_global`),
+  `schedule_categories`, `schedule_users`/`schedule_groups`/`schedule_devices`.
+- `common/schedule_eval.py`: pure day/time/time-zone evaluation
+  (`schedule_is_active()`, stdlib `zoneinfo`, handles an overnight
+  window like bedtime 21:00→06:00 explicitly) plus
+  `is_full_lockout_active()`.
+- `common/blocklist_parser.py`: parses the three real subscription
+  formats (AdGuard/adblock, hosts-file, bare domain-per-line), verified
+  live against real Block List Project files.
+- `common/category_fetch.py`: fetches + parses a category's
+  `subscription_url`, replacing only its `source='subscription'` rows.
+  Lives in `common/` (not `controller/`) deliberately, so both the
+  dashboard's "Sync now" button and the controller's own scheduled loop
+  can use it without the two container images' identical flat-copy
+  layout silently colliding on a same-named file (the same reasoning
+  that already put `adguard_client.py` in `common/` and
+  `adguard_sync.py` in `controller/`).
+- `controller/adguard_sync.py`: `build_category_deny_rules()` (the
+  ≤5,000-domain path, reusing `_domain_rule()` — emits a cheap *unscoped*
+  rule when a category currently applies to every eligible device, a
+  `$client=`-scoped one otherwise) and `sync_category_subscriptions()`
+  (the >5,000-domain path — adds/toggles AdGuard's own native filter
+  subscription, enabled either because the category is directly
+  `is_global` or because an `is_global` schedule referencing it is
+  currently active).
+- `common/adguard_client.py`: three new functions
+  (`add_filter_url`/`remove_filter_url`/`set_filter_url_enabled` +
+  `get_filters_status`) for that native-subscription mechanism — **not
+  yet live-verified** (built from AdGuard's published OpenAPI spec; no
+  Docker available locally and the smoke-test VM was offline when
+  written — first thing to confirm once it's back).
+- `controller/policy_state.py`: `compute_desired_policy()` gained a pure
+  computed overlay — a device under an active `lockout_all` schedule is
+  reclassified to `QUARANTINE` for that cycle only, **never writing
+  `devices.quarantined_at`**, keeping a manual operator quarantine and a
+  scheduled bedtime lockout on fully independent axes (same separation
+  `bump_eligible()` already established for bump vs. base
+  classification). Confirmed via code exploration that
+  `phase3/nftables-manager`'s Go side needed **zero changes** — it
+  already treats the `quarantine_v4` set as a pure opaque IP bucket.
+- Dashboard: new Categories and Schedules pages (`/categories`,
+  `/schedules`), reusing the existing combobox/`ACCESS_SELECTS` widget
+  pattern (relabeled `BLOCK_ACCESS_SELECTS` — block semantics, the
+  opposite of the Domains page's allow semantics), plus a household
+  default time zone setting.
+- `controller/requirements.txt`/`dashboard/requirements.txt` gained
+  `tzdata` — a second deliberate, documented exception to this project's
+  stdlib-only discipline (same footing as `pyroute2`: pure data, no
+  compiler needed), since `zoneinfo` has no bundled tz database of its
+  own and neither Windows nor `python:3.12-slim` are guaranteed to have
+  system tzdata.
+
+**Testing**: 87 new tests across `common/schedule_eval.py`,
+`common/blocklist_parser.py`, `common/matching.py`'s two new targeting
+predicates, `common/category_fetch.py`, `common/adguard_client.py`'s new
+functions, `controller/adguard_sync.py`'s two new rule-builders,
+`controller/policy_state.py`'s lockout overlay, and the dashboard's new
+routes — 639 passing / 30 skipped (pre-existing Windows-platform gaps)
+after this pass, zero regressions. Also live-verified end-to-end against
+the seeded dashboard (add category → add domain/override → set Blocked
+for → confirmed in DB; add schedule → confirmed lockout badge, categories
+section correctly hidden for a `lockout_all` schedule) — clean server log
+throughout, only a pre-existing, unrelated service-worker console error
+also present on the already-shipped Domains page.
+
+**Not yet live-verified (needs the VM)**: AdGuard Home actually applying
+a category custom rule or a native filter subscription on real DNS
+queries; a real device losing all connectivity via the `quarantine_v4`
+nftables set during a simulated bedtime window; the exact
+`add_filter_url`/`set_filter_url` request/response shape (see above).
+
+**Resolved same session**: the project owner asked for a sensible default
+set to be seeded now. `defaults/seed_defaults.py` gained
+`DEFAULT_CATEGORIES` -- 10 starter categories (Adult, Gambling, Drugs,
+Fraud & Scams, Facebook, TikTok, Twitter/X, WhatsApp — all with a real
+Block List Project `subscription_url`; AI and Weapons manual-only, no
+`subscription_url`, since no public list exists for either), none
+`is_global` by default (seeding the row alone blocks nothing — an admin
+still has to turn one on and choose who it applies to). **Verified for
+real, not just mocked**: ran `category_fetch.fetch_and_sync_category()`
+against the real, live WhatsApp URL end-to-end (no test doubles) — fetched
+226 real domains, parsed and `re.escape()`d correctly
+(`account\.whatsapp\.com`, etc.), stored with `source='subscription'`,
+`last_synced_at` set. Two more tests added to
+`tests/test_seed_idempotent.py` (10 total categories seeded; a re-seed
+never overwrites an admin's own `is_global` edit) — 641 tests total.
+
 ---
 
 ## Cross-cutting: security-by-design

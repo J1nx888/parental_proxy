@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 from policy_class import PolicyClass, bump_eligible, classify_device, to_set_name
+from schedule_eval import is_full_lockout_active
 
 # The nftables-manager side's fifth, independent set (policy.SetBump) --
 # not one of PolicyClass's four mutually-exclusive values, so it isn't
@@ -22,7 +24,9 @@ from policy_class import PolicyClass, bump_eligible, classify_device, to_set_nam
 _BUMP_SET_NAME = "bump"
 
 
-def compute_desired_policy(conn: sqlite3.Connection) -> dict[str, list[str]]:
+def compute_desired_policy(
+    conn: sqlite3.Connection, now: datetime | None = None
+) -> dict[str, list[str]]:
     """One entry per PolicyClass's nftables set name, each holding the
     IPv4 addresses of every device currently classified into it, PLUS
     an independent `"bump"` entry (RoadMap.md's "two independent axes"
@@ -40,21 +44,44 @@ def compute_desired_policy(conn: sqlite3.Connection) -> dict[str, list[str]]:
     routed through this device's identity should get that device's
     policy. Devices with no active binding contribute nothing -- there's
     no IP to add to any set.
+
+    **Phase 8 (2026-08-31)**: `now` (defaults to the current UTC instant;
+    tests inject a fixed value) drives a second, independent overlay --
+    a device whose classify_device() result ISN'T already BYPASS gets
+    reclassified to QUARANTINE if `schedule_eval.is_full_lockout_active()`
+    says a `lockout_all` schedule currently targets it. This is a PURE
+    computation, same as bump_eligible() above -- it never writes
+    `devices.quarantined_at`, so a manual operator quarantine (that
+    column) and a scheduled bedtime lockout (this overlay) stay on fully
+    independent axes: a device an admin manually quarantined stays
+    quarantined regardless of any schedule, and a device under an active
+    bedtime schedule returns to its normal classification the moment the
+    window ends, with nothing left over to clean up. An already-BYPASS
+    (`ignored`) device is never overridden -- "outside the whole system,
+    for good" (common/db.py's own words on that column) includes being
+    outside schedules too, matching the same baseline-protection rule
+    already applied to AdGuard in controller/adguard_sync.py.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
     policy: dict[str, list[str]] = {to_set_name(pc): [] for pc in PolicyClass}
     policy[_BUMP_SET_NAME] = []
 
     rows = conn.execute(
         """
-        SELECT d.ignored, d.quarantined_at, d.is_authenticated, d.bump_enabled,
-               d.bypass_login, b.ipv4_address
+        SELECT d.id, d.user_id, d.group_id, d.ignored, d.quarantined_at, d.is_authenticated,
+               d.bump_enabled, d.bypass_login, b.ipv4_address
         FROM devices d
         JOIN device_bindings b ON b.device_id = d.id AND b.active = 1
         """
     ).fetchall()
 
     for row in rows:
-        policy[to_set_name(classify_device(row))].append(row["ipv4_address"])
+        policy_class = classify_device(row)
+        if policy_class != PolicyClass.BYPASS and is_full_lockout_active(conn, row, now):
+            policy_class = PolicyClass.QUARANTINE
+        policy[to_set_name(policy_class)].append(row["ipv4_address"])
         if bump_eligible(row):
             policy[_BUMP_SET_NAME].append(row["ipv4_address"])
 

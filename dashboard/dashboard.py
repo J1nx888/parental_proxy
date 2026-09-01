@@ -27,11 +27,15 @@ from flask import Flask, Response, redirect, render_template_string, request, se
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import zoneinfo
+
 import adguard_client
 import auth
+import category_fetch
 import cr_api
 import db
 import matching
+import schedule_eval
 
 CA_CERT_PATH = Path(os.environ.get("PP_CA_CERT_PATH", "/config/ssl_cert/ca_cert.pem"))
 
@@ -106,6 +110,11 @@ def bootstrap_admin() -> None:
         db.set_setting_if_absent(conn, "adguard_url", os.environ.get("ADGUARD_URL", ""))
         db.set_setting_if_absent(conn, "adguard_username", os.environ.get("ADGUARD_USERNAME", "admin"))
         db.set_setting_if_absent(conn, "adguard_password", os.environ.get("ADGUARD_PASSWORD", ""))
+        # Phase 8: default IANA time zone new schedules are created with --
+        # each schedule still stores its OWN time_zone once created (see
+        # common/db.py's schedules table comment), so changing this later
+        # never silently moves an existing schedule's meaning.
+        db.set_setting_if_absent(conn, "household_time_zone", os.environ.get("HOUSEHOLD_TIME_ZONE", "UTC"))
         conn.commit()
     finally:
         conn.close()
@@ -178,7 +187,7 @@ try { if (localStorage.getItem("pp_sidebar_collapsed") === "1") document.documen
 </script>
 </head>
 <body>
-{% set page_titles = {'report': 'Report', 'users': 'Users', 'domains': 'Domains', 'devices': 'Devices', 'health': 'Health', 'settings': 'Settings'} %}
+{% set page_titles = {'report': 'Report', 'users': 'Users', 'domains': 'Domains', 'categories': 'Categories', 'schedules': 'Schedules', 'devices': 'Devices', 'health': 'Health', 'settings': 'Settings'} %}
 <div class="app-shell">
   <nav class="sidebar">
     <a class="sidebar-brand" href="{{ url_for('report') }}">
@@ -197,6 +206,14 @@ try { if (localStorage.getItem("pp_sidebar_collapsed") === "1") document.documen
       <a class="sidebar-item {{ 'active' if active=='domains' else '' }}" href="{{ url_for('domains') }}" title="Domains">
         <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="3" y1="12" x2="21" y2="12"/><path d="M12 3a14.5 14.5 0 0 1 0 18a14.5 14.5 0 0 1 0-18z"/></svg>
         <span class="sidebar-label">Domains</span>
+      </a>
+      <a class="sidebar-item {{ 'active' if active=='categories' else '' }}" href="{{ url_for('categories') }}" title="Categories">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41L13.42 20.58a2 2 0 0 1-2.83 0L2.59 12.58a2 2 0 0 1 0-2.83L9.76 2.58A2 2 0 0 1 12.59 2.58"/><circle cx="7.5" cy="7.5" r="1.5"/></svg>
+        <span class="sidebar-label">Categories</span>
+      </a>
+      <a class="sidebar-item {{ 'active' if active=='schedules' else '' }}" href="{{ url_for('schedules') }}" title="Schedules">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span class="sidebar-label">Schedules</span>
       </a>
       <a class="sidebar-item {{ 'active' if active=='devices' else '' }}" href="{{ url_for('devices') }}" title="Devices">
         <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
@@ -917,6 +934,51 @@ ACCESS_SELECTS = """
     </div>
   </div>
   <p class="hint" style="margin-top:.5rem;">Type to search, then click a result to add it as a tag -- click a tag's &times; to remove it.</p>
+"""
+
+# Phase 8: same widget/field shape as ACCESS_SELECTS above (is_global +
+# three multi comboboxes, posting user_ids/group_ids/device_ids) -- but
+# categories/schedules are a BLOCK-list, the opposite polarity from
+# domains' allow-list, so the copy says "Block for" / "Blocked for"
+# instead of "Everyone" / the allow-oriented hint text, to avoid this
+# reading like the Domains page's grant. Needs the exact same template
+# variables in scope (all_users_combo/all_groups_combo/all_devices_combo,
+# preselected_*_ids, is_global_checked).
+BLOCK_ACCESS_SELECTS = """
+  <label><input type="checkbox" name="is_global" {{ 'checked' if is_global_checked }}> Block for Everyone</label>
+  <div class="access-grid">
+    <div>
+      <div class="access-label">Users</div>
+      <div class="combobox" data-combobox data-mode="multi" data-field="user_ids" data-empty="No users yet.">
+        <div class="combobox-tags" data-combobox-tags></div>
+        <input type="search" class="combobox-input" data-combobox-input placeholder="Search users&hellip;">
+        <div class="combobox-results" data-combobox-results></div>
+        <script type="application/json" data-combobox-items>{{ all_users_combo|tojson }}</script>
+        <script type="application/json" data-combobox-selected>{{ preselected_user_ids|list|tojson }}</script>
+      </div>
+    </div>
+    <div>
+      <div class="access-label">Groups</div>
+      <div class="combobox" data-combobox data-mode="multi" data-field="group_ids" data-empty="No groups yet.">
+        <div class="combobox-tags" data-combobox-tags></div>
+        <input type="search" class="combobox-input" data-combobox-input placeholder="Search groups&hellip;">
+        <div class="combobox-results" data-combobox-results></div>
+        <script type="application/json" data-combobox-items>{{ all_groups_combo|tojson }}</script>
+        <script type="application/json" data-combobox-selected>{{ preselected_group_ids|list|tojson }}</script>
+      </div>
+    </div>
+    <div>
+      <div class="access-label">Devices</div>
+      <div class="combobox" data-combobox data-mode="multi" data-field="device_ids" data-empty="No devices yet.">
+        <div class="combobox-tags" data-combobox-tags></div>
+        <input type="search" class="combobox-input" data-combobox-input placeholder="Search devices&hellip;">
+        <div class="combobox-results" data-combobox-results></div>
+        <script type="application/json" data-combobox-items>{{ all_devices_combo|tojson }}</script>
+        <script type="application/json" data-combobox-selected>{{ preselected_device_ids|list|tojson }}</script>
+      </div>
+    </div>
+  </div>
+  <p class="hint" style="margin-top:.5rem;">Type to search, then click a result to add it as a tag -- click a tag's &times; to remove it. Blocked for Everyone always wins regardless of what's checked below.</p>
 """
 
 
@@ -1702,6 +1764,692 @@ DEVICES_BODY = """
 </form>
 </div>
 """
+
+
+# ==========================================================
+# CATEGORIES (Phase 8)
+# ==========================================================
+
+CATEGORIES_BODY = """
+<div class="card">
+<h2>Categories ({{ categories|length }})</h2>
+<p class="hint">
+  A category BLOCKS a set of domains for whoever it's assigned to (or everyone) --
+  the opposite of the <a href="{{ url_for('domains') }}">Domains</a> page, which grants access.
+  Domains come from a subscribed list, manual additions, or both.
+</p>
+{% if categories %}<input type="search" data-filter-table="categoriesTable" placeholder="Search categories&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">{% endif %}
+<div class="table-scroll">
+<table id="categoriesTable">
+  <tr><th>Name</th><th>Domains</th><th>Blocked for</th><th>Last synced</th><th></th></tr>
+  {% for c in categories %}
+  <tr>
+    <td>{{ c.name }}</td>
+    <td>{{ c.domain_count }}{% if c.domain_count > max_scoped %} <span class="badge blocked" title="Over {{ max_scoped }} domains -- can only be blocked for Everyone, see Manage">everyone-only</span>{% endif %}</td>
+    <td>{{ 'Everyone' if c.is_global else 'Per-user/group/device' }}</td>
+    <td>{{ c.last_synced_at or ('Manual only' if not c.subscription_url else 'Never') }}</td>
+    <td>
+      <a class="btn small" href="{{ url_for('category_detail', category_id=c.id) }}">Manage</a>
+      <form class="inline" method="post" action="{{ url_for('delete_category') }}">
+        <input type="hidden" name="category_id" value="{{ c.id }}">
+        <button class="danger small" type="submit" onclick="return confirm('Delete this category?')">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5"><em>No categories configured.</em></td></tr>
+  {% endfor %}
+</table>
+</div>
+
+<form class="add-form" method="post" action="{{ url_for('add_category') }}">
+  <input type="text" name="name" placeholder="e.g. Gambling" required>
+  <input type="text" name="subscription_url" placeholder="Subscription URL (optional -- leave blank for a manual-only category)" style="flex:1; min-width:320px;">
+  <button class="add" type="submit">Add category</button>
+</form>
+<p class="hint">A category over {{ max_scoped }} domains (a large subscribed list) can only ever be blocked for Everyone -- AdGuard Home has no way to scope a list that size to specific people/devices. Smaller categories can be assigned however you like.</p>
+</div>
+
+{% if categories|selectattr('subscription_url')|list %}
+<div class="card">
+<h2>Refresh subscriptions</h2>
+<p class="hint">Re-fetches every category's subscription list right now, instead of waiting for the daily background refresh. A slow or unreachable source is skipped without affecting the others.</p>
+<form method="post" action="{{ url_for('sync_all_categories_now') }}">
+  <button class="add" type="submit">Sync all subscriptions now</button>
+</form>
+</div>
+{% endif %}
+"""
+
+
+def _category_row_context(conn, category) -> dict:
+    domain_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM category_domains WHERE category_id = ?", (category["id"],)
+    ).fetchone()["c"]
+    return {**dict(category), "domain_count": domain_count}
+
+
+@app.route("/categories")
+@require_admin
+def categories():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM categories ORDER BY is_global DESC, name").fetchall()
+    body = render_template_string(
+        CATEGORIES_BODY,
+        categories=[_category_row_context(conn, c) for c in rows],
+        max_scoped=matching.MAX_SCOPED_CATEGORY_DOMAINS,
+    )
+    return render("categories", body)
+
+
+@app.route("/categories/add", methods=["POST"])
+@require_admin
+def add_category():
+    name = request.form.get("name", "").strip()
+    subscription_url = request.form.get("subscription_url", "").strip() or None
+    if not name:
+        return flash_redirect("categories", "Name is required.", error=True)
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO categories (name, subscription_url, is_global, created_at) VALUES (?, ?, 0, ?)",
+            (name, subscription_url, db.now_iso()),
+        )
+        conn.commit()
+    except Exception as exc:
+        if "UNIQUE" in str(exc):
+            return flash_redirect("categories", f"{name!r} already exists.", error=True)
+        raise
+    return flash_redirect("categories", f"Added {name}.")
+
+
+@app.route("/categories/delete", methods=["POST"])
+@require_admin
+def delete_category():
+    category_id = request.form.get("category_id", "")
+    conn = get_db()
+    conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+    conn.commit()
+    return flash_redirect("categories", "Category removed.")
+
+
+CATEGORY_DETAIL_BODY = """
+<p><a href="{{ url_for('categories') }}">&larr; All categories</a></p>
+<h1>{{ c.name }}</h1>
+
+{% if c.subscription_url %}
+<div class="card">
+<h2>Subscription</h2>
+<p class="hint"><code>{{ c.subscription_url }}</code></p>
+<p class="hint">Last synced: {{ c.last_synced_at or 'never' }}. {{ domain_count }} domain{{ 's' if domain_count != 1 else '' }} from this source (plus any manual additions below).</p>
+<form method="post" action="{{ url_for('sync_category_now', category_id=c.id) }}">
+  <button class="add" type="submit">Sync now</button>
+</form>
+</div>
+{% endif %}
+
+<div class="card">
+<h2>Blocked for</h2>
+{% if over_threshold %}
+<p class="hint"><strong>This category has {{ domain_count }} domains -- over the {{ max_scoped }}-domain limit for per-target scoping.</strong> AdGuard Home has no way to apply a list this size to just some people/devices, so it can only be blocked for Everyone or not at all.</p>
+<form method="post" action="{{ url_for('update_category_access') }}">
+  <input type="hidden" name="category_id" value="{{ c.id }}">
+  <label><input type="checkbox" name="is_global" {{ 'checked' if c.is_global }}> Block for Everyone</label>
+  <button class="add" type="submit" style="margin-top:.8rem; display:block;">Save</button>
+</form>
+{% else %}
+<form method="post" action="{{ url_for('update_category_access') }}">
+  <input type="hidden" name="category_id" value="{{ c.id }}">
+""" + BLOCK_ACCESS_SELECTS + """
+  <button class="add" type="submit" style="margin-top:.8rem;">Save</button>
+</form>
+{% endif %}
+</div>
+
+<div class="card">
+<h2>Domains ({{ domain_count }})</h2>
+<div class="table-scroll">
+<table>
+  <tr><th>Pattern</th><th>Source</th><th></th></tr>
+  {% for d in category_domains %}
+  <tr>
+    <td><code>{{ d.pattern }}</code></td>
+    <td><span class="badge {{ 'mode-bump' if d.source == 'manual' else 'mode-splice' }}">{{ d.source }}</span></td>
+    <td>
+      {% if d.source == 'manual' %}
+      <form class="inline" method="post" action="{{ url_for('delete_category_domain') }}">
+        <input type="hidden" name="category_domain_id" value="{{ d.id }}">
+        <button class="danger small" type="submit">Remove</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3"><em>No domains yet.</em></td></tr>
+  {% endfor %}
+</table>
+</div>
+<form class="add-form" method="post" action="{{ url_for('add_category_domain') }}">
+  <input type="hidden" name="category_id" value="{{ c.id }}">
+  <input type="text" name="pattern" placeholder="e.g. example\\.com" required>
+  <button class="add" type="submit">Add domain</button>
+</form>
+<p class="hint">Manually-added domains are never touched by a subscription sync.</p>
+</div>
+
+<div class="card">
+<h2>Allow-exceptions ({{ overrides|length }})</h2>
+<p class="hint">A domain listed here is never blocked by this category, even if it's also in the subscribed list.</p>
+<div class="table-scroll">
+<table>
+  <tr><th>Pattern</th><th>Note</th><th></th></tr>
+  {% for o in overrides %}
+  <tr>
+    <td><code>{{ o.pattern }}</code></td>
+    <td>{{ o.note or '' }}</td>
+    <td>
+      <form class="inline" method="post" action="{{ url_for('delete_category_override') }}">
+        <input type="hidden" name="override_id" value="{{ o.id }}">
+        <button class="danger small" type="submit">Remove</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="3"><em>No exceptions.</em></td></tr>
+  {% endfor %}
+</table>
+</div>
+<form class="add-form" method="post" action="{{ url_for('add_category_override') }}">
+  <input type="hidden" name="category_id" value="{{ c.id }}">
+  <input type="text" name="pattern" placeholder="Exact pattern to allow, e.g. example\\.com" style="flex:1; min-width:280px;" required>
+  <input type="text" name="note" placeholder="Note (optional)">
+  <button class="add" type="submit">Add exception</button>
+</form>
+<p class="hint">Must match a pattern's exact text as stored above (see the Domains column) -- not a broader or narrower pattern that happens to overlap it.</p>
+</div>
+"""
+
+
+@app.route("/categories/<int:category_id>")
+@require_admin
+def category_detail(category_id: int):
+    conn = get_db()
+    c = conn.execute("SELECT * FROM categories WHERE id = ?", (category_id,)).fetchone()
+    if c is None:
+        return flash_redirect("categories", "That category no longer exists.", error=True)
+    all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+    all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
+    all_devices = conn.execute("SELECT * FROM devices ORDER BY COALESCE(label, mac_address)").fetchall()
+    domain_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM category_domains WHERE category_id = ?", (category_id,)
+    ).fetchone()["c"]
+    body = render_template_string(
+        CATEGORY_DETAIL_BODY, c=c, domain_count=domain_count,
+        over_threshold=domain_count > matching.MAX_SCOPED_CATEGORY_DOMAINS,
+        max_scoped=matching.MAX_SCOPED_CATEGORY_DOMAINS,
+        category_domains=conn.execute(
+            "SELECT * FROM category_domains WHERE category_id = ? ORDER BY source, pattern", (category_id,)
+        ).fetchall(),
+        overrides=conn.execute(
+            "SELECT * FROM category_overrides WHERE category_id = ? ORDER BY pattern", (category_id,)
+        ).fetchall(),
+        all_users_combo=_entity_combo(all_users, lambda u: u["display_name"]),
+        all_groups_combo=_entity_combo(all_groups, lambda g: g["name"]),
+        all_devices_combo=_entity_combo(all_devices, lambda dev: dev["label"] or dev["mac_address"]),
+        preselected_user_ids={
+            row["user_id"] for row in conn.execute(
+                "SELECT user_id FROM category_users WHERE category_id = ?", (category_id,)
+            )
+        },
+        preselected_group_ids={
+            row["group_id"] for row in conn.execute(
+                "SELECT group_id FROM category_groups WHERE category_id = ?", (category_id,)
+            )
+        },
+        preselected_device_ids={
+            row["device_id"] for row in conn.execute(
+                "SELECT device_id FROM category_devices WHERE category_id = ?", (category_id,)
+            )
+        },
+        is_global_checked=bool(c["is_global"]),
+    )
+    return render("categories", body)
+
+
+@app.route("/categories/access", methods=["POST"])
+@require_admin
+def update_category_access():
+    """Replaces a category's entire block-target set (Everyone + users +
+    groups + devices) with exactly what was submitted -- same
+    grant-and-revoke-are-the-same-action shape as update_domain_access(),
+    just BLOCK instead of allow. A category over
+    matching.MAX_SCOPED_CATEGORY_DOMAINS is rejected unless the result is
+    is_global-only (see controller/adguard_sync.py's docstring for why:
+    AdGuard Home can't scope a list that size to a subset of clients)."""
+    category_id = request.form.get("category_id", "")
+    is_global = 1 if request.form.get("is_global") else 0
+    user_ids = {int(x) for x in request.form.getlist("user_ids") if x.isdigit()}
+    group_ids = {int(x) for x in request.form.getlist("group_ids") if x.isdigit()}
+    device_ids = {int(x) for x in request.form.getlist("device_ids") if x.isdigit()}
+
+    conn = get_db()
+    domain_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM category_domains WHERE category_id = ?", (category_id,)
+    ).fetchone()["c"]
+    if domain_count > matching.MAX_SCOPED_CATEGORY_DOMAINS and not is_global and (user_ids or group_ids or device_ids):
+        return flash_redirect(
+            "category_detail", "This category is too large to scope to specific people/devices -- "
+            "it can only be blocked for Everyone.", error=True, category_id=category_id,
+        )
+
+    conn.execute("UPDATE categories SET is_global = ? WHERE id = ?", (is_global, category_id))
+    conn.execute("DELETE FROM category_users WHERE category_id = ?", (category_id,))
+    for uid in user_ids:
+        conn.execute("INSERT OR IGNORE INTO category_users (category_id, user_id) VALUES (?,?)", (category_id, uid))
+    conn.execute("DELETE FROM category_groups WHERE category_id = ?", (category_id,))
+    for gid in group_ids:
+        conn.execute("INSERT OR IGNORE INTO category_groups (category_id, group_id) VALUES (?,?)", (category_id, gid))
+    conn.execute("DELETE FROM category_devices WHERE category_id = ?", (category_id,))
+    for did in device_ids:
+        conn.execute("INSERT OR IGNORE INTO category_devices (category_id, device_id) VALUES (?,?)", (category_id, did))
+    conn.commit()
+    return flash_redirect("category_detail", "Access updated.", category_id=category_id)
+
+
+@app.route("/categories/domains/add", methods=["POST"])
+@require_admin
+def add_category_domain():
+    category_id = request.form.get("category_id", "")
+    pattern = request.form.get("pattern", "").strip()
+    if not pattern:
+        return flash_redirect("category_detail", "Pattern is required.", error=True, category_id=category_id)
+    if len(pattern) > 200:
+        return flash_redirect("category_detail", "Pattern too long (200 characters max).", error=True, category_id=category_id)
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        return flash_redirect("category_detail", f"Not a valid regex: {exc}", error=True, category_id=category_id)
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO category_domains (category_id, pattern, source, created_at) "
+        "VALUES (?, ?, 'manual', ?)",
+        (category_id, pattern, db.now_iso()),
+    )
+    conn.commit()
+    return flash_redirect("category_detail", "Domain added.", category_id=category_id)
+
+
+@app.route("/categories/domains/delete", methods=["POST"])
+@require_admin
+def delete_category_domain():
+    category_domain_id = request.form.get("category_domain_id", "")
+    conn = get_db()
+    row = conn.execute("SELECT category_id FROM category_domains WHERE id = ?", (category_domain_id,)).fetchone()
+    if row is None:
+        return flash_redirect("categories", "That domain no longer exists.", error=True)
+    conn.execute("DELETE FROM category_domains WHERE id = ? AND source = 'manual'", (category_domain_id,))
+    conn.commit()
+    return flash_redirect("category_detail", "Domain removed.", category_id=row["category_id"])
+
+
+@app.route("/categories/overrides/add", methods=["POST"])
+@require_admin
+def add_category_override():
+    category_id = request.form.get("category_id", "")
+    pattern = request.form.get("pattern", "").strip()
+    note = request.form.get("note", "").strip() or None
+    if not pattern:
+        return flash_redirect("category_detail", "Pattern is required.", error=True, category_id=category_id)
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO category_overrides (category_id, pattern, note, created_at) VALUES (?, ?, ?, ?)",
+        (category_id, pattern, note, db.now_iso()),
+    )
+    conn.commit()
+    return flash_redirect("category_detail", "Exception added.", category_id=category_id)
+
+
+@app.route("/categories/overrides/delete", methods=["POST"])
+@require_admin
+def delete_category_override():
+    override_id = request.form.get("override_id", "")
+    conn = get_db()
+    row = conn.execute("SELECT category_id FROM category_overrides WHERE id = ?", (override_id,)).fetchone()
+    if row is None:
+        return flash_redirect("categories", "That exception no longer exists.", error=True)
+    conn.execute("DELETE FROM category_overrides WHERE id = ?", (override_id,))
+    conn.commit()
+    return flash_redirect("category_detail", "Exception removed.", category_id=row["category_id"])
+
+
+@app.route("/categories/<int:category_id>/sync", methods=["POST"])
+@require_admin
+def sync_category_now(category_id: int):
+    conn = get_db()
+    category = conn.execute("SELECT * FROM categories WHERE id = ?", (category_id,)).fetchone()
+    if category is None:
+        return flash_redirect("categories", "That category no longer exists.", error=True)
+    try:
+        count = category_fetch.fetch_and_sync_category(conn, category)
+    except category_fetch.CategoryFetchError as exc:
+        return flash_redirect("category_detail", f"Sync failed: {exc}", error=True, category_id=category_id)
+    return flash_redirect("category_detail", f"Synced {count} domains.", category_id=category_id)
+
+
+@app.route("/categories/sync-all", methods=["POST"])
+@require_admin
+def sync_all_categories_now():
+    conn = get_db()
+    results = category_fetch.sync_all_categories(conn)
+    total = sum(results.values())
+    return flash_redirect("categories", f"Synced {len(results)} categor{'y' if len(results) == 1 else 'ies'}, {total} domains total.")
+
+
+# ==========================================================
+# SCHEDULES (Phase 8)
+# ==========================================================
+
+_DAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+_DAY_LABELS = {"mon": "Mon", "tue": "Tue", "wed": "Wed", "thu": "Thu", "fri": "Fri", "sat": "Sat", "sun": "Sun"}
+
+DAY_CHECKBOXES = """
+  <div class="access-label" style="margin-top:.6rem;">Days</div>
+  <div style="display:flex; gap:.8rem; flex-wrap:wrap; margin:.3rem 0 .6rem;">
+  {% for code in day_codes %}
+    <label><input type="checkbox" name="days" value="{{ code }}" {{ 'checked' if code in selected_days }}> {{ day_labels[code] }}</label>
+  {% endfor %}
+  </div>
+"""
+
+SCHEDULES_BODY = """
+<div class="card">
+<h2>Schedules ({{ schedules|length }})</h2>
+<p class="hint">A schedule blocks categories (or everything) for whoever it's assigned to, only while its time window is open -- e.g. "block Social Media on school days 08:00-15:00" or "no internet at all, every night 21:00-06:00."</p>
+{% if schedules %}<input type="search" data-filter-table="schedulesTable" placeholder="Search schedules&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">{% endif %}
+<div class="table-scroll">
+<table id="schedulesTable">
+  <tr><th>Name</th><th>Days</th><th>Window</th><th>Effect</th><th>Applies to</th><th></th></tr>
+  {% for s in schedules %}
+  <tr>
+    <td>{{ s.name }}</td>
+    <td>{{ s.days_of_week }}</td>
+    <td>{{ s.start_time }}&ndash;{{ s.end_time }} {{ s.time_zone }}</td>
+    <td>{% if s.lockout_all %}<span class="badge blocked">full lockout</span>{% else %}{{ s.category_count }} categor{{ 'y' if s.category_count == 1 else 'ies' }}{% endif %}</td>
+    <td>{{ 'Everyone' if s.is_global else 'Per-user/group/device' }}</td>
+    <td>
+      <a class="btn small" href="{{ url_for('schedule_detail', schedule_id=s.id) }}">Manage</a>
+      <form class="inline" method="post" action="{{ url_for('delete_schedule') }}">
+        <input type="hidden" name="schedule_id" value="{{ s.id }}">
+        <button class="danger small" type="submit" onclick="return confirm('Delete this schedule?')">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6"><em>No schedules configured.</em></td></tr>
+  {% endfor %}
+</table>
+</div>
+
+<form class="add-form" method="post" action="{{ url_for('add_schedule') }}" style="flex-wrap:wrap;">
+  <input type="text" name="name" placeholder="e.g. Bedtime" required style="flex:1; min-width:200px;">
+""" + DAY_CHECKBOXES + """
+  <input type="time" name="start_time" value="21:00" required>
+  <span class="hint" style="margin:0;">to</span>
+  <input type="time" name="end_time" value="06:00" required>
+  <select name="time_zone">
+    {% for tz in available_time_zones %}
+    <option value="{{ tz }}" {{ 'selected' if tz == household_time_zone }}>{{ tz }}</option>
+    {% endfor %}
+  </select>
+  <label><input type="checkbox" name="lockout_all"> Full lockout (no internet at all)</label>
+  <button class="add" type="submit">Add schedule</button>
+</form>
+<p class="hint">An end time earlier than the start time means an overnight window (like the Bedtime example above) -- it's treated as running past midnight into the next day.</p>
+</div>
+"""
+
+
+def _schedule_row_context(conn, schedule) -> dict:
+    category_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM schedule_categories WHERE schedule_id = ?", (schedule["id"],)
+    ).fetchone()["c"]
+    return {**dict(schedule), "category_count": category_count}
+
+
+def _parse_days(raw_days: list[str]) -> str | None:
+    days = [d for d in raw_days if d in _DAY_CODES]
+    return ",".join(days) if days else None
+
+
+def _valid_time(value: str) -> bool:
+    return bool(re.match(r"^\d{2}:\d{2}$", value or ""))
+
+
+@app.route("/schedules")
+@require_admin
+def schedules():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM schedules ORDER BY is_global DESC, name").fetchall()
+    household_time_zone = db.get_setting(conn, "household_time_zone", "UTC")
+    body = render_template_string(
+        SCHEDULES_BODY,
+        schedules=[_schedule_row_context(conn, s) for s in rows],
+        day_codes=_DAY_CODES, day_labels=_DAY_LABELS, selected_days=set(),
+        household_time_zone=household_time_zone,
+        available_time_zones=sorted(zoneinfo.available_timezones()),
+    )
+    return render("schedules", body)
+
+
+@app.route("/schedules/add", methods=["POST"])
+@require_admin
+def add_schedule():
+    name = request.form.get("name", "").strip()
+    days = _parse_days(request.form.getlist("days"))
+    start_time = request.form.get("start_time", "")
+    end_time = request.form.get("end_time", "")
+    time_zone = request.form.get("time_zone", "UTC")
+    lockout_all = 1 if request.form.get("lockout_all") else 0
+
+    if not name:
+        return flash_redirect("schedules", "Name is required.", error=True)
+    if not days:
+        return flash_redirect("schedules", "Pick at least one day.", error=True)
+    if not (_valid_time(start_time) and _valid_time(end_time)):
+        return flash_redirect("schedules", "Start and end time are required.", error=True)
+    if time_zone not in zoneinfo.available_timezones():
+        return flash_redirect("schedules", "That doesn't look like a real time zone.", error=True)
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO schedules (name, days_of_week, start_time, end_time, time_zone, "
+            "lockout_all, is_global, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            (name, days, start_time, end_time, time_zone, lockout_all, db.now_iso()),
+        )
+        conn.commit()
+    except Exception as exc:
+        if "UNIQUE" in str(exc):
+            return flash_redirect("schedules", f"{name!r} already exists.", error=True)
+        raise
+    return flash_redirect("schedules", f"Added {name}.")
+
+
+@app.route("/schedules/delete", methods=["POST"])
+@require_admin
+def delete_schedule():
+    schedule_id = request.form.get("schedule_id", "")
+    conn = get_db()
+    conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+    conn.commit()
+    return flash_redirect("schedules", "Schedule removed.")
+
+
+SCHEDULE_DETAIL_BODY = """
+<p><a href="{{ url_for('schedules') }}">&larr; All schedules</a></p>
+<h1>{{ s.name }}</h1>
+
+<div class="card">
+<h2>When</h2>
+<form class="add-form" method="post" action="{{ url_for('update_schedule') }}" style="flex-wrap:wrap;">
+  <input type="hidden" name="schedule_id" value="{{ s.id }}">
+""" + DAY_CHECKBOXES + """
+  <input type="time" name="start_time" value="{{ s.start_time }}" required>
+  <span class="hint" style="margin:0;">to</span>
+  <input type="time" name="end_time" value="{{ s.end_time }}" required>
+  <select name="time_zone">
+    {% for tz in available_time_zones %}
+    <option value="{{ tz }}" {{ 'selected' if tz == s.time_zone }}>{{ tz }}</option>
+    {% endfor %}
+  </select>
+  <label><input type="checkbox" name="lockout_all" {{ 'checked' if s.lockout_all }}> Full lockout (no internet at all)</label>
+  <button class="add" type="submit">Save</button>
+</form>
+<p class="hint">An end time earlier than the start time runs past midnight into the next day.</p>
+</div>
+
+<div class="card">
+<h2>Blocked for</h2>
+<form method="post" action="{{ url_for('update_schedule_access') }}">
+  <input type="hidden" name="schedule_id" value="{{ s.id }}">
+""" + BLOCK_ACCESS_SELECTS + """
+  <button class="add" type="submit" style="margin-top:.8rem;">Save</button>
+</form>
+</div>
+
+{% if not s.lockout_all %}
+<div class="card">
+<h2>Categories blocked during this window</h2>
+<p class="hint">Ignored while "Full lockout" is checked above -- a full lockout blocks everything, categories included.</p>
+<form method="post" action="{{ url_for('update_schedule_categories') }}">
+  <input type="hidden" name="schedule_id" value="{{ s.id }}">
+  <div class="combobox" data-combobox data-mode="multi" data-field="category_ids" data-empty="No categories yet.">
+    <div class="combobox-tags" data-combobox-tags></div>
+    <input type="search" class="combobox-input" data-combobox-input placeholder="Search categories&hellip;">
+    <div class="combobox-results" data-combobox-results></div>
+    <script type="application/json" data-combobox-items>{{ all_categories_combo|tojson }}</script>
+    <script type="application/json" data-combobox-selected>{{ preselected_category_ids|list|tojson }}</script>
+  </div>
+  <button class="add" type="submit" style="margin-top:.8rem;">Save</button>
+</form>
+</div>
+{% endif %}
+"""
+
+
+@app.route("/schedules/<int:schedule_id>")
+@require_admin
+def schedule_detail(schedule_id: int):
+    conn = get_db()
+    s = conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    if s is None:
+        return flash_redirect("schedules", "That schedule no longer exists.", error=True)
+    all_users = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+    all_groups = conn.execute("SELECT * FROM groups ORDER BY name").fetchall()
+    all_devices = conn.execute("SELECT * FROM devices ORDER BY COALESCE(label, mac_address)").fetchall()
+    all_categories = conn.execute("SELECT * FROM categories ORDER BY name").fetchall()
+    body = render_template_string(
+        SCHEDULE_DETAIL_BODY, s=s,
+        day_codes=_DAY_CODES, day_labels=_DAY_LABELS,
+        selected_days=set(s["days_of_week"].split(",")),
+        available_time_zones=sorted(zoneinfo.available_timezones()),
+        all_users_combo=_entity_combo(all_users, lambda u: u["display_name"]),
+        all_groups_combo=_entity_combo(all_groups, lambda g: g["name"]),
+        all_devices_combo=_entity_combo(all_devices, lambda dev: dev["label"] or dev["mac_address"]),
+        all_categories_combo=_entity_combo(all_categories, lambda cat: cat["name"]),
+        preselected_user_ids={
+            row["user_id"] for row in conn.execute(
+                "SELECT user_id FROM schedule_users WHERE schedule_id = ?", (schedule_id,)
+            )
+        },
+        preselected_group_ids={
+            row["group_id"] for row in conn.execute(
+                "SELECT group_id FROM schedule_groups WHERE schedule_id = ?", (schedule_id,)
+            )
+        },
+        preselected_device_ids={
+            row["device_id"] for row in conn.execute(
+                "SELECT device_id FROM schedule_devices WHERE schedule_id = ?", (schedule_id,)
+            )
+        },
+        preselected_category_ids={
+            row["category_id"] for row in conn.execute(
+                "SELECT category_id FROM schedule_categories WHERE schedule_id = ?", (schedule_id,)
+            )
+        },
+        is_global_checked=bool(s["is_global"]),
+    )
+    return render("schedules", body)
+
+
+@app.route("/schedules/update", methods=["POST"])
+@require_admin
+def update_schedule():
+    schedule_id = request.form.get("schedule_id", "")
+    days = _parse_days(request.form.getlist("days"))
+    start_time = request.form.get("start_time", "")
+    end_time = request.form.get("end_time", "")
+    time_zone = request.form.get("time_zone", "UTC")
+    lockout_all = 1 if request.form.get("lockout_all") else 0
+
+    if not days:
+        return flash_redirect("schedule_detail", "Pick at least one day.", error=True, schedule_id=schedule_id)
+    if not (_valid_time(start_time) and _valid_time(end_time)):
+        return flash_redirect("schedule_detail", "Start and end time are required.", error=True, schedule_id=schedule_id)
+    if time_zone not in zoneinfo.available_timezones():
+        return flash_redirect("schedule_detail", "That doesn't look like a real time zone.", error=True, schedule_id=schedule_id)
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE schedules SET days_of_week = ?, start_time = ?, end_time = ?, time_zone = ?, "
+        "lockout_all = ? WHERE id = ?",
+        (days, start_time, end_time, time_zone, lockout_all, schedule_id),
+    )
+    conn.commit()
+    return flash_redirect("schedule_detail", "Saved.", schedule_id=schedule_id)
+
+
+@app.route("/schedules/access", methods=["POST"])
+@require_admin
+def update_schedule_access():
+    """Replaces a schedule's entire target set -- same
+    grant-and-revoke-are-the-same-action shape as update_domain_access()/
+    update_category_access()."""
+    schedule_id = request.form.get("schedule_id", "")
+    is_global = 1 if request.form.get("is_global") else 0
+    user_ids = {int(x) for x in request.form.getlist("user_ids") if x.isdigit()}
+    group_ids = {int(x) for x in request.form.getlist("group_ids") if x.isdigit()}
+    device_ids = {int(x) for x in request.form.getlist("device_ids") if x.isdigit()}
+
+    conn = get_db()
+    conn.execute("UPDATE schedules SET is_global = ? WHERE id = ?", (is_global, schedule_id))
+    conn.execute("DELETE FROM schedule_users WHERE schedule_id = ?", (schedule_id,))
+    for uid in user_ids:
+        conn.execute("INSERT OR IGNORE INTO schedule_users (schedule_id, user_id) VALUES (?,?)", (schedule_id, uid))
+    conn.execute("DELETE FROM schedule_groups WHERE schedule_id = ?", (schedule_id,))
+    for gid in group_ids:
+        conn.execute("INSERT OR IGNORE INTO schedule_groups (schedule_id, group_id) VALUES (?,?)", (schedule_id, gid))
+    conn.execute("DELETE FROM schedule_devices WHERE schedule_id = ?", (schedule_id,))
+    for did in device_ids:
+        conn.execute("INSERT OR IGNORE INTO schedule_devices (schedule_id, device_id) VALUES (?,?)", (schedule_id, did))
+    conn.commit()
+    return flash_redirect("schedule_detail", "Access updated.", schedule_id=schedule_id)
+
+
+@app.route("/schedules/categories", methods=["POST"])
+@require_admin
+def update_schedule_categories():
+    schedule_id = request.form.get("schedule_id", "")
+    category_ids = {int(x) for x in request.form.getlist("category_ids") if x.isdigit()}
+    conn = get_db()
+    conn.execute("DELETE FROM schedule_categories WHERE schedule_id = ?", (schedule_id,))
+    for cid in category_ids:
+        conn.execute(
+            "INSERT OR IGNORE INTO schedule_categories (schedule_id, category_id) VALUES (?,?)",
+            (schedule_id, cid),
+        )
+    conn.commit()
+    return flash_redirect("schedule_detail", "Categories updated.", schedule_id=schedule_id)
 
 
 @app.route("/devices")
@@ -2591,6 +3339,19 @@ SETTINGS_BODY = """
 </div>
 
 <div class="card">
+<h2>Household time zone</h2>
+<p class="hint">The default time zone new <a href="{{ url_for('schedules') }}">schedules</a> are created with. Each schedule stores its own time zone once created, so changing this later never moves an existing schedule's meaning.</p>
+<form class="add-form" method="post" action="{{ url_for('update_household_time_zone') }}">
+  <select name="household_time_zone">
+    {% for tz in available_time_zones %}
+    <option value="{{ tz }}" {{ 'selected' if tz == household_time_zone }}>{{ tz }}</option>
+    {% endfor %}
+  </select>
+  <button class="add" type="submit">Save</button>
+</form>
+</div>
+
+<div class="card">
 <h2>Blocked-site experience</h2>
 <form class="add-form" method="post" action="{{ url_for('update_block_page_mode') }}">
   <select name="block_page_mode">
@@ -2661,14 +3422,29 @@ def settings_page():
     adguard_url = db.get_setting(conn, "adguard_url", "")
     adguard_username = db.get_setting(conn, "adguard_username", "admin")
     adguard_password = db.get_setting(conn, "adguard_password", "")
+    household_time_zone = db.get_setting(conn, "household_time_zone", "UTC")
     body = render_template_string(
         SETTINGS_BODY, local_network=local_network, admin_username=admin_username,
         block_page_mode=block_page_mode, device_stale_days=device_stale_days,
         stale_device_count=stale_device_count, adguard_url=adguard_url,
         adguard_username=adguard_username,
         adguard_configured=bool(adguard_url and adguard_password),
+        household_time_zone=household_time_zone,
+        available_time_zones=sorted(zoneinfo.available_timezones()),
     )
     return render("settings", body)
+
+
+@app.route("/settings/household-time-zone", methods=["POST"])
+@require_admin
+def update_household_time_zone():
+    tz = request.form.get("household_time_zone", "UTC").strip()
+    if tz not in zoneinfo.available_timezones():
+        return flash_redirect("settings_page", "That doesn't look like a real time zone.", error=True)
+    conn = get_db()
+    db.set_setting(conn, "household_time_zone", tz)
+    conn.commit()
+    return flash_redirect("settings_page", "Saved.")
 
 
 @app.route("/settings/adguard", methods=["POST"])

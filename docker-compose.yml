@@ -151,6 +151,11 @@ services:
       - ADGUARD_URL=${ADGUARD_URL:-http://127.0.0.1:3000}
       - ADGUARD_USERNAME=${ADGUARD_USERNAME:-admin}
       - ADGUARD_PASSWORD=${ADGUARD_PASSWORD:-}
+      # Phase 8: default time zone new Schedules are created with -- only
+      # consumed once, to seed this DB setting on first run; editable from
+      # the Settings page afterward. Each schedule keeps its own time zone
+      # once created, so changing this later never moves an existing one.
+      - HOUSEHOLD_TIME_ZONE=${HOUSEHOLD_TIME_ZONE:-UTC}
     volumes:
       - pp_config:/config
 

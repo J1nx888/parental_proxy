@@ -4,6 +4,7 @@ DB."""
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 import db
 import identity
@@ -155,3 +156,87 @@ def test_write_desired_policy_persists_and_upserts(conn):
 
     count = conn.execute("SELECT COUNT(*) AS c FROM interception_runtime").fetchone()["c"]
     assert count == 1, "expected a single upserted singleton row, not a new row per write"
+
+
+# --------------------------------------- Phase 8: scheduled full-lockout overlay
+
+def _add_lockout_schedule(conn, name="Bedtime", is_global=1, days="mon", start="21:00", end="06:00"):
+    conn.execute(
+        "INSERT INTO schedules (name, days_of_week, start_time, end_time, time_zone, "
+        "lockout_all, is_global, created_at) VALUES (?, ?, ?, ?, 'UTC', 1, ?, ?)",
+        (name, days, start, end, is_global, db.now_iso()),
+    )
+    conn.commit()
+
+
+# Monday 2026-08-31 22:00 UTC -- inside the default "mon 21:00-06:00" window.
+_DURING_LOCKOUT = datetime(2026, 8, 31, 22, 0, tzinfo=timezone.utc)
+# Monday 2026-08-31 12:00 UTC -- outside it.
+_OUTSIDE_LOCKOUT = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+
+def test_device_under_active_global_lockout_schedule_goes_to_quarantine(conn):
+    _add_lockout_schedule(conn)
+    _add_device(conn, "aa:bb:cc:dd:ee:01", is_authenticated=1)
+    _bind(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21")
+    policy = compute_desired_policy(conn, now=_DURING_LOCKOUT)
+    assert policy["quarantine"] == ["192.168.1.21"]
+    assert policy["authenticated"] == []
+
+
+def test_same_device_outside_the_lockout_window_is_unaffected(conn):
+    _add_lockout_schedule(conn)
+    _add_device(conn, "aa:bb:cc:dd:ee:01", is_authenticated=1)
+    _bind(conn, "aa:bb:cc:dd:ee:01", "192.168.1.21")
+    policy = compute_desired_policy(conn, now=_OUTSIDE_LOCKOUT)
+    assert policy["authenticated"] == ["192.168.1.21"]
+    assert policy["quarantine"] == []
+
+
+def test_ignored_device_stays_bypass_even_during_an_active_lockout_schedule(conn):
+    _add_lockout_schedule(conn)
+    _add_device(conn, "aa:bb:cc:dd:ee:02", ignored=1)
+    _bind(conn, "aa:bb:cc:dd:ee:02", "192.168.1.22")
+    policy = compute_desired_policy(conn, now=_DURING_LOCKOUT)
+    assert policy["bypass"] == ["192.168.1.22"]
+    assert policy["quarantine"] == []
+
+
+def test_manually_quarantined_device_is_unaffected_by_schedule_state_either_way(conn):
+    # No lockout schedule at all -- a manual quarantine must still hold on
+    # its own, independent of Phase 8 ever having been configured.
+    _add_device(conn, "aa:bb:cc:dd:ee:03", quarantined_at=db.now_iso())
+    _bind(conn, "aa:bb:cc:dd:ee:03", "192.168.1.23")
+    policy = compute_desired_policy(conn, now=_OUTSIDE_LOCKOUT)
+    assert policy["quarantine"] == ["192.168.1.23"]
+
+    # And an active lockout schedule elsewhere changes nothing about it --
+    # still just the one, already-explained reason it's quarantined.
+    _add_lockout_schedule(conn)
+    policy = compute_desired_policy(conn, now=_DURING_LOCKOUT)
+    assert policy["quarantine"] == ["192.168.1.23"]
+
+
+def test_non_lockout_schedule_never_triggers_the_quarantine_overlay(conn):
+    conn.execute(
+        "INSERT INTO schedules (name, days_of_week, start_time, end_time, time_zone, "
+        "lockout_all, is_global, created_at) VALUES ('School hours', 'mon', '00:00', '23:59', "
+        "'UTC', 0, 1, ?)",
+        (db.now_iso(),),
+    )
+    conn.commit()
+    _add_device(conn, "aa:bb:cc:dd:ee:04", is_authenticated=1)
+    _bind(conn, "aa:bb:cc:dd:ee:04", "192.168.1.24")
+    policy = compute_desired_policy(conn, now=_DURING_LOCKOUT)
+    assert policy["authenticated"] == ["192.168.1.24"]
+    assert policy["quarantine"] == []
+
+
+def test_defaults_to_real_current_time_when_now_is_omitted(conn):
+    # Just confirming the default path doesn't blow up and returns the
+    # normal shape -- exact behavior for "right now" isn't asserted since
+    # that would make the test's outcome depend on when it happens to run.
+    _add_device(conn, "aa:bb:cc:dd:ee:05", is_authenticated=1)
+    _bind(conn, "aa:bb:cc:dd:ee:05", "192.168.1.25")
+    policy = compute_desired_policy(conn)
+    assert "192.168.1.25" in policy["authenticated"] + policy["quarantine"]

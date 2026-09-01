@@ -2219,3 +2219,352 @@ def test_device_assignment_uses_radio_picker(client):
     resp = client.get("/devices", headers=_auth_header())
     assert b'data-mode="single"' in resp.data
     assert b'"id": "ignored", "label": "Ignore (never filtered)"' in resp.data
+
+
+# ============================================================
+# Phase 8: Categories
+# ============================================================
+
+def test_categories_page_loads_empty(client):
+    resp = client.get("/categories", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"No categories configured" in resp.data
+
+
+def test_add_category_then_appears(client, db_conn):
+    resp = client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT * FROM categories WHERE name = 'Gambling'").fetchone()
+    assert row is not None
+    assert row["subscription_url"] is None
+    assert row["is_global"] == 0
+
+
+def test_add_category_requires_a_name(client, db_conn):
+    resp = client.post("/categories/add", data={"name": ""}, headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT * FROM categories").fetchone() is None
+
+
+def test_add_category_rejects_a_duplicate_name(client):
+    client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
+    resp = client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_delete_category_removes_it(client, db_conn):
+    client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Gambling'").fetchone()["id"]
+    client.post("/categories/delete", data={"category_id": category_id}, headers=_auth_header())
+    assert db_conn.execute("SELECT * FROM categories WHERE id = ?", (category_id,)).fetchone() is None
+
+
+def test_category_detail_shows_added_domains(client, db_conn):
+    client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Gambling'").fetchone()["id"]
+    client.post(
+        "/categories/domains/add",
+        data={"category_id": category_id, "pattern": r"bet\.example\.com"},
+        headers=_auth_header(),
+    )
+    resp = client.get(f"/categories/{category_id}", headers=_auth_header())
+    assert resp.status_code == 200
+    assert br"bet\.example\.com" in resp.data
+    row = db_conn.execute(
+        "SELECT * FROM category_domains WHERE category_id = ?", (category_id,)
+    ).fetchone()
+    assert row["source"] == "manual"
+
+
+def test_delete_category_domain_only_removes_manual_rows(client, db_conn):
+    client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Gambling'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO category_domains (category_id, pattern, source, created_at) "
+        "VALUES (?, ?, 'subscription', datetime('now'))",
+        (category_id, r"sub\.example\.com"),
+    )
+    db_conn.commit()
+    sub_row_id = db_conn.execute(
+        "SELECT id FROM category_domains WHERE pattern = ?", (r"sub\.example\.com",)
+    ).fetchone()["id"]
+    resp = client.post(
+        "/categories/domains/delete", data={"category_domain_id": sub_row_id}, headers=_auth_header()
+    )
+    assert resp.status_code == 302
+    # Subscription-sourced row must survive a manual-delete attempt.
+    assert db_conn.execute("SELECT * FROM category_domains WHERE id = ?", (sub_row_id,)).fetchone() is not None
+
+
+def test_delete_category_domain_nonexistent_id_redirects_cleanly(client):
+    resp = client.post(
+        "/categories/domains/delete", data={"category_domain_id": "999999"}, headers=_auth_header()
+    )
+    assert resp.status_code == 302
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_add_category_override_then_appears(client, db_conn):
+    client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Gambling'").fetchone()["id"]
+    resp = client.post(
+        "/categories/overrides/add",
+        data={"category_id": category_id, "pattern": r"safe\.example\.com", "note": "school portal"},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    row = db_conn.execute(
+        "SELECT * FROM category_overrides WHERE category_id = ?", (category_id,)
+    ).fetchone()
+    assert row["pattern"] == r"safe\.example\.com"
+    assert row["note"] == "school portal"
+
+
+def test_update_category_access_sets_global_and_targets(client, db_conn):
+    client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Gambling'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO users (username, display_name, password_hash, created_at) "
+        "VALUES ('kid1', 'Kid One', 'x', datetime('now'))"
+    )
+    db_conn.commit()
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()["id"]
+
+    resp = client.post(
+        "/categories/access", data={"category_id": category_id, "user_ids": [str(user_id)]}, headers=_auth_header()
+    )
+    assert resp.status_code == 302
+    assert db_conn.execute("SELECT is_global FROM categories WHERE id = ?", (category_id,)).fetchone()["is_global"] == 0
+    assert db_conn.execute(
+        "SELECT 1 FROM category_users WHERE category_id = ? AND user_id = ?", (category_id, user_id)
+    ).fetchone() is not None
+
+
+def test_update_category_access_rejects_scoping_an_oversized_category(client, db_conn, monkeypatch):
+    import matching
+    monkeypatch.setattr(matching, "MAX_SCOPED_CATEGORY_DOMAINS", 1)
+    client.post("/categories/add", data={"name": "Porn"}, headers=_auth_header())
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Porn'").fetchone()["id"]
+    db_conn.executemany(
+        "INSERT INTO category_domains (category_id, pattern, source, created_at) VALUES (?, ?, 'manual', datetime('now'))",
+        [(category_id, r"a\.example\.com"), (category_id, r"b\.example\.com")],
+    )
+    db_conn.execute(
+        "INSERT INTO users (username, display_name, password_hash, created_at) "
+        "VALUES ('kid1', 'Kid One', 'x', datetime('now'))"
+    )
+    db_conn.commit()
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()["id"]
+
+    resp = client.post(
+        "/categories/access", data={"category_id": category_id, "user_ids": [str(user_id)]}, headers=_auth_header()
+    )
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute(
+        "SELECT 1 FROM category_users WHERE category_id = ? AND user_id = ?", (category_id, user_id)
+    ).fetchone() is None
+
+
+def test_update_category_access_still_allows_global_on_an_oversized_category(client, db_conn, monkeypatch):
+    import matching
+    monkeypatch.setattr(matching, "MAX_SCOPED_CATEGORY_DOMAINS", 1)
+    client.post("/categories/add", data={"name": "Porn"}, headers=_auth_header())
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Porn'").fetchone()["id"]
+    db_conn.executemany(
+        "INSERT INTO category_domains (category_id, pattern, source, created_at) VALUES (?, ?, 'manual', datetime('now'))",
+        [(category_id, r"a\.example\.com"), (category_id, r"b\.example\.com")],
+    )
+    db_conn.commit()
+
+    resp = client.post(
+        "/categories/access", data={"category_id": category_id, "is_global": "on"}, headers=_auth_header()
+    )
+    assert resp.status_code == 302
+    assert "error" not in (resp.headers["Location"].split("?", 1)[1] if "?" in resp.headers["Location"] else "")
+    assert db_conn.execute("SELECT is_global FROM categories WHERE id = ?", (category_id,)).fetchone()["is_global"] == 1
+
+
+def test_sync_category_now_reports_failure_cleanly(client, db_conn, monkeypatch):
+    import category_fetch
+
+    client.post(
+        "/categories/add",
+        data={"name": "Gambling", "subscription_url": "https://example.invalid/gambling.txt"},
+        headers=_auth_header(),
+    )
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Gambling'").fetchone()["id"]
+
+    def _boom(conn, category, timeout=None):
+        raise category_fetch.CategoryFetchError("could not reach host")
+
+    monkeypatch.setattr(category_fetch, "fetch_and_sync_category", _boom)
+    resp = client.post(f"/categories/{category_id}/sync", headers=_auth_header())
+    assert resp.status_code == 302
+    assert "error=1" in resp.headers["Location"]
+
+
+# ============================================================
+# Phase 8: Schedules
+# ============================================================
+
+def test_schedules_page_loads_empty(client):
+    resp = client.get("/schedules", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"No schedules configured" in resp.data
+
+
+def test_add_schedule_then_appears(client, db_conn):
+    resp = client.post(
+        "/schedules/add",
+        data={
+            "name": "Bedtime", "days": ["mon", "tue"], "start_time": "21:00", "end_time": "06:00",
+            "time_zone": "UTC", "lockout_all": "on",
+        },
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT * FROM schedules WHERE name = 'Bedtime'").fetchone()
+    assert row is not None
+    assert row["days_of_week"] == "mon,tue"
+    assert row["lockout_all"] == 1
+
+
+def test_add_schedule_requires_at_least_one_day(client, db_conn):
+    resp = client.post(
+        "/schedules/add",
+        data={"name": "Bedtime", "start_time": "21:00", "end_time": "06:00", "time_zone": "UTC"},
+        headers=_auth_header(),
+    )
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT * FROM schedules").fetchone() is None
+
+
+def test_add_schedule_rejects_an_invalid_time_zone(client, db_conn):
+    resp = client.post(
+        "/schedules/add",
+        data={
+            "name": "Bedtime", "days": ["mon"], "start_time": "21:00", "end_time": "06:00",
+            "time_zone": "Not/AZone",
+        },
+        headers=_auth_header(),
+    )
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT * FROM schedules").fetchone() is None
+
+
+def test_delete_schedule_removes_it(client, db_conn):
+    client.post(
+        "/schedules/add",
+        data={"name": "Bedtime", "days": ["mon"], "start_time": "21:00", "end_time": "06:00", "time_zone": "UTC"},
+        headers=_auth_header(),
+    )
+    schedule_id = db_conn.execute("SELECT id FROM schedules WHERE name = 'Bedtime'").fetchone()["id"]
+    client.post("/schedules/delete", data={"schedule_id": schedule_id}, headers=_auth_header())
+    assert db_conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone() is None
+
+
+def test_update_schedule_saves_new_window(client, db_conn):
+    client.post(
+        "/schedules/add",
+        data={"name": "School hours", "days": ["mon"], "start_time": "08:00", "end_time": "15:00", "time_zone": "UTC"},
+        headers=_auth_header(),
+    )
+    schedule_id = db_conn.execute("SELECT id FROM schedules WHERE name = 'School hours'").fetchone()["id"]
+    resp = client.post(
+        "/schedules/update",
+        data={
+            "schedule_id": schedule_id, "days": ["mon", "tue", "wed", "thu", "fri"],
+            "start_time": "08:30", "end_time": "15:30", "time_zone": "America/Chicago",
+        },
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    assert row["days_of_week"] == "mon,tue,wed,thu,fri"
+    assert row["start_time"] == "08:30"
+    assert row["time_zone"] == "America/Chicago"
+
+
+def test_schedule_detail_shows_categories_section_unless_lockout(client, db_conn):
+    client.post(
+        "/schedules/add",
+        data={"name": "School hours", "days": ["mon"], "start_time": "08:00", "end_time": "15:00", "time_zone": "UTC"},
+        headers=_auth_header(),
+    )
+    schedule_id = db_conn.execute("SELECT id FROM schedules WHERE name = 'School hours'").fetchone()["id"]
+    resp = client.get(f"/schedules/{schedule_id}", headers=_auth_header())
+    assert b"Categories blocked during this window" in resp.data
+
+    client.post(
+        "/schedules/add",
+        data={"name": "Bedtime", "days": ["mon"], "start_time": "21:00", "end_time": "06:00", "time_zone": "UTC", "lockout_all": "on"},
+        headers=_auth_header(),
+    )
+    bedtime_id = db_conn.execute("SELECT id FROM schedules WHERE name = 'Bedtime'").fetchone()["id"]
+    resp = client.get(f"/schedules/{bedtime_id}", headers=_auth_header())
+    assert b"Categories blocked during this window" not in resp.data
+
+
+def test_update_schedule_categories_assigns_them(client, db_conn):
+    client.post(
+        "/schedules/add",
+        data={"name": "School hours", "days": ["mon"], "start_time": "08:00", "end_time": "15:00", "time_zone": "UTC"},
+        headers=_auth_header(),
+    )
+    schedule_id = db_conn.execute("SELECT id FROM schedules WHERE name = 'School hours'").fetchone()["id"]
+    client.post("/categories/add", data={"name": "Gaming"}, headers=_auth_header())
+    category_id = db_conn.execute("SELECT id FROM categories WHERE name = 'Gaming'").fetchone()["id"]
+
+    resp = client.post(
+        "/schedules/categories",
+        data={"schedule_id": schedule_id, "category_ids": [str(category_id)]},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    assert db_conn.execute(
+        "SELECT 1 FROM schedule_categories WHERE schedule_id = ? AND category_id = ?", (schedule_id, category_id)
+    ).fetchone() is not None
+
+
+def test_update_schedule_access_sets_global_and_targets(client, db_conn):
+    client.post(
+        "/schedules/add",
+        data={"name": "Bedtime", "days": ["mon"], "start_time": "21:00", "end_time": "06:00", "time_zone": "UTC"},
+        headers=_auth_header(),
+    )
+    schedule_id = db_conn.execute("SELECT id FROM schedules WHERE name = 'Bedtime'").fetchone()["id"]
+    resp = client.post(
+        "/schedules/access", data={"schedule_id": schedule_id, "is_global": "on"}, headers=_auth_header()
+    )
+    assert resp.status_code == 302
+    assert db_conn.execute("SELECT is_global FROM schedules WHERE id = ?", (schedule_id,)).fetchone()["is_global"] == 1
+
+
+# ============================================================
+# Phase 8: Settings household time zone
+# ============================================================
+
+def test_settings_page_shows_household_time_zone(client):
+    resp = client.get("/settings", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"Household time zone" in resp.data
+
+
+def test_update_household_time_zone_saves(client, db_conn):
+    import db as db_mod
+
+    resp = client.post(
+        "/settings/household-time-zone", data={"household_time_zone": "America/Chicago"}, headers=_auth_header()
+    )
+    assert resp.status_code == 302
+    assert db_mod.get_setting(db_conn, "household_time_zone") == "America/Chicago"
+
+
+def test_update_household_time_zone_rejects_garbage(client, db_conn):
+    import db as db_mod
+
+    resp = client.post(
+        "/settings/household-time-zone", data={"household_time_zone": "Not/AZone"}, headers=_auth_header()
+    )
+    assert "error=1" in resp.headers["Location"]
+    assert db_mod.get_setting(db_conn, "household_time_zone", "UTC") == "UTC"
