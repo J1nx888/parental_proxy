@@ -37,11 +37,57 @@ Pi-hole setup:
 | 1 | Dashboard modernization (design system, charts, PWA) | ✅ Done |
 | 2 | Device/group data model groundwork | ✅ Done |
 | — | Filter/picker UI scaling (GH #8) | ✅ Done |
-| 3 | Network-level interception (the actual Bark Home replacement mechanism) | 🔶 Milestones 1–9 have real, tested (several functionally verified live) work; not yet deployed anywhere real — see the Milestones list below |
-| 4 | Captive-portal forced enrollment | ⬜ Design sketch only, not started |
+| 3 | Network-level interception (the actual Bark Home replacement mechanism) | 🔶 Milestones 1–9 real, tested, functionally verified live in Docker-bridge/veth harnesses only — **never against the real Orbi mesh (G1), see [Path to deployment](#path-to-deployment) below** |
+| 4 | Captive-portal forced enrollment | ✅ Done (Milestones 1–3 + reminder screens + portal admin-add) |
 | 5 | Admin dashboard: responsive layout, installable PWA, control surface | 🔶 Begun — mobile/tablet audit done, one bug fixed |
-| 6 | YouTube channel/creator-level filtering | ⬜ Assessed, not started |
+| 6 | YouTube channel/creator-level filtering | ⬜ Assessed only, 0% built (G2) |
 | 7 | Remote Access Hardening: TLS, VPN, session/auth model for off-LAN access | ⬜ Not started |
+| 8 | Content categories & time-based schedules | ✅ Done, live-verified |
+| 9 | SafeSearch & YouTube Restricted Mode (G3) | ✅ Done, live-verified |
+| 10 | Ad-hoc "pause the internet" (G6) | ✅ Done, live-verified |
+| 11 | Operational event log ("Events" page) | ✅ Done, live-verified |
+
+---
+
+## Path to deployment
+
+A 2026-09-01 code-grounded audit against the full product goal (Bark
+Home replacement + per-device SSL-Bump + captive portal + Crunchyroll
+show whitelist + planned YouTube whitelist) found 8 gaps, numbered
+G1–G8. Where each stands, and what's actually left before and after a
+real deployment decision:
+
+| Gap | What | Status |
+|---|---|---|
+| **G1** | Core ARP interception mechanism has zero real-network evidence — only Docker-bridge/veth harnesses, never the real Orbi mesh | ⬜ **Not started — the one remaining gate.** See [`docs/deployment/g1-runbook.md`](deployment/g1-runbook.md) for the validation procedure. |
+| G2 | YouTube video/creator whitelist | ⬜ 0% built, fully designed only — not required for baseline Bark Home parity, doesn't block G1 |
+| G3 | No SafeSearch / YouTube Restricted Mode enforcement | ✅ Done (Phase 9) |
+| G4 | Show approvals are user-only (`user_shows` has no `group_shows`/`device_shows` sibling) | ⏸ Explicitly deferred to a later phase at your direction — not a G1 blocker |
+| G5 | Captive-portal session model (DHCP IP-change window; MAC-rotation login friction) | ✅ Resolved by policy decision — both accepted as-is, revisit if they prove worse in practice than expected |
+| G6 | No ad-hoc "pause the internet" control | ✅ Done (Phase 10) |
+| G7 | Cutover data step for existing household devices (`is_authenticated` defaults) | ✅ Resolved by policy: deploy with zero devices pre-added, bulk-import real MACs via CSV once known |
+| G8 | Bark's on-device ML content-scanning alerts | Out of scope — an app/device feature, not achievable from a network box |
+
+**Before deployment**: only G1. Run
+[`docs/deployment/g1-runbook.md`](deployment/g1-runbook.md) — real
+Orbi-mesh validation of the ARP interception mechanism, with an explicit
+no-go condition, kill switch, and test matrix covering every real
+attachment path (router/satellite, wired/wireless, roaming, DHCP
+renewal, reboot, crash recovery).
+
+**After G1 passes, before decommissioning Bark Home**: the soak test
+(Milestone 10 in Phase 3 below) — a real multi-day household run with
+Bark Home kept installed and re-enabled between test windows, not a
+one-time pass/fail check.
+
+**After deployment** (neither blocks going live): G2 (YouTube
+filtering) and G4 (device/group show approvals, needed as a shared
+prerequisite before G2 per the 2026-09-01 audit's own recommended
+order), then Phase 7 (remote access hardening) if off-LAN dashboard
+access becomes a real need.
+
+**If G1 comes back a no-go**: this is a project-shape decision, not a
+bug fix — see the runbook's own "If this comes back a no-go" section.
 
 ---
 
