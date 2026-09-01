@@ -2867,16 +2867,25 @@ SafeSearch either, so no `$client=`-scoped equivalent was built.
 11 new tests (3 in `tests/test_adguard_client.py`, 5 in
 `tests/test_controller_adguard_sync.py` including one proving an admin's
 own per-service AdGuard customization survives a reconcile untouched, 3
-in `tests/test_dashboard.py`) — 655 passed, 30 skipped (Windows) / 674+11
-expected on Linux, zero regressions.
+in `tests/test_dashboard.py`) — 655 passed, 30 skipped (Windows), 685
+passed/0 skipped on Linux (confirmed on the smoke-test VM the same day),
+zero regressions.
 
-**Not yet live-verified end-to-end**: the dashboard toggle → `settings`
-write → controller's next `sync_once()` → real AdGuard state chain was
-exercised piece-by-piece (the AdGuard API calls live, the toggle/route
-via the local pytest suite) but never as one continuous flow through a
-real running dashboard + controller pair. Worth a quick check next time
-the VM is up, same "verify the seams, not just the pieces" discipline as
-everything else in this project.
+**2026-09-01, live-verified end-to-end the same day**, once the smoke-test
+VM's `dashboard`/`controller` images were rebuilt with this code: a real
+`curl -u admin:... -X POST http://127.0.0.1:8787/settings/safesearch -d
+safesearch_enabled=1` against the actual running dashboard, followed by
+the real controller's next 30s poll cycle, flipped the real AdGuard
+instance's `enabled` from `false` to `true` — confirmed via
+`dig www.google.com` returning a CNAME to `forcesafesearch.google.com`
+afterward. Even better: AdGuard had been left `enabled: true` from an
+earlier, unrelated manual test while `settings.safesearch_enabled` was
+still `"0"` — the controller's very first cycle after redeploying
+self-healed that drift back to `false` with no prompting at all, a real
+(not staged) proof that this reconciles on every cycle rather than only
+reacting to an explicit toggle. Toggling off through the same real route
+reconciled AdGuard back to `false` again the same way. Left in the `off`
+state afterward, matching the default.
 
 Deliberately NOT built: AdGuard Home's separate `/control/parental/*`
 "Parental Control" endpoint (a third-party adult-content blocklist

@@ -534,7 +534,15 @@ they started hitting the fake client's (previously untouched)
 `get_safesearch_status`, which none of them had mocked; added a plain
 `{"enabled": False}` stub to each (matching the setting's own untouched
 default) rather than changing what they actually test. 655 passed, 30
-skipped (Windows) -- zero regressions.
+skipped (Windows) -- zero regressions. Live-verified the full chain the
+same day on the smoke-test VM (see RoadMap.md's Phase 9 entry): a real
+`curl POST` against the running dashboard's `/settings/safesearch`,
+through a real controller poll cycle, to a real AdGuard state change,
+confirmed via a real `dig` rewrite -- including an unplanned but genuine
+proof of the reconcile-every-cycle design: AdGuard was left `enabled:
+true` from an earlier manual test while the DB setting was still `"0"`,
+and the controller's first cycle after redeploying corrected that drift
+on its own, with nothing telling it to. 685 passed/0 skipped on Linux.
 
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
