@@ -1504,6 +1504,8 @@ def test_import_devices_headerless_csv_still_works(client, db_conn):
 
 
 def test_import_devices_skips_duplicate_macs_without_clobbering_assignment(client, db_conn):
+    import urllib.parse
+
     client.post(
         "/devices/add", data={"mac_address": "aa:bb:cc:dd:ee:13", "label": "Original label"},
         headers=_auth_header(),
@@ -1519,9 +1521,18 @@ def test_import_devices_skips_duplicate_macs_without_clobbering_assignment(clien
     row = db_conn.execute("SELECT label FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:13'").fetchone()
     assert row["label"] == "Original label", "an existing device's own data must never be overwritten by an import"
 
+    message = urllib.parse.unquote_plus(resp.headers["Location"])
+    assert "aa:bb:cc:dd:ee:13" in message, "the admin must be told WHICH mac was a duplicate, not just a count"
+
 
 def test_import_devices_skips_rows_with_no_valid_mac(client, db_conn):
-    csv_text = "not-a-mac,Bad Row\naa:bb:cc:dd:ee:15,Good Row\n"
+    """The invalid row here is deliberately NOT first -- a first-row
+    parse failure is ambiguous with the header-skip heuristic itself
+    (see import_devices()'s own comment on that known edge case) and is
+    covered separately below."""
+    import urllib.parse
+
+    csv_text = "aa:bb:cc:dd:ee:15,Good Row\nnot-a-mac,Bad Row\n"
     resp = client.post(
         "/devices/import", data=_csv_upload(csv_text), headers=_auth_header(),
         content_type="multipart/form-data",
@@ -1531,6 +1542,54 @@ def test_import_devices_skips_rows_with_no_valid_mac(client, db_conn):
     assert count == 1
     row = db_conn.execute("SELECT * FROM devices").fetchone()
     assert row["mac_address"] == "aa:bb:cc:dd:ee:15"
+
+    message = urllib.parse.unquote_plus(resp.headers["Location"])
+    assert "not-a-mac" in message, "the admin must see the actual offending cell, not just a count"
+
+
+def test_import_devices_a_malformed_first_row_is_silently_treated_as_a_header(client, db_conn):
+    """Documents a real, known, low-blast-radius edge case rather than
+    leaving it as a silent surprise: the header-skip heuristic can't
+    distinguish a genuine header from a garbage first DATA row -- both
+    look identical (first cell doesn't parse as a MAC), so a malformed
+    first row is dropped WITHOUT being counted/reported as invalid at
+    all, unlike the same malformed content anywhere else in the file.
+    Blast radius is capped at exactly one row (only the first), and only
+    when that row is itself invalid, not merely coincidentally unlucky
+    placement of a real error."""
+    import urllib.parse
+
+    csv_text = "not-a-mac,Bad Row\naa:bb:cc:dd:ee:80,Good Row\n"
+    resp = client.post(
+        "/devices/import", data=_csv_upload(csv_text), headers=_auth_header(),
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 302
+    count = db_conn.execute("SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    assert count == 1
+
+    message = urllib.parse.unquote_plus(resp.headers["Location"])
+    assert "not-a-mac" not in message, "documenting current behavior -- update this test if the heuristic changes"
+
+
+def test_import_devices_duplicate_preview_is_capped_for_a_large_batch(client, db_conn):
+    """A real router export can be 50+ devices -- the preview must not
+    turn into an unreadable wall of text (or blow past a sane URL
+    length) when most/all of them are already known."""
+    import urllib.parse
+
+    macs = [f"aa:bb:cc:dd:ee:{i:02x}" for i in range(20, 35)]  # 15 devices
+    for mac in macs:
+        client.post("/devices/add", data={"mac_address": mac}, headers=_auth_header())
+
+    csv_text = "\n".join(macs)
+    resp = client.post(
+        "/devices/import", data=_csv_upload(csv_text), headers=_auth_header(),
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 302
+    message = urllib.parse.unquote_plus(resp.headers["Location"])
+    assert "and 5 more" in message  # 15 duplicates, capped preview shows 10 + "5 more"
 
 
 def test_import_devices_requires_a_file(client, db_conn):

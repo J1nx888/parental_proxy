@@ -1619,6 +1619,22 @@ def normalize_mac(value: str) -> str | None:
     return value if MAC_ADDRESS_RE.match(value) else None
 
 
+_PREVIEW_LIST_MAX = 10
+
+
+def _preview_list(items: list[str]) -> str:
+    """Renders import_devices()'s skipped-item lists as a short,
+    comma-separated preview -- capped so a genuinely large CSV (a real
+    router export can easily be 50+ devices) doesn't turn the flash
+    message (a URL query param) into an unreadable wall of text."""
+    shown = items[:_PREVIEW_LIST_MAX]
+    text = ", ".join(shown)
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        text += f", and {remaining} more"
+    return text
+
+
 def _device_assignment_value(d) -> str:
     """The current selection for the composite assignment <select> below,
     given a devices row -- inverse of _parse_device_assignment()."""
@@ -2591,8 +2607,14 @@ def import_devices():
     first row's first cell doesn't parse as a MAC (normalize_mac()),
     it's treated as a header rather than a data row. `INSERT OR IGNORE`
     on the mac_address UNIQUE constraint means an already-known MAC is
-    silently skipped (counted, not overwritten) rather than erroring out
-    the whole batch or clobbering an existing assignment.
+    silently skipped (not overwritten) rather than erroring out the
+    whole batch or clobbering an existing assignment -- but "silently"
+    only means the DATA isn't touched, not that the ADMIN isn't told:
+    the flash message names which MACs were skipped as duplicates and
+    which raw cells failed to parse as a MAC at all (`_preview_list()`,
+    capped so a real 50+ device router export doesn't turn into an
+    unreadable message), not just an aggregate count -- a plain "3
+    already known" gives an admin nothing to actually act on.
     """
     file = request.files.get("csv_file")
     if not file or not file.filename:
@@ -2606,17 +2628,23 @@ def import_devices():
     if not rows:
         return flash_redirect("devices", "That CSV had no rows.", error=True)
 
+    # Known, low-blast-radius edge case: a genuinely malformed first DATA
+    # row is indistinguishable from a real header by this heuristic alone
+    # (both fail to parse as a MAC) -- such a row is silently dropped
+    # WITHOUT being counted in invalid_cells below, unlike the same
+    # malformed content anywhere else in the file. Capped at exactly one
+    # row (only ever the first), not a systemic gap.
     start = 1 if normalize_mac(rows[0][0]) is None else 0
 
     conn = get_db()
     added = 0
-    skipped_duplicate = 0
-    skipped_invalid = 0
+    duplicate_macs = []
+    invalid_cells = []
     now = db.now_iso()
     for row in rows[start:]:
         mac = normalize_mac(row[0]) if row else None
         if mac is None:
-            skipped_invalid += 1
+            invalid_cells.append(row[0] if row else "")
             continue
         label = row[1].strip() if len(row) > 1 and row[1].strip() else None
         cur = conn.execute(
@@ -2626,14 +2654,18 @@ def import_devices():
         if cur.rowcount:
             added += 1
         else:
-            skipped_duplicate += 1
+            duplicate_macs.append(mac)
     conn.commit()
 
+    # Named, not just counted -- an aggregate "3 already known" gives an
+    # admin nothing to act on for a real 20-50 device router export; they
+    # need to know WHICH ones to go check. Capped so a genuinely huge CSV
+    # doesn't blow out the flash message (rendered as a URL query param).
     parts = [f"Imported {added} device{'s' if added != 1 else ''}."]
-    if skipped_duplicate:
-        parts.append(f"{skipped_duplicate} already known.")
-    if skipped_invalid:
-        parts.append(f"{skipped_invalid} row{'s' if skipped_invalid != 1 else ''} had no valid MAC address.")
+    if duplicate_macs:
+        parts.append(f"Already known ({_preview_list(duplicate_macs)}).")
+    if invalid_cells:
+        parts.append(f"No valid MAC address ({_preview_list(invalid_cells)}).")
     return flash_redirect("devices", " ".join(parts), error=(added == 0))
 
 

@@ -3043,7 +3043,27 @@ valid MAC address." -- exactly matching the file's contents -- and both
 real rows landed in the real database as plain Unassigned devices, not
 duplicated, not overwritten. Cleaned up afterward.
 
----
+**Follow-up, same day**: project owner asked whether an admin gets any
+way to react to a duplicate found during import -- answer at the time
+was no, the flash message only reported an aggregate count ("1 already
+known"), useless for a real 20-50 device router export where the admin
+has no way to tell WHICH ones without manually diffing. Fixed:
+`import_devices()` now names the specific duplicate MACs and the raw
+cells that failed to parse (`_preview_list()`, capped at 10 shown + "and
+N more" so a large batch doesn't turn the flash message -- rendered as a
+URL query param -- into an unreadable wall of text). Surfaced and
+documented a second, previously-unnoticed real gap while fixing this:
+the header-auto-detection heuristic ("first row's first cell doesn't
+parse as a MAC -> treat as header, skip it") can't tell a genuine header
+from a garbage first DATA row -- both look identical to it -- so a
+malformed first row is silently dropped WITHOUT even being counted as
+invalid, unlike the same malformed content anywhere else in the file.
+Blast radius is capped at exactly one row (only ever the first) and only
+when that row is itself bad, not a systemic issue -- documented in the
+code and covered by a test that pins down current behavior rather than
+left as a silent surprise for a future reader. 2 new tests (the
+capped-preview behavior, and the malformed-first-row edge case) --
+677 passed, 30 skipped (Windows), zero regressions.
 
 ## Cross-cutting: security-by-design
 

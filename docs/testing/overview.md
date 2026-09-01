@@ -586,6 +586,21 @@ csv_file=@...` multipart upload against the actual running dashboard
 exactly the expected counts in the flash message, and the database
 ended up with exactly the two real, non-duplicate devices.
 
+**2026-09-01, same-day follow-up**: fixed a real usability gap the
+project owner asked about directly -- the flash message only reported
+an aggregate duplicate count, not which MACs. 2 new tests: the capped
+preview (15 duplicates in one batch -> shows 10 + "and 5 more", not all
+15) and a test that pins down a related, previously-undocumented edge
+case found while fixing this -- a genuinely malformed FIRST row is
+indistinguishable from a real header by the auto-detection heuristic and
+gets silently dropped without being counted as invalid at all (unlike
+the same bad content anywhere else in the file). Also had to reorder an
+existing test (`test_import_devices_skips_rows_with_no_valid_mac`) once
+asserting on the actual message content revealed it had been
+accidentally exercising that same ambiguous first-row case rather than
+the ordinary mid-batch one it was meant to test. 677 passed, 30 skipped
+(Windows), zero regressions.
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in

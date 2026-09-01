@@ -499,12 +499,19 @@ actual captive-portal login screen itself is still Phase 4, not built).
   `docs/deployment/setup.md`) -- multipart file field `csv_file`, one
   `mac_address,label` row per device. Auto-detects and skips a header
   row (via `normalize_mac()` on the first cell -- if it's not a valid
-  MAC, that row is treated as a header, not data). `INSERT OR IGNORE` on
-  the UNIQUE `mac_address` constraint -- an already-known MAC is
-  silently skipped and counted, never overwritten. Every row lands
-  exactly like `add_device()` with no assignment (plain Unassigned) --
-  there's no separate bulk-assignment step; assign each one afterward
-  from this page's own per-row Manage link.
+  MAC, that row is treated as a header, not data -- **known edge case**:
+  a genuinely malformed first DATA row is indistinguishable from a real
+  header by this heuristic and is silently dropped uncounted, capped at
+  exactly the first row, never a systemic gap). `INSERT OR IGNORE` on the
+  UNIQUE `mac_address` constraint -- an already-known MAC is skipped, not
+  overwritten. **The flash message names which MACs were duplicates and
+  which raw cells failed to parse** (`_preview_list()`, capped at 10 with
+  "and N more"), not just an aggregate count -- added 2026-09-01 after
+  the project owner asked whether an admin gets any way to react to a
+  duplicate; the original cut only reported a bare count. Every row
+  lands exactly like `add_device()` with no assignment (plain
+  Unassigned) -- there's no separate bulk-assignment step; assign each
+  one afterward from this page's own per-row Manage link.
 - `GET /devices/<int:device_id>` -> `device_detail()` -- one device's
   editable assignment, `bump_enabled`, and `bypass_login` checkboxes.
   Renders `DEVICE_DETAIL_BODY`. Redirects to `devices` with an error flash
