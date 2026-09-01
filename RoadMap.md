@@ -3149,6 +3149,23 @@ empty state, a real event listed, recovery severity shown distinctly,
 newest-first ordering, admin auth required, the display cap). 692
 passed, 30 skipped (Windows), zero regressions.
 
+**Live-verified 2026-09-01** against the real smoke-test VM with a
+genuine failure, not a synthetic one: `docker stop`ped the real
+`adguard` container, waited for the real controller's next cycles.
+Container logs showed the expected `WARNING:controller:adguard sync
+failed: ... Connection refused` / `adguard discovery correlation
+failed: ...`, and the real `/events` page showed matching `error` rows
+in real time, one per occurrence, with real timestamps 30s apart --
+proving the "how long has this been broken" signal actually works, not
+just that a single row gets written. `docker start`ed AdGuard back up:
+within one cycle, BOTH `adguard_sync` and `adguard_discovery`
+independently logged their own `recovery` row (`adguard_sync recovered`
+/ `adguard_discovery recovered`) -- confirming the per-source failure
+tracking stays correctly independent between two different loops
+hitting the same underlying outage at the same time, exactly as the
+unit tests already proved, now against a real failure instead of a
+mocked one. Cleaned up (`DELETE FROM system_events`) afterward.
+
 ---
 
 ## Cross-cutting: security-by-design
