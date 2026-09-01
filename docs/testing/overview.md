@@ -624,7 +624,15 @@ event listed, `recovery` severity rendered distinctly from `error`,
 newest-first ordering, admin auth required (matches every other page),
 and the display cap (`EVENT_DISPLAY_LIMIT`) hides older rows from the
 page without deleting them from the table. 692 passed, 30 skipped
-(Windows), zero regressions.
+(Windows), 722 passed/0 skipped on Linux, zero regressions.
+Live-verified with a genuine failure on the smoke-test VM the same day
+(see RoadMap.md's Phase 11 entry): `docker stop`ping the real `adguard`
+container produced real, correctly-timestamped `error` rows on the real
+`/events` page for two independent loops (`adguard_sync`,
+`adguard_discovery`) hitting the same outage, and restarting it produced
+independent `recovery` rows for both, confirming the per-source
+failure-tracking closures stay correctly isolated against a real
+concurrent failure, not just the sequential ones the unit tests exercise.
 
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
