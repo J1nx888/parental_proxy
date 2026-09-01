@@ -739,6 +739,26 @@ USER_DETAIL_BODY = """
 <p><a href="{{ url_for('users') }}">&larr; All users</a></p>
 <h1>{{ u.display_name }} <code>({{ u.username }})</code></h1>
 
+{% if user_devices %}
+<div class="card">
+<h2>Pause the internet</h2>
+<p class="hint">
+  Pauses every device assigned to {{ u.display_name }} at once ({{ user_devices|length }}
+  device{{ 's' if user_devices|length != 1 else '' }}, {{ paused_device_count }} currently paused) --
+  immediate and indefinite, until resumed. Manage an individual device's pause from the
+  <a href="{{ url_for('devices') }}">Devices</a> page instead if you only want to pause one.
+</p>
+<form class="inline" method="post" action="{{ url_for('pause_user') }}" onsubmit="return confirm('Pause the internet for all of {{ u.display_name }}\\'s devices?');">
+  <input type="hidden" name="user_id" value="{{ u.id }}">
+  <button class="danger" type="submit">Pause {{ u.display_name }}'s internet</button>
+</form>
+<form class="inline" method="post" action="{{ url_for('resume_user') }}">
+  <input type="hidden" name="user_id" value="{{ u.id }}">
+  <button class="btn" type="submit">Resume</button>
+</form>
+</div>
+{% endif %}
+
 <div class="card">
 <h2>Assigned sites</h2>
 <div class="table-scroll">
@@ -811,7 +831,18 @@ def user_detail(user_id: int):
         "SELECT series_id, series_name FROM user_shows WHERE user_id = ? ORDER BY series_name",
         (user_id,),
     ).fetchall()
-    body = render_template_string(USER_DETAIL_BODY, u=u, assigned_domains=assigned_domains, shows=shows)
+    # G6: excludes ignored devices, same reasoning as pause_all_devices() --
+    # an ignored device can't actually be paused (BYPASS outranks
+    # QUARANTINE in classify_device()), so it shouldn't count toward "how
+    # many of this kid's devices are pausable" either.
+    user_devices = conn.execute(
+        "SELECT id, quarantined_at FROM devices WHERE user_id = ? AND ignored = 0", (user_id,)
+    ).fetchall()
+    paused_device_count = sum(1 for row in user_devices if row["quarantined_at"])
+    body = render_template_string(
+        USER_DETAIL_BODY, u=u, assigned_domains=assigned_domains, shows=shows,
+        user_devices=user_devices, paused_device_count=paused_device_count,
+    )
     return render("users", body)
 
 
@@ -1711,6 +1742,25 @@ DEVICES_BODY = """
 </div>
 
 <div class="card">
+<h2>Pause the internet</h2>
+<p class="hint">
+  Bark Home's one-tap pause, per whole house here -- immediate and
+  indefinite, until you resume it. Uses the same <code>quarantined_at</code>
+  mechanism as a bedtime <a href="{{ url_for('schedules') }}">schedule</a>'s
+  full lockout (live-verified: a paused device loses ALL internet access,
+  not just filtered sites), just triggered by hand instead of a clock.
+  <strong>Ignored</strong> devices are skipped -- pausing one would have no
+  effect (same reason an ignored device isn't gated by a login either).
+</p>
+<form class="inline" method="post" action="{{ url_for('pause_all_devices') }}" onsubmit="return confirm('Pause the internet for every device in the house (except Ignored ones)?');">
+  <button class="danger" type="submit">Pause the whole house</button>
+</form>
+<form class="inline" method="post" action="{{ url_for('resume_all_devices') }}">
+  <button class="btn" type="submit">Resume everyone</button>
+</form>
+</div>
+
+<div class="card">
 <h2>Devices ({{ devices|length }})</h2>
 <p class="hint">
   Track known devices by MAC address ahead of the interception-layer work.
@@ -1734,7 +1784,8 @@ DEVICES_BODY = """
       {% else %}<em>Unassigned</em>{% endif %}
     </td>
     <td>
-      {% if d.pending %}<span class="badge pending" title="Seen on the network but nobody has logged in on it yet">Awaiting login</span>
+      {% if d.quarantined_at and not d.ignored %}<span class="badge blocked" title="Paused since {{ d.quarantined_at }} -- no internet access at all">Paused</span>
+      {% elif d.pending %}<span class="badge pending" title="Seen on the network but nobody has logged in on it yet">Awaiting login</span>
       {% elif d.ignored or d.bypass_login %}&mdash;
       {% else %}<span class="badge allowed">Authenticated</span>{% endif %}
     </td>
@@ -1749,6 +1800,19 @@ DEVICES_BODY = """
         <input type="hidden" name="device_id" value="{{ d.id }}">
         <button class="btn small" type="submit" title="Let this device online without ever needing to log in">Bypass</button>
       </form>
+      {% endif %}
+      {% if not d.ignored %}
+        {% if d.quarantined_at %}
+        <form class="inline" method="post" action="{{ url_for('resume_device') }}">
+          <input type="hidden" name="device_id" value="{{ d.id }}">
+          <button class="btn small" type="submit">Resume</button>
+        </form>
+        {% else %}
+        <form class="inline" method="post" action="{{ url_for('pause_device') }}">
+          <input type="hidden" name="device_id" value="{{ d.id }}">
+          <button class="danger small" type="submit">Pause</button>
+        </form>
+        {% endif %}
       {% endif %}
       <form class="inline" method="post" action="{{ url_for('delete_device') }}">
         <input type="hidden" name="device_id" value="{{ d.id }}">
@@ -2539,9 +2603,124 @@ def bypass_login_device():
     return flash_redirect("devices", "Device will no longer be asked to log in.")
 
 
+# G6: ad-hoc "pause the internet" -- Bark Home has one-tap pause per
+# device/kid/whole-house; `devices.quarantined_at` + the QUARANTINE
+# nftables set already existed for exactly this (Phase 3) with no
+# dashboard control wired to it until now. All three variants below are
+# plain writes to that one column -- `common/policy_class.py`'s
+# `classify_device()` already treats a non-NULL `quarantined_at` as
+# QUARANTINE (second-highest precedence, below only BYPASS/`ignored`),
+# and `controller/policy_state.py` already computes it into the real
+# nftables `quarantine_v4` set every cycle, live-verified 2026-09-01
+# (RoadMap.md's Phase 8 entry) with real packet loss and real recovery.
+# No new enforcement code needed anywhere -- this is purely wiring an
+# admin control onto plumbing that was already real.
+#
+# There is deliberately no separate "why was this paused" column: manual
+# pause and a schedule-driven lockout both express through the exact
+# same `quarantined_at`/QUARANTINE mechanism (matching the schedule
+# overlay's own "two independent axes" design, which never writes this
+# column itself -- see controller/policy_state.py). Resuming a device
+# therefore always means "un-pause it," full stop, regardless of how
+# many different actions might have paused it.
+#
+# An `ignored` device is a no-op to pause -- BYPASS outranks QUARANTINE
+# in classify_device()'s own precedence, so setting `quarantined_at` on
+# one would silently do nothing. The three routes below all exclude
+# `ignored` devices from a bulk pause for this reason; the single-device
+# route doesn't need to (the UI simply doesn't offer the button for one).
+
+def _set_quarantine(conn, where_sql: str, params: tuple, *, paused: bool) -> int:
+    value = db.now_iso() if paused else None
+    cur = conn.execute(f"UPDATE devices SET quarantined_at = ? WHERE {where_sql}", (value, *params))
+    conn.commit()
+    return cur.rowcount
+
+
+@app.route("/devices/pause", methods=["POST"])
+@require_admin
+def pause_device():
+    device_id = request.form.get("device_id", "")
+    redirect_to = request.form.get("redirect_to", "devices")
+    conn = get_db()
+    _set_quarantine(conn, "id = ?", (device_id,), paused=True)
+    if redirect_to == "device_detail":
+        return flash_redirect("device_detail", "Paused.", device_id=device_id)
+    return flash_redirect("devices", "Paused.")
+
+
+@app.route("/devices/resume", methods=["POST"])
+@require_admin
+def resume_device():
+    device_id = request.form.get("device_id", "")
+    redirect_to = request.form.get("redirect_to", "devices")
+    conn = get_db()
+    _set_quarantine(conn, "id = ?", (device_id,), paused=False)
+    if redirect_to == "device_detail":
+        return flash_redirect("device_detail", "Resumed.", device_id=device_id)
+    return flash_redirect("devices", "Resumed.")
+
+
+@app.route("/devices/pause-all", methods=["POST"])
+@require_admin
+def pause_all_devices():
+    conn = get_db()
+    n = _set_quarantine(conn, "ignored = 0", (), paused=True)
+    return flash_redirect("devices", f"Paused the internet for {n} device{'s' if n != 1 else ''}.")
+
+
+@app.route("/devices/resume-all", methods=["POST"])
+@require_admin
+def resume_all_devices():
+    conn = get_db()
+    n = _set_quarantine(conn, "quarantined_at IS NOT NULL", (), paused=False)
+    return flash_redirect("devices", f"Resumed {n} device{'s' if n != 1 else ''}.")
+
+
+@app.route("/users/pause", methods=["POST"])
+@require_admin
+def pause_user():
+    user_id = request.form.get("user_id", "")
+    conn = get_db()
+    n = _set_quarantine(conn, "user_id = ? AND ignored = 0", (user_id,), paused=True)
+    return flash_redirect(
+        "user_detail", f"Paused the internet for {n} device{'s' if n != 1 else ''}.", user_id=user_id
+    )
+
+
+@app.route("/users/resume", methods=["POST"])
+@require_admin
+def resume_user():
+    user_id = request.form.get("user_id", "")
+    conn = get_db()
+    n = _set_quarantine(conn, "user_id = ? AND quarantined_at IS NOT NULL", (user_id,), paused=False)
+    return flash_redirect("user_detail", f"Resumed {n} device{'s' if n != 1 else ''}.", user_id=user_id)
+
+
 DEVICE_DETAIL_BODY = """
 <p><a href="{{ url_for('devices') }}">&larr; All devices</a></p>
 <h1><code>{{ d.mac_address }}</code></h1>
+
+{% if not d.ignored %}
+<div class="card">
+<h2>Pause the internet</h2>
+{% if d.quarantined_at %}
+<p class="hint">Paused since <strong>{{ d.quarantined_at }}</strong> -- no internet access at all, not just filtered sites.</p>
+<form method="post" action="{{ url_for('resume_device') }}">
+  <input type="hidden" name="device_id" value="{{ d.id }}">
+  <input type="hidden" name="redirect_to" value="device_detail">
+  <button class="btn" type="submit">Resume</button>
+</form>
+{% else %}
+<p class="hint">Immediate, indefinite -- until you resume it. Same mechanism a bedtime schedule's full lockout uses, just triggered by hand.</p>
+<form method="post" action="{{ url_for('pause_device') }}">
+  <input type="hidden" name="device_id" value="{{ d.id }}">
+  <input type="hidden" name="redirect_to" value="device_detail">
+  <button class="danger" type="submit">Pause this device</button>
+</form>
+{% endif %}
+</div>
+{% endif %}
 
 <div class="card">
 <form class="add-form" method="post" action="{{ url_for('update_device') }}">

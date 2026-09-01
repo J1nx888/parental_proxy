@@ -544,6 +544,30 @@ true` from an earlier manual test while the DB setting was still `"0"`,
 and the controller's first cycle after redeploying corrected that drift
 on its own, with nothing telling it to. 685 passed/0 skipped on Linux.
 
+**2026-09-01, G6 (ad-hoc pause)**: 12 new tests in `tests/test_dashboard.py`
+covering all three scopes -- per-device pause/resume sets/clears
+`quarantined_at` (and requires admin auth), the Paused badge renders on
+the Devices list, whole-house pause skips `ignored` devices while resume
+clears every currently-quarantined one regardless of cause, per-kid
+pause/resume is correctly scoped to `WHERE user_id = ?` and never
+touches another user's device, the per-kid card only renders when that
+user actually has a device, and an `ignored` device is offered no pause
+button at all (pausing one would be a silent no-op). No new
+controller/nftables tests needed -- G6 added zero enforcement-layer code
+(see RoadMap.md's Phase 10 entry), so the existing Phase 3/Phase 8
+coverage of `classify_device()` and the QUARANTINE overlay already
+covers what happens once `quarantined_at` is set, regardless of which UI
+path set it. 666 passed, 30 skipped (Windows), zero regressions.
+Live-verified the per-device path end to end on the smoke-test VM the
+same day, reusing the exact container from Phase 8's own live-verification
+pass: a real `curl POST /devices/pause` wrote `quarantined_at` for real,
+the already-running controller moved that device's real IP into the
+real kernel `quarantine_v4` set on its next cycle, and a real `ping`
+dropped 3/3 packets -- then `POST /devices/resume` reversed all of it.
+Whole-house/per-kid were verified at the SQL layer only (same
+`_set_quarantine()` write against more rows, already proven by the unit
+tests and by per-device's own real nftables round-trip).
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in

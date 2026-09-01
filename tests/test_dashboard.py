@@ -1734,6 +1734,155 @@ def test_bypass_login_requires_admin_auth(client, db_conn):
     ).fetchone()["bypass_login"] == 0
 
 
+# ============================================================
+# G6: ad-hoc "pause the internet" (per-device / per-user / whole-house)
+# ============================================================
+
+def test_pause_device_sets_quarantined_at(client, db_conn):
+    device_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:60")
+    resp = client.post("/devices/pause", data={"device_id": device_id}, headers=_auth_header())
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT quarantined_at FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["quarantined_at"] is not None
+
+
+def test_resume_device_clears_quarantined_at(client, db_conn):
+    device_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:61")
+    client.post("/devices/pause", data={"device_id": device_id}, headers=_auth_header())
+
+    resp = client.post("/devices/resume", data={"device_id": device_id}, headers=_auth_header())
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT quarantined_at FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["quarantined_at"] is None
+
+
+def test_pause_device_requires_admin_auth(client, db_conn):
+    device_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:62")
+    resp = client.post("/devices/pause", data={"device_id": device_id})
+    assert resp.status_code == 401
+    row = db_conn.execute("SELECT quarantined_at FROM devices WHERE id = ?", (device_id,)).fetchone()
+    assert row["quarantined_at"] is None
+
+
+def test_devices_page_shows_paused_badge(client, db_conn):
+    device_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:63")
+    client.post("/devices/pause", data={"device_id": device_id}, headers=_auth_header())
+
+    resp = client.get("/devices", headers=_auth_header())
+    assert b"Paused" in resp.data
+
+
+def test_pause_all_devices_skips_ignored(client, db_conn):
+    normal_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:64")
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, ignored, created_at) VALUES ('aa:bb:cc:dd:ee:65', 1, datetime('now'))"
+    )
+    db_conn.commit()
+    ignored_id = db_conn.execute("SELECT id FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:65'").fetchone()["id"]
+
+    resp = client.post("/devices/pause-all", headers=_auth_header())
+    assert resp.status_code == 302
+
+    assert db_conn.execute(
+        "SELECT quarantined_at FROM devices WHERE id = ?", (normal_id,)
+    ).fetchone()["quarantined_at"] is not None
+    assert db_conn.execute(
+        "SELECT quarantined_at FROM devices WHERE id = ?", (ignored_id,)
+    ).fetchone()["quarantined_at"] is None
+
+
+def test_resume_all_devices_clears_every_paused_device(client, db_conn):
+    a = _insert_device(db_conn, "aa:bb:cc:dd:ee:66")
+    b = _insert_device(db_conn, "aa:bb:cc:dd:ee:67")
+    client.post("/devices/pause-all", headers=_auth_header())
+
+    resp = client.post("/devices/resume-all", headers=_auth_header())
+    assert resp.status_code == 302
+
+    for device_id in (a, b):
+        row = db_conn.execute("SELECT quarantined_at FROM devices WHERE id = ?", (device_id,)).fetchone()
+        assert row["quarantined_at"] is None
+
+
+def test_pause_user_pauses_only_that_users_devices(client, db_conn):
+    client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, user_id, created_at) VALUES ('aa:bb:cc:dd:ee:68', ?, datetime('now'))",
+        (user_id,),
+    )
+    other_device_id = _insert_device(db_conn, "aa:bb:cc:dd:ee:69")
+    db_conn.commit()
+    kid_device_id = db_conn.execute(
+        "SELECT id FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:68'"
+    ).fetchone()["id"]
+
+    resp = client.post("/users/pause", data={"user_id": user_id}, headers=_auth_header())
+    assert resp.status_code == 302
+
+    assert db_conn.execute(
+        "SELECT quarantined_at FROM devices WHERE id = ?", (kid_device_id,)
+    ).fetchone()["quarantined_at"] is not None
+    assert db_conn.execute(
+        "SELECT quarantined_at FROM devices WHERE id = ?", (other_device_id,)
+    ).fetchone()["quarantined_at"] is None
+
+
+def test_resume_user_clears_only_that_users_devices(client, db_conn):
+    client.post("/users/add", data={"username": "kid2", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid2'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, user_id, created_at) VALUES ('aa:bb:cc:dd:ee:70', ?, datetime('now'))",
+        (user_id,),
+    )
+    db_conn.commit()
+    client.post("/users/pause", data={"user_id": user_id}, headers=_auth_header())
+
+    resp = client.post("/users/resume", data={"user_id": user_id}, headers=_auth_header())
+    assert resp.status_code == 302
+    row = db_conn.execute(
+        "SELECT quarantined_at FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:70'"
+    ).fetchone()
+    assert row["quarantined_at"] is None
+
+
+def test_user_detail_page_shows_pause_card_when_user_has_devices(client, db_conn):
+    client.post("/users/add", data={"username": "kid3", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid3'").fetchone()["id"]
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, user_id, created_at) VALUES ('aa:bb:cc:dd:ee:71', ?, datetime('now'))",
+        (user_id,),
+    )
+    db_conn.commit()
+
+    resp = client.get(f"/users/{user_id}", headers=_auth_header())
+    assert b"Pause the internet" in resp.data
+
+
+def test_user_detail_page_hides_pause_card_when_user_has_no_devices(client, db_conn):
+    client.post("/users/add", data={"username": "kid4", "password": "pw"}, headers=_auth_header())
+    user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid4'").fetchone()["id"]
+
+    resp = client.get(f"/users/{user_id}", headers=_auth_header())
+    assert b"Pause the internet" not in resp.data
+
+
+def test_pausing_an_ignored_device_offers_no_pause_button(client, db_conn):
+    """An ignored device can't actually be paused (BYPASS outranks
+    QUARANTINE), so the UI shouldn't offer a button that would silently
+    do nothing."""
+    db_conn.execute(
+        "INSERT INTO devices (mac_address, ignored, created_at) VALUES ('aa:bb:cc:dd:ee:72', 1, datetime('now'))"
+    )
+    db_conn.commit()
+    device_id = db_conn.execute(
+        "SELECT id FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:72'"
+    ).fetchone()["id"]
+
+    resp = client.get(f"/devices/{device_id}", headers=_auth_header())
+    assert b"Pause this device" not in resp.data
+
+
 def test_bypass_login_defaults_an_unassigned_device_to_ignored(client, db_conn):
     """2026-08-31, project owner's explicit direction: a device that will
     never log in commonly has no real assignment either, so bypassing it

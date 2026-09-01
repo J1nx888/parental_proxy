@@ -802,3 +802,14 @@ playback goes through `www.crunchyroll.com/playback`, already covered.
   elsewhere in this file, SafeSearch is deliberately network-wide only --
   matching Bark Home's own behavior -- with no per-user/group/device
   scoping built at all.
+- **G6's ad-hoc "pause the internet" needed zero enforcement-layer
+  changes.** `devices.quarantined_at` and the QUARANTINE nftables set
+  were already fully general (Phase 3) -- `classify_device()` already
+  treats a non-NULL value as QUARANTINE regardless of who or what set
+  it, and `controller/policy_state.py` already computes it into the real
+  kernel ruleset every cycle. G6 is purely three dashboard routes writing
+  to a column that was already real and already live-verified. There is
+  deliberately no "why was this paused" tracking -- a manual pause and a
+  schedule's `lockout_all` overlay both express through this exact same
+  mechanism, so resuming a device always just means "un-pause it,"
+  regardless of how many different things might have paused it.

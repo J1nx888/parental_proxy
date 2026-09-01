@@ -530,6 +530,26 @@ actual captive-portal login screen itself is still Phase 4, not built).
   Hard-deletes the row (`device_bindings`/`device_domains`/
   `network_events` referencing it fall back to `device_id = NULL` via `ON
   DELETE SET NULL`/`CASCADE`, not left dangling). Redirects to `devices`.
+- `POST /devices/pause` / `POST /devices/resume` -> `pause_device()` /
+  `resume_device()` (G6, 2026-09-01) -- form fields `device_id`, optional
+  `redirect_to=device_detail` (defaults to redirecting to `devices`).
+  Writes/clears `devices.quarantined_at` via the shared `_set_quarantine()`
+  helper -- no new enforcement, `common/policy_class.py`'s
+  `classify_device()` and `controller/policy_state.py` already treat a
+  non-NULL value as QUARANTINE (Phase 3), live-verified against a real
+  device in Phase 8's own entry. The UI never offers these for an
+  `ignored` device (BYPASS outranks QUARANTINE, so it would be a no-op).
+- `POST /devices/pause-all` / `POST /devices/resume-all` ->
+  `pause_all_devices()` / `resume_all_devices()` (G6) -- whole-house
+  variant, no form fields. Pause excludes `ignored` devices
+  (`WHERE ignored = 0`); resume clears every currently-quarantined device
+  regardless of how it got that way (`WHERE quarantined_at IS NOT NULL`).
+  Both redirect to `devices` with a count of devices affected.
+- `POST /users/pause` / `POST /users/resume` -> `pause_user()` /
+  `resume_user()` (G6) -- form field `user_id`. Per-kid variant of the
+  above, scoped to `WHERE user_id = ?` (pause also excludes `ignored`).
+  Redirects to `user_detail`. The user detail page only shows this card
+  when that user actually has at least one non-`ignored` device.
 - `POST /devices/cleanup` -> `cleanup_stale_devices()` -- deletes every
   device whose `last_seen_at` is older than the `device_stale_days`
   setting (see below); a device never observed at all (`last_seen_at IS

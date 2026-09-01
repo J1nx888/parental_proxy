@@ -2898,6 +2898,70 @@ G3 actually needed.
 
 ---
 
+## Phase 10 — Ad-hoc "pause the internet" (G6, built 2026-09-01)
+
+Same gap-analysis pass as Phase 9/G3 above, next in the project owner's
+own stated order (G3, then G6, then G1 prep). Bark Home has one-tap
+"pause the internet" per device/kid/whole-house; `devices.quarantined_at`
+and the QUARANTINE nftables set already existed for exactly this
+(Phase 3) — `common/policy_class.py`'s `classify_device()` already
+treats a non-NULL `quarantined_at` as QUARANTINE, and
+`controller/policy_state.py` already computes it into the real
+`quarantine_v4` nftables set every cycle. **No new enforcement code was
+needed at all** — this whole phase is wiring an admin control onto
+plumbing that was already real and already live-verified (Phase 8's
+entry above: a real device lost real connectivity via this exact
+mechanism, `ping` 0/3 received matching the kernel drop counter, and
+recovered the instant the condition clearing it fired).
+
+**Shipped**, all in `dashboard/dashboard.py`:
+- **Per-device**: a "Pause"/"Resume" button per row on the Devices list,
+  and a dedicated card on the device detail page. `POST /devices/pause`
+  / `POST /devices/resume`.
+- **Per-kid**: a card on the user detail page (shown only when that user
+  has at least one device), pausing/resuming every device assigned to
+  them at once. `POST /users/pause` / `POST /users/resume`.
+- **Whole-house**: a card at the top of the Devices page.
+  `POST /devices/pause-all` / `POST /devices/resume-all`.
+
+All three are thin wrappers around one shared `_set_quarantine()` helper
+that writes/clears `devices.quarantined_at` — there is deliberately no
+separate "why was this paused" column: manual pause and a schedule's
+`lockout_all` overlay both express through the exact same
+`quarantined_at`/QUARANTINE mechanism (matching the schedule overlay's
+own "two independent axes" design, which never writes this column
+itself), so resuming a device always just means "un-pause it," full
+stop, regardless of how many different things might have paused it.
+Every bulk variant (whole-house, per-kid) excludes `ignored` devices --
+BYPASS outranks QUARANTINE in `classify_device()`'s own precedence, so
+pausing an `ignored` device would silently do nothing; the UI doesn't
+even offer the single-device button for one, for the same reason.
+
+12 new tests in `tests/test_dashboard.py` (per-device set/clear/auth-
+required, the Paused badge appears, whole-house pause skips `ignored`
+and resume clears everyone, per-kid pause/resume scoped correctly and
+doesn't touch other users' devices, the per-kid card only renders when
+the user actually has a device, an `ignored` device gets no pause
+button at all). 666 passed, 30 skipped (Windows), zero regressions.
+
+**Live-verified 2026-09-01** against the real smoke-test VM (rebuilt
+`dashboard` image only -- no controller/policy changes were made, since
+none were needed): a real `curl POST /devices/pause` against a real
+device correctly wrote `quarantined_at`; the already-running controller
+picked it up on its very next cycle and moved that device's real IP into
+the real kernel `quarantine_v4` set (confirmed via `nft list set`,
+reusing the exact same container from Phase 8's own live-verification
+pass); a real `ping` from that device dropped 3/3 packets. `POST
+/devices/resume` reversed it on the next cycle, real connectivity
+restored. Whole-house and per-kid variants verified at the SQL/DB layer
+(the bulk `UPDATE ... WHERE ignored = 0` / `WHERE user_id = ?` clauses
+behave exactly as the unit tests already prove) -- not re-run through a
+second full nftables round-trip, since per-device already proved the
+enforcement side end to end and these two are the same write against
+more rows.
+
+---
+
 ## Cross-cutting: security-by-design
 
 Security is designed in from the start on every phase above, not
