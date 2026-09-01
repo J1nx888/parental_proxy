@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_run": "2026-09-01T05:05:00Z",
+  "last_run": "2026-09-01T14:10:00Z",
   "sections": {
     "architecture": {
       "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "adguard/", "defaults/", "dashboard/", "controller/", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile"],
@@ -22,9 +22,9 @@
     },
     "deployment": {
       "source_paths": ["docker-compose.yml", "proxy/Dockerfile", "adguard/Dockerfile", "adguard/entrypoint.sh", "dashboard/Dockerfile", "controller/Dockerfile", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile", "proxy/entrypoint.sh", "setup.sh", ".env.example", ".github/workflows/tests.yml", "README.md"],
-      "fingerprint": "681158c6e55991a6f46159a8b87f772f5efbd2c725ae74dac593e77ce49914d5",
+      "fingerprint": "6dac28752b186b1c0d5a930e6e50caefa65ceed0e763fd3043b267dd697dae77",
       "doc_path": "docs/deployment/setup.md",
-      "last_updated": "2026-09-01T05:05:00Z"
+      "last_updated": "2026-09-01T14:10:00Z"
     },
     "security": {
       "source_paths": ["common/auth.py", "proxy/authz_helper.py", "proxy/sni_helper.py", "common/squid_helper.py", "proxy/entrypoint.sh", "proxy/squid.conf.template", "dashboard/dashboard.py", "dashboard/block_page_server.py", "dashboard/captive_portal_server.py", "common/device_identity.py", "common/adguard_client.py", "controller/adguard_sync.py", "controller/main.py", "adguard/entrypoint.sh"],

@@ -335,6 +335,36 @@ documented in `.env.example`:
   without restarting either container — the `.env` value only seeds it on
   first run (`db.set_setting_if_absent` in `entrypoint.sh`).
 
+## Build-time note: apt sources are forced to HTTPS
+
+`controller/Dockerfile`, `dashboard/Dockerfile`, `proxy/Dockerfile`, and
+`phase3/nftables-manager/Dockerfile` all `sed` the base image's
+`/etc/apt/sources.list.d/debian.sources` from `http://deb.debian.org` to
+`https://deb.debian.org` before running `apt-get update`. This exists
+because of a real failure confirmed live on the smoke-test VM (2026-09-01):
+plain-HTTP apt fetches of `deb.debian.org`'s `InRelease` files consistently
+failed apt's clearsign parser (`Clearsigned file isn't valid, got
+'NOSPLIT'`), while a byte-for-byte-identical `curl` fetch of the exact same
+URL over plain HTTP from the VM's own host network succeeded every time —
+something in that environment's path between the Docker container network
+and the mirror mangles the plain-HTTP response specifically for apt's
+fetcher. HTTPS is unaffected, hence the switch. If a future rebuild
+environment hits the same symptom, this is already handled; if a
+*different* symptom shows up building on a new environment, don't assume
+it's the same root cause without checking (this one was never fully root-
+caused, just routed around).
+
+One follow-on wrinkle: `debian:bookworm-slim` (the base for `proxy` and
+`phase3/nftables-manager`) ships with **no `ca-certificates` package at
+all**, so switching it straight to HTTPS hit a chicken-and-egg problem —
+apt can't TLS-verify the mirror to fetch the very package that would let it
+verify anything. Both Dockerfiles bootstrap around this with a plain
+`COPY --from=python:3.12-slim /etc/ssl/certs/ca-certificates.crt ...`
+(that image already carries a real, current CA bundle) — a plain file copy
+of a standard root bundle, not a relaxation of TLS verification. The real
+`ca-certificates` package is still installed via apt right after, which
+reconciles/manages that file properly from then on.
+
 ## Port mappings
 
 With `network_mode: host`, all three services' ports bind directly to

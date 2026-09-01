@@ -2684,11 +2684,79 @@ section correctly hidden for a `lockout_all` schedule) — clean server log
 throughout, only a pre-existing, unrelated service-worker console error
 also present on the already-shipped Domains page.
 
-**Not yet live-verified (needs the VM)**: AdGuard Home actually applying
-a category custom rule or a native filter subscription on real DNS
-queries; a real device losing all connectivity via the `quarantine_v4`
-nftables set during a simulated bedtime window; the exact
-`add_filter_url`/`set_filter_url` request/response shape (see above).
+**2026-09-01, real infra bug hit and fixed before any of the above could
+even build**: rebuilding the six images on the smoke-test VM (its first
+rebuild since Phase 8 landed) hit a genuine environment failure --
+`apt-get update` against `deb.debian.org` over plain HTTP consistently
+failed apt's clearsign parser (`Clearsigned file isn't valid, got
+'NOSPLIT'`), on every one of `controller`/`dashboard`/`proxy`/
+`phase3/nftables-manager`'s Dockerfiles. Confirmed via a byte-for-byte
+diff that a plain `curl` fetch of the identical URL over HTTP from the
+VM's own host network returned the correct file every time -- something
+between Docker's container network path and the mirror mangles the
+plain-HTTP response specifically for apt's fetcher, not a corrupted
+upstream file. Fixed by forcing every apt source to HTTPS via a one-line
+`sed` against the base image's deb822 `sources.list.d` file. That then
+surfaced a second, narrower issue on the two `debian:bookworm-slim`-based
+images (`proxy`, `nftables-manager`): that base ships with **zero**
+`ca-certificates` at all, so HTTPS apt hit a chicken-and-egg
+certificate-verification failure. Fixed with a plain `COPY
+--from=python:3.12-slim` of that image's own already-present CA bundle
+file -- reusing a standard root bundle from elsewhere in this repo's own
+images, not a TLS-verification relaxation (deliberately avoided --
+disabling `Acquire::https::Verify-Peer` was the first idea, correctly
+blocked by this session's own auto-mode classifier as a security-relevant
+change worth a second look). All six images then built and redeployed
+clean; the running stack's `/health` page showed both cards green
+afterward.
+
+**2026-09-01: all three "needs the VM" items above now live-verified for
+real**, once the smoke-test VM came back up. Full writeup with exact
+commands/output in the dated "smoke-test VM catch-up" section further
+below; summary here:
+- **Native filter-subscription API shape**: `get_filters_status`,
+  `add_filter_url`, `set_filter_url_enabled`, `remove_filter_url` all
+  confirmed byte-for-byte against a real running AdGuard Home v0.107.79
+  -- every assumed request/response shape in `common/adguard_client.py`'s
+  docstrings turned out correct on the first try (no surprises, unlike
+  most of this project's other AdGuard-API guesses). `sync_category_subscriptions()`
+  itself also run end-to-end against a scratch 5,001-domain category:
+  correctly added+enabled on `is_global=1`, correctly disabled once
+  flipped off with no gating schedule.
+- **Scoped `$client=` category rule**: a real category assigned to one
+  of two real Docker-container "devices" produced exactly the expected
+  `/(?i)(?:^|\.)(?:example\.com)$/$client=<ip>` rule; `dig`ging
+  `example.com` from the scoped container returned AdGuard's configured
+  block response, the other container resolved the real address, and an
+  unrelated domain from the scoped container still resolved fine.
+- **Schedule-driven QUARANTINE + real nftables lockout**: a real
+  `lockout_all=1` schedule scoped to one real device, active right now,
+  correctly overlaid QUARANTINE in `controller/policy_state.py`'s
+  computed `desired_policy_json`, which the real Go `nftables-manager`
+  picked up and moved that device's IP into the real kernel's
+  `quarantine_v4` set -- confirmed via `nft list set`, not just the JSON.
+  Then proved actual packet loss: `ping` from that device dropped 3/3
+  packets, matching the real `ip saddr @quarantine_v4 counter drop`
+  rule's counter incrementing by exactly 3. Closing the schedule window
+  (moving `end_time` into the past) flipped the device straight back to
+  `authenticated_v4` on the very next poll cycle and connectivity
+  genuinely came back (0% loss). Both directions proven, not just one.
+- **Real gotcha hit and resolved along the way** (same category as this
+  VM's own documented "stray discovery bindings" lesson, see
+  [[parental-proxy-smoketest-vm]]): the first quarantine attempt used a
+  hand-inserted fake `devices` row with a made-up MAC, sharing the same
+  Docker-assigned IP as a MAC the production discovery loop had
+  independently auto-discovered for that same container's real veth
+  interface. Both device rows bound to the same IP, and the JSON
+  builder's last-write-wins-per-IP behavior silently put the IP in
+  `unauthenticated` instead of `quarantine`. Fixed by using the real
+  auto-discovered device row instead of a second fake one -- not a bug
+  in the quarantine/schedule code itself, but a genuine reminder that
+  this VM's shared `docker0`/`network_mode: host` setup means any test
+  container's traffic is visible to production's own live discovery,
+  same lesson as before. All test devices/bindings/schedules/categories
+  cleaned up afterward (bindings deactivated, not hard-deleted, matching
+  this VM's established practice).
 
 **Resolved same session**: the project owner asked for a sensible default
 set to be seeded now. `defaults/seed_defaults.py` gained

@@ -492,6 +492,27 @@ browser extensions (~82% CSS cosmetic/element-hiding rules, plus a few
 path-scoped resource blocks), not DNS-tier whole-domain blocking; no test
 coverage needed since nothing from it was wired in.
 
+**2026-09-01, smoke-test VM catch-up**: no new tests this pass -- pure
+live verification of the three items Phase 8 had shipped without,
+against the real smoke-test VM (see RoadMap.md's dated entry for full
+commands/output). Full suite re-confirmed clean on Linux both before and
+after: 671 passed/0 skipped on the pre-fix commit, 674 passed/0 skipped
+after landing the apt-HTTPS/CA-bundle Dockerfile fixes and the AI-seeding
+commit (matches Windows' 644 passed + 30 skipped = 674 collected).
+Verified for real, not unit-tested: `common/adguard_client.py`'s four
+native-filter functions against a live AdGuard Home instance (all four
+request/response shapes confirmed correct, no surprises);
+`sync_category_subscriptions()` end-to-end against a scratch
+5,001-domain category (add+enable, then disable); a scoped `$client=`
+category rule differentiating two real Docker-container "devices" via
+real `dig` queries; and the schedule-driven QUARANTINE overlay producing
+genuine packet loss (`ping` 0/3 received, matching the real
+`ip saddr @quarantine_v4 counter drop` rule's counter) and genuine
+recovery once the schedule window closed. All test devices/bindings/
+schedules/categories cleaned up afterward; a stray discovery-loop
+binding conflict hit mid-test (see RoadMap.md) was resolved without
+needing any code change.
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in
