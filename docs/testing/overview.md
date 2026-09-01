@@ -472,6 +472,26 @@ AdGuard Home actually applying a category custom rule or a native filter
 subscription against real DNS queries, and a real device losing
 connectivity via `quarantine_v4` during a simulated bedtime window.
 
+**2026-09-01, follow-up**: seeded the previously-empty "AI" category with a
+1,195-domain manual snapshot from Microsoft Purview's own published
+AI-sites list (see `docs/database/schema.md`'s Seed data section and
+`defaults/ai_sites_seed.py`'s own docstring for full provenance). 6 new
+tests added to `tests/test_seed_idempotent.py`: exact domain count seeded
+with `source='manual'`; a handful of well-known AI domains
+(`chatgpt.com`, `claude.ai`, `anthropic.com`, `character.ai`,
+`midjourney.co`) present and correctly `re.escape()`d; the split between
+"AI has domains immediately" vs. "every subscription-backed category has
+zero `category_domains` rows until its first sync" made explicit as two
+separate tests (replacing one test that asserted the old, now-incorrect
+"no category has domains yet" blanket claim); and a reseed neither
+duplicates nor clobbers a domain an admin adds to the category by hand.
+644 tests total, all passing, no regressions. Also evaluated (not
+integrated) a second candidate the project owner asked about, Stevo's AI
+Blocklist -- fetched its real raw file live and confirmed it's built for
+browser extensions (~82% CSS cosmetic/element-hiding rules, plus a few
+path-scoped resource blocks), not DNS-tier whole-domain blocking; no test
+coverage needed since nothing from it was wired in.
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_run": "2026-09-01T03:30:12Z",
+  "last_run": "2026-09-01T05:05:00Z",
   "sections": {
     "architecture": {
       "source_paths": ["README.md", "docker-compose.yml", "common/", "proxy/", "adguard/", "defaults/", "dashboard/", "controller/", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile"],
@@ -15,16 +15,16 @@
       "last_updated": "2026-09-01T03:12:57Z"
     },
     "database": {
-      "source_paths": ["common/db.py", "defaults/seed_defaults.py"],
-      "fingerprint": "9c7f000672c0bb0001b4ab20fae9c4210839c84530f32035ffc4c7697e86f956",
+      "source_paths": ["common/db.py", "defaults/seed_defaults.py", "defaults/ai_sites_seed.py"],
+      "fingerprint": "82bdf2024882d2494ca564f5485a69f4e595e0af8aad15c21a2cdb9cb37506d9",
       "doc_path": "docs/database/schema.md",
-      "last_updated": "2026-09-01T03:30:12Z"
+      "last_updated": "2026-09-01T05:05:00Z"
     },
     "deployment": {
       "source_paths": ["docker-compose.yml", "proxy/Dockerfile", "adguard/Dockerfile", "adguard/entrypoint.sh", "dashboard/Dockerfile", "controller/Dockerfile", "phase3/arp-worker/Dockerfile", "phase3/nftables-manager/Dockerfile", "proxy/entrypoint.sh", "setup.sh", ".env.example", ".github/workflows/tests.yml", "README.md"],
-      "fingerprint": "8f74127d2219afb2d715c063cda64c9b5a830c8a7c3bcb4b157b328e9b7e57b2",
+      "fingerprint": "681158c6e55991a6f46159a8b87f772f5efbd2c725ae74dac593e77ce49914d5",
       "doc_path": "docs/deployment/setup.md",
-      "last_updated": "2026-09-01T03:12:57Z"
+      "last_updated": "2026-09-01T05:05:00Z"
     },
     "security": {
       "source_paths": ["common/auth.py", "proxy/authz_helper.py", "proxy/sni_helper.py", "common/squid_helper.py", "proxy/entrypoint.sh", "proxy/squid.conf.template", "dashboard/dashboard.py", "dashboard/block_page_server.py", "dashboard/captive_portal_server.py", "common/device_identity.py", "common/adguard_client.py", "controller/adguard_sync.py", "controller/main.py", "adguard/entrypoint.sh"],
@@ -34,9 +34,9 @@
     },
     "testing": {
       "source_paths": ["tests/", "pytest.ini", "requirements-dev.txt", ".github/workflows/tests.yml"],
-      "fingerprint": "a1464feadef98a3cd303e4bd80bd5b0846d8630ad45aca1d1cb76912eaea6e0a",
+      "fingerprint": "c8bcb9e6b75667ed971578e35a1d310081398b43be26af442bf34c4c83df7960",
       "doc_path": "docs/testing/overview.md",
-      "last_updated": "2026-09-01T03:30:12Z"
+      "last_updated": "2026-09-01T05:05:00Z"
     }
   }
 }

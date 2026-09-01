@@ -6,12 +6,14 @@ has since edited or removed via the dashboard stays as they left it.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import db
+from ai_sites_seed import AI_SITE_DOMAINS
 
 # Infrastructure Crunchyroll's site depends on -- global, splice mode (never
 # decrypted, just a host-level pass-through once allowed). Carried over from
@@ -164,6 +166,21 @@ def seed(conn) -> None:
             "INSERT OR IGNORE INTO categories (name, subscription_url, is_global, created_at) "
             "VALUES (?, ?, 0, ?)",
             (name, subscription_url, db.now_iso()),
+        )
+
+    # AI category starter domains: a one-time manual snapshot (see
+    # ai_sites_seed.py's own docstring for provenance/exclusions), tagged
+    # source='manual' -- the same tag an admin's own hand-added domain gets,
+    # and therefore never touched or duplicated by a re-seed. Not a
+    # subscription sync: there is no subscription_url on this category for
+    # common/category_fetch.py to fetch from.
+    ai_row = conn.execute("SELECT id FROM categories WHERE name = 'AI'").fetchone()
+    if ai_row:
+        now = db.now_iso()
+        conn.executemany(
+            "INSERT OR IGNORE INTO category_domains (category_id, pattern, source, created_at) "
+            "VALUES (?, ?, 'manual', ?)",
+            [(ai_row["id"], re.escape(domain), now) for domain in AI_SITE_DOMAINS],
         )
 
 

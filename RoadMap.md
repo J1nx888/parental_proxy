@@ -2706,6 +2706,46 @@ against the real, live WhatsApp URL end-to-end (no test doubles) — fetched
 `tests/test_seed_idempotent.py` (10 total categories seeded; a re-seed
 never overwrites an admin's own `is_global` edit) — 641 tests total.
 
+**Addendum (2026-09-01): AI category seeded with a real starter list.**
+The project owner pointed at Microsoft Purview's own published
+[list of generative-AI sites](https://learn.microsoft.com/en-us/purview/ai-microsoft-purview-supported-sites)
+and asked whether it could seed the "AI" category (which had shipped with
+zero domains — no public subscription list exists for it). Fetched it live:
+1,211 `*.domain` entries. 1,195 converted cleanly to plain domains (the
+`*.` wildcard prefix means the same thing as this project's own
+domain-suffix matching, so it was just stripped); 15 were excluded because
+they scope one AI feature to a *path* on an otherwise general-purpose
+domain (e.g. `github.com/features/copilot`, `aws.amazon.com/bedrock/titan`,
+`bing.com/chat`) — this project's category model blocks by domain, not
+path, so blocking those bare domains would have collaterally blocked large
+unrelated sites (all of GitHub, all of AWS, ...); one further entry
+(`*.vertexaisearch.cloud.google`, missing its `.com`) looked like a typo in
+Microsoft's own list and was dropped rather than guessed at. The result
+went into a new `defaults/ai_sites_seed.py` (`AI_SITE_DOMAINS`, a plain
+list — see its own docstring for full provenance and the exclusion list),
+imported by `seed_defaults.seed()` to insert straight into
+`category_domains` with `source='manual'` (no `category_fetch.py` sync
+possible here — Microsoft's page isn't a fetchable plain-text list). Also
+separately fetched and evaluated
+[Stevo's AI Blocklist](https://github.com/Stevoisiak/Stevos-AI-Blocklist)
+per the project owner's question: confirmed live (fetched the raw file) it
+is ~82% cosmetic/CSS element-hiding rules and path-scoped resource blocks
+for browser extensions (uBlock Origin/AdGuard *browser extension*, not
+AdGuard *Home*) — meant to hide an AI widget on a page, not block a whole
+AI site — with **zero** full-domain block rules found in the sample
+checked. Not usable for this project's DNS-tier, whole-domain category
+model; not integrated.
+
+Caught and fixed a deployment gap before it shipped: `proxy/Dockerfile`
+`COPY`s `defaults/seed_defaults.py` by exact filename, not the whole
+`defaults/` directory — the new `ai_sites_seed.py` would have been silently
+left out of the built image, breaking the container's first-run seed with
+a `ModuleNotFoundError` the moment it ran. Fixed the `COPY` line to name
+both files. 6 new tests added to `tests/test_seed_idempotent.py`
+(1,195-domain count, `source='manual'` tagging, spot-checked domains
+present, admin-added-domain survives a reseed) — 644 tests total, all
+passing, zero regressions.
+
 ---
 
 ## Cross-cutting: security-by-design

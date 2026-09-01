@@ -693,18 +693,43 @@ left it.
    exists for either, manual-curation-only). **None are seeded
    `is_global`** -- the row existing blocks nothing on its own; an admin
    still has to turn one on and choose who it applies to from the
-   Categories page. **No `category_domains` rows are seeded either** --
-   those only appear once something actually calls
-   `common/category_fetch.py`'s `fetch_and_sync_category()` (the
-   controller's own daily background loop, or the dashboard's "Sync now"
-   button) -- confirmed live: a real, non-mocked sync of the seeded
+   Categories page. **No `category_domains` rows are seeded for the
+   subscription-backed categories** -- those only appear once something
+   actually calls `common/category_fetch.py`'s `fetch_and_sync_category()`
+   (the controller's own daily background loop, or the dashboard's "Sync
+   now" button) -- confirmed live: a real, non-mocked sync of the seeded
    WhatsApp URL fetched 226 real domains end-to-end.
+   **AI is the one exception**: it has no `subscription_url` for
+   `category_fetch.py` to sync from, so instead `seed()` inserts a
+   **one-time manual snapshot** of 1,195 domains straight into
+   `category_domains` (`source='manual'`), from
+   [`defaults/ai_sites_seed.py`](../../defaults/ai_sites_seed.py) --
+   sourced from Microsoft Purview's own published
+   [AI-sites list](https://learn.microsoft.com/en-us/purview/ai-microsoft-purview-supported-sites)
+   (fetched live 2026-09-01). 15 entries from Microsoft's original list
+   were deliberately dropped because they scope one AI feature to a *path*
+   on an otherwise general-purpose domain (`github.com/features/copilot`,
+   `aws.amazon.com/bedrock/titan`, `bing.com/chat`, `sindresorhus.com`'s 3
+   tools, and 9 others -- see the module's own docstring for the full
+   list) -- this project's `category_domains` model has no path scoping,
+   so blocking the bare domain would have collaterally blocked large
+   unrelated sites. Being `source='manual'` (the same tag an admin's own
+   hand-added domain gets), a re-seed never touches or duplicates these
+   rows; an admin can freely add to or delete from this starter set from
+   the AI category's own Manage page. At 1,195 domains it's well under
+   `matching.MAX_SCOPED_CATEGORY_DOMAINS` (5,000), so -- unlike the four
+   over-threshold subscription categories -- AI can still be scoped to a
+   specific kid/device, not just turned on globally.
 
 Run directly: `python3 defaults/seed_defaults.py` (imports `db` from the
 same directory via a `sys.path.insert` at the top of the file -- run it
 from a context where `common/` is importable as `db`, e.g. from inside the
 proxy container's `/opt/parental-proxy/`, or with that directory added to
-`PYTHONPATH`/`sys.path` manually).
+`PYTHONPATH`/`sys.path` manually). Also imports its sibling
+`defaults/ai_sites_seed.py` by bare module name (`from ai_sites_seed import
+AI_SITE_DOMAINS`) -- both files must be copied into the same directory in
+any deployment image; `proxy/Dockerfile` does this with a single `COPY
+defaults/seed_defaults.py defaults/ai_sites_seed.py ...` line.
 
 ## Running / resetting the database locally
 

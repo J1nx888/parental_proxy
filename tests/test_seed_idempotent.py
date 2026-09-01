@@ -1,7 +1,11 @@
 """defaults/seed_defaults.py: idempotent first-run seeding."""
 from __future__ import annotations
 
+import re
+
+import db
 import seed_defaults
+from ai_sites_seed import AI_SITE_DOMAINS
 
 
 def _counts(conn):
@@ -9,6 +13,7 @@ def _counts(conn):
         "domains": conn.execute("SELECT COUNT(*) c FROM domains").fetchone()["c"],
         "domain_paths": conn.execute("SELECT COUNT(*) c FROM domain_paths").fetchone()["c"],
         "categories": conn.execute("SELECT COUNT(*) c FROM categories").fetchone()["c"],
+        "category_domains": conn.execute("SELECT COUNT(*) c FROM category_domains").fetchone()["c"],
     }
 
 
@@ -25,21 +30,89 @@ def test_seed_is_idempotent_on_row_counts(conn):
     assert first["domains"] > 0
     assert first["domain_paths"] == len(seed_defaults.CRUNCHYROLL_PATHS)
     assert first["categories"] == len(seed_defaults.DEFAULT_CATEGORIES)
+    assert first["category_domains"] == len(AI_SITE_DOMAINS)
 
 
-def test_default_categories_seeded_not_global_with_no_domains_yet(conn):
-    """Seeding a category row alone blocks nothing -- is_global defaults
-    to 0, and no category_domains rows exist until something actually
-    calls common/category_fetch.py's fetch_and_sync_category() (the
-    controller's own daily loop, or the dashboard's "Sync now" button)."""
+def test_default_categories_seeded_not_global(conn):
+    """Seeding a category row alone blocks nothing -- is_global defaults to
+    0 for every starter category, AI included, regardless of whether it has
+    domains yet."""
     seed_defaults.seed(conn)
     conn.commit()
     rows = conn.execute("SELECT name, subscription_url, is_global FROM categories ORDER BY name").fetchall()
     assert len(rows) == len(seed_defaults.DEFAULT_CATEGORIES)
     assert all(r["is_global"] == 0 for r in rows)
-    ai_row = conn.execute("SELECT subscription_url FROM categories WHERE name = 'AI'").fetchone()
+
+
+def test_subscription_categories_have_no_domains_until_first_sync(conn):
+    """Every OTHER starter category (has a subscription_url) gets no
+    category_domains rows until something actually calls
+    common/category_fetch.py's fetch_and_sync_category() (the controller's
+    own daily loop, or the dashboard's "Sync now" button) -- unlike AI,
+    which is a manual snapshot seeded with its domains already in place."""
+    seed_defaults.seed(conn)
+    conn.commit()
+    subscribed_ids = [
+        r["id"] for r in conn.execute("SELECT id FROM categories WHERE subscription_url IS NOT NULL")
+    ]
+    for category_id in subscribed_ids:
+        count = conn.execute(
+            "SELECT COUNT(*) c FROM category_domains WHERE category_id = ?", (category_id,)
+        ).fetchone()["c"]
+        assert count == 0
+
+
+def test_ai_category_seeded_with_manual_domain_snapshot(conn):
+    """AI has no public subscription list (confirmed via research) -- it's
+    seeded from a one-time manual snapshot (defaults/ai_sites_seed.py,
+    sourced from Microsoft Purview's published AI-sites list) instead, all
+    tagged source='manual' so a re-seed never touches or duplicates them."""
+    seed_defaults.seed(conn)
+    conn.commit()
+    ai_row = conn.execute("SELECT id, subscription_url FROM categories WHERE name = 'AI'").fetchone()
     assert ai_row["subscription_url"] is None
-    assert conn.execute("SELECT COUNT(*) c FROM category_domains").fetchone()["c"] == 0
+
+    rows = conn.execute(
+        "SELECT pattern, source FROM category_domains WHERE category_id = ?", (ai_row["id"],)
+    ).fetchall()
+    assert len(rows) == len(AI_SITE_DOMAINS)
+    assert all(r["source"] == "manual" for r in rows)
+
+    patterns = {r["pattern"] for r in rows}
+    for domain in ("chatgpt.com", "claude.ai", "anthropic.com", "character.ai", "midjourney.co"):
+        assert re.escape(domain) in patterns
+
+
+def test_ai_category_reseed_preserves_admin_added_domain(conn):
+    """Re-running seed() must not disturb a domain an admin added to the AI
+    category by hand -- same INSERT OR IGNORE idempotency as everything else
+    in this module, keyed on (category_id, pattern). (Note, same as the
+    pre-existing GLOBAL_SPLICE_DOMAINS/TRUSTED_DOMAINS seeds: this does NOT
+    protect against a *deleted* default reappearing on reseed -- INSERT OR
+    IGNORE can't tell "never inserted" from "admin removed it" -- only
+    against duplication/data loss for rows the admin adds.)"""
+    seed_defaults.seed(conn)
+    conn.commit()
+    ai_row = conn.execute("SELECT id FROM categories WHERE name = 'AI'").fetchone()
+
+    conn.execute(
+        "INSERT INTO category_domains (category_id, pattern, source, created_at) "
+        "VALUES (?, ?, 'manual', ?)",
+        (ai_row["id"], re.escape("some-admin-added-ai-site.example"), db.now_iso()),
+    )
+    conn.commit()
+
+    seed_defaults.seed(conn)
+    conn.commit()
+
+    patterns = {
+        r["pattern"]
+        for r in conn.execute(
+            "SELECT pattern FROM category_domains WHERE category_id = ?", (ai_row["id"],)
+        )
+    }
+    assert re.escape("some-admin-added-ai-site.example") in patterns
+    assert len(patterns) == len(AI_SITE_DOMAINS) + 1
 
 
 def test_seed_twice_leaves_a_category_admin_edit_untouched(conn):
