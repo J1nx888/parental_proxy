@@ -2942,7 +2942,9 @@ required, the Paused badge appears, whole-house pause skips `ignored`
 and resume clears everyone, per-kid pause/resume scoped correctly and
 doesn't touch other users' devices, the per-kid card only renders when
 the user actually has a device, an `ignored` device gets no pause
-button at all). 666 passed, 30 skipped (Windows), zero regressions.
+button at all). 666 passed, 30 skipped (Windows), 696 passed/0 skipped
+on Linux (confirmed on the smoke-test VM the same day), zero
+regressions.
 
 **Live-verified 2026-09-01** against the real smoke-test VM (rebuilt
 `dashboard` image only -- no controller/policy changes were made, since

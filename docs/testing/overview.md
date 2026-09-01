@@ -557,7 +557,8 @@ controller/nftables tests needed -- G6 added zero enforcement-layer code
 (see RoadMap.md's Phase 10 entry), so the existing Phase 3/Phase 8
 coverage of `classify_device()` and the QUARANTINE overlay already
 covers what happens once `quarantined_at` is set, regardless of which UI
-path set it. 666 passed, 30 skipped (Windows), zero regressions.
+path set it. 666 passed, 30 skipped (Windows), 696 passed/0 skipped on
+Linux, zero regressions.
 Live-verified the per-device path end to end on the smoke-test VM the
 same day, reusing the exact container from Phase 8's own live-verification
 pass: a real `curl POST /devices/pause` wrote `quarantined_at` for real,
