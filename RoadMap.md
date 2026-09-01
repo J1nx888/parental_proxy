@@ -3325,6 +3325,24 @@ tests in `tests/test_controller_adguard_sync.py`; 2 pre-existing
 managed block is never fully empty anymore -- the anti-DoH baseline is
 always present). 718 passed, 30 skipped on Windows, zero regressions.
 
+**Live-verified against the real smoke-test VM stack, not just unit
+tests**: rebuilt and recreated the real `controller` container there;
+its next real `adguard_sync` cycle pushed all 8 anti-DoH rules into the
+real running AdGuard Home instance's actual custom-rules list
+(confirmed via `/control/filtering/status`, unscoped -- no `$client=`
+-- exactly as designed). `dig`ging each one against the real AdGuard
+resolver on port 5353: `use-application-dns.net` returned real
+**NXDOMAIN** (AdGuard Home has its own built-in special case for this
+exact domain whenever any filtering is active at all -- this project's
+explicit rule is a documented, defense-in-depth backstop, not the only
+thing making it work); the 7 provider domains returned real **NOERROR
+answers of `0.0.0.0`**, matching this AdGuard instance's configured
+`blocking_mode: default` -- still an effective block, since 0.0.0.0
+isn't a connectable address for a DoH bootstrap request either way. A
+control domain (`example.com`) resolved normally throughout, confirming
+the fix doesn't collaterally block real traffic. Full suite re-run on
+the VM afterward: **748 passed, 0 skipped** on Linux.
+
 ---
 
 ## Cross-cutting: security-by-design

@@ -690,6 +690,14 @@ rewritten to compute its expected count via
 `adguard_sync.build_anti_doh_rules()` rather than a hardcoded number,
 so a future change to that list doesn't silently re-break them the
 same way. 718 passed, 30 skipped on Windows, zero regressions.
+**Live-verified against the real smoke-test VM AdGuard instance**
+(not just these unit tests): all 8 rules landed correctly, unscoped,
+in the real running instance's custom-rules list after a real
+`adguard_sync` cycle; `dig` against the real resolver confirmed
+`use-application-dns.net` -> NXDOMAIN and each provider domain ->
+`0.0.0.0`/NOERROR (this instance's configured `blocking_mode`), both
+effective blocks, while a control domain resolved normally throughout.
+Full suite re-run on the VM: **748 passed, 0 skipped** on Linux.
 
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see

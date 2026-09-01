@@ -1093,3 +1093,19 @@ machinery, a materially bigger design change than this pass; revisit
 if DoH bypass attempts are ever observed in practice (the Events page,
 Phase 11, would be a reasonable place to eventually surface a signal
 for this, though nothing does yet).
+
+**Live-verified against the real smoke-test VM's AdGuard Home
+instance**, not just unit-tested: rebuilt and recreated the real
+`controller` container there; its next real `adguard_sync` cycle
+pushed all 8 rules, unscoped, into the real instance's own custom-rules
+list (`/control/filtering/status`). `dig`ging each one against the
+real resolver: `use-application-dns.net` returned real **NXDOMAIN**
+(AdGuard Home has its own built-in special-case handling for this
+exact domain whenever any filtering is active at all -- this project's
+explicit rule is a documented, defense-in-depth backstop, not the sole
+reason it works); the 7 provider domains returned real **NOERROR
+answers of `0.0.0.0`**, matching this instance's configured
+`blocking_mode: default` -- still an effective block, since `0.0.0.0`
+isn't a connectable address for a DoH bootstrap request either way. An
+unrelated control domain resolved normally throughout, confirming no
+collateral blocking.
