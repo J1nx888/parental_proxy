@@ -3033,6 +3033,15 @@ invalid-MAC-row skipping, empty-file and no-file error paths, admin-auth
 required, imported rows are plain unassigned). 675 passed, 30 skipped
 (Windows), zero regressions.
 
+**Live-verified 2026-09-01** against the real smoke-test VM: a real CSV
+(`aa:bb:cc:dd:ee:f1,Living Room TV` / `aa:bb:cc:dd:ee:f2,Kids Tablet` /
+an invalid-MAC row / a duplicate of the first row) uploaded via a real
+`curl -F csv_file=@...` multipart request against the actual running
+dashboard came back "Imported 2 devices. 1 already known. 1 row had no
+valid MAC address." -- exactly matching the file's contents -- and both
+real rows landed in the real database as plain Unassigned devices, not
+duplicated, not overwritten. Cleaned up afterward.
+
 ---
 
 ## Cross-cutting: security-by-design
