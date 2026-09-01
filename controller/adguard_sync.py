@@ -132,6 +132,85 @@ def _domain_rule_unscoped(pattern: str, block_page_ip: str | None = None) -> str
     return rule
 
 
+# Domains a browser's own built-in "Secure DNS"/DNS-over-HTTPS toggle
+# would otherwise use to silently route around every bit of DNS-tier
+# enforcement in this project -- see `build_anti_doh_rules()`'s own
+# docstring below for why this needed closing, and
+# docs/security/overview.md section 10 for the full writeup. Not
+# admin-configurable and not stored in `domains`/`categories` on
+# purpose: this isn't a household content decision, it's closing a
+# hole in the mechanism those tables depend on to mean anything.
+_DOH_CANARY_DOMAINS = (
+    # Firefox (and some Chromium-based browsers) query this exact
+    # domain before auto-enabling DNS-over-HTTPS; a resolver that
+    # returns NXDOMAIN for it is Mozilla's own documented signal that
+    # the network doesn't want DoH auto-enabled, and they leave the
+    # system resolver in place instead -- not a guess, see
+    # https://support.mozilla.org/kb/canary-domain-use-application-dns-net.
+    "use-application-dns.net",
+)
+
+# The handful of public DoH resolvers real browsers/OSes ship as their
+# default or one-click "Secure DNS" options. Blocking these specific
+# hostnames makes the easy, one-toggle bypass (Settings > Secure DNS,
+# no dev tools or technical skill needed) fail closed instead of
+# silently working. Not an attempt at an exhaustive list of every DoH
+# provider that has ever existed -- Chrome specifically probes its own
+# small hardcoded provider list and falls back to the system resolver
+# if the probe fails, so blocking Chrome's own candidates is enough to
+# make its automatic upgrade fail closed the same way the canary domain
+# does for Firefox; a household member deliberately configuring an
+# obscure, unlisted DoH provider by hand is a meaningfully different
+# (and smaller) threat than "flip the setting Chrome/Firefox already
+# show by default."
+_DOH_PROVIDER_DOMAINS = (
+    "cloudflare-dns.com",
+    "mozilla.cloudflare-dns.com",
+    "dns.google",
+    "dns.quad9.net",
+    "doh.opendns.com",
+    "dns.nextdns.io",
+    "doh.cleanbrowsing.org",
+)
+
+
+def build_anti_doh_rules() -> list[str]:
+    """Unconditional, network-wide deny rules for the DoH canary/provider
+    domains above -- closes the most realistic real-world bypass of
+    DNS-tier enforcement found during the 2026-09-02 brute-force/
+    injection audit (prompted directly: "can an end user bypass checks,
+    e.g. via browser dev tools"). The literal dev-tools scenario doesn't
+    apply anywhere in this codebase (verified: no client-supplied
+    header/cookie/param feeds into any allow/deny decision -- see
+    docs/security/overview.md section 9's SQL-injection audit for the
+    same kind of sweep applied to this question), but investigating it
+    surfaced a much more practically real one: a kid doesn't need dev
+    tools OR any special skill to defeat this project's DNS-tier
+    enforcement as it existed before this function -- Firefox and
+    Chrome both ship a one-click "Secure DNS"/DNS-over-HTTPS toggle in
+    their own visible Settings UI, and neither AdGuard nor
+    `phase3/nftables-manager`'s baseline rules intercepted plain
+    port-443 traffic for a normal (`authenticated_v4`, non-bump)
+    device -- only port 53 is redirected for that class (see
+    `knftables_adapter.go`'s `baselineRules`) -- so a DoH query sailed
+    through completely unfiltered, and the browser then used whatever
+    real (unfiltered) IP it got back, also over port 443, also
+    untouched. This function does not fully close that class of gap
+    (a bump-eligible device's port 443 traffic already gets redirected
+    to Squid regardless of what IP a DoH query returns, and terminates
+    there against an unconfigured domain; a NON-bump device still has
+    no equivalent SNI-layer backstop) -- see docs/security/overview.md
+    section 10 for the accepted residual gap and why closing it fully
+    would mean giving DNS-tier-only devices some of Squid's own
+    SNI-inspection machinery, a bigger design change than this pass.
+
+    No `conn` parameter needed -- unlike every other rule builder in
+    this module, this one reads no per-household state at all; it is
+    the same fixed list for every deployment, every cycle, forever
+    (until the lists above are edited by hand)."""
+    return [_domain_rule_unscoped(d) for d in _DOH_CANARY_DOMAINS + _DOH_PROVIDER_DOMAINS]
+
+
 def _build_domain_deny_rules(
     conn: sqlite3.Connection, mode: str, *, require_bump_eligible: bool, block_page_ip: str | None = None,
 ) -> list[str]:
@@ -551,15 +630,19 @@ def sync_once(
     conn: sqlite3.Connection, base_url: str, username: str, password: str, block_page_ip: str | None = None
 ) -> int:
     """One full sync cycle. Returns the number of managed CUSTOM rules
-    pushed (0 is a normal, healthy state -- see build_rules' own
-    docstring) -- does not count native filter-subscription toggles from
+    pushed -- does not count native filter-subscription toggles from
     `sync_category_subscriptions()` or the SafeSearch master toggle from
     `sync_safesearch()`, separate mechanisms (Phase 8/G3) each with
-    their own success/failure shape."""
+    their own success/failure shape. Never 0 as of 2026-09-02:
+    `build_anti_doh_rules()`'s fixed baseline is always included, so the
+    minimum healthy count is `len(build_anti_doh_rules())`, not 0 --
+    see that function's own docstring before assuming an empty managed
+    block still means "nothing to deny.\""""
     managed = (
         build_rules(conn, block_page_ip)
         + build_splice_deny_rules(conn, block_page_ip)
         + build_category_deny_rules(conn, block_page_ip=block_page_ip)
+        + build_anti_doh_rules()
     )
     current = adguard_client.get_custom_rules(base_url, username, password)
     preserved = _strip_managed_block(current)

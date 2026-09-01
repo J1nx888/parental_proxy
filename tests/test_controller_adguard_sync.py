@@ -323,10 +323,14 @@ def test_sync_once_pushes_both_bump_and_splice_rule_sets(conn, monkeypatch):
 
     count = adguard_sync.sync_once(conn, "http://127.0.0.1:3000", "admin", "x")
 
-    assert count == 2  # one bump hard-deny + one splice deny, same device denied both ways
+    # one bump hard-deny + one splice deny (same device denied both ways)
+    # + the always-on anti-DoH baseline (build_anti_doh_rules(), added
+    # 2026-09-02 -- see that function's own docstring).
+    assert count == 2 + len(adguard_sync.build_anti_doh_rules())
     managed = pushed["rules"][1:-1]  # strip the begin/end markers
     assert any("crunchyroll" in r for r in managed)
     assert any("example" in r for r in managed)
+    assert any("use-application-dns" in r for r in managed)
 
 
 # ============================================================
@@ -385,7 +389,8 @@ def test_sync_once_preserves_admin_rules_and_replaces_the_managed_block(conn, mo
 
     count = adguard_sync.sync_once(conn, "http://127.0.0.1:3000", "admin", "x")
 
-    assert count == 1
+    # 1 bump hard-deny + the always-on anti-DoH baseline (2026-09-02).
+    assert count == 1 + len(adguard_sync.build_anti_doh_rules())
     assert pushed["rules"][0] == "! an admin's own rule"
     assert pushed["rules"][1] == adguard_sync._MARKER_BEGIN
     assert "192.168.1.10" in pushed["rules"][2]
@@ -393,9 +398,14 @@ def test_sync_once_preserves_admin_rules_and_replaces_the_managed_block(conn, mo
 
 
 def test_sync_once_with_nothing_to_deny_still_clears_a_stale_managed_block(conn, monkeypatch):
-    """No bump domains configured (or no non-bump device known yet) --
-    build_rules() returns []. A previous cycle's now-stale managed block
-    must still be cleared, not left in place forever."""
+    """No bump/splice/category domains configured (or no non-bump device
+    known yet) -- build_rules()/build_splice_deny_rules()/
+    build_category_deny_rules() all return []. A previous cycle's now-
+    stale managed block must still be cleared, not left in place
+    forever. build_anti_doh_rules() is unconditional (2026-09-02), so
+    the managed block itself is never fully empty anymore -- this test
+    now checks that ONLY the anti-DoH baseline survives, not that
+    nothing does."""
     existing = ["! kept", adguard_sync._MARKER_BEGIN, "/stale/$client=1.2.3.4", adguard_sync._MARKER_END]
     monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: list(existing))
     monkeypatch.setattr(adguard_sync.adguard_client, "get_safesearch_status", lambda *a, **k: {"enabled": False})
@@ -408,8 +418,9 @@ def test_sync_once_with_nothing_to_deny_still_clears_a_stale_managed_block(conn,
 
     count = adguard_sync.sync_once(conn, "http://127.0.0.1:3000", "admin", "x")
 
-    assert count == 0
-    assert pushed["rules"] == ["! kept"]
+    anti_doh = adguard_sync.build_anti_doh_rules()
+    assert count == len(anti_doh)
+    assert pushed["rules"] == ["! kept", adguard_sync._MARKER_BEGIN, *anti_doh, adguard_sync._MARKER_END]
 
 
 # ============================================================
@@ -582,6 +593,65 @@ def test_build_category_deny_rules_no_applicable_devices_contributes_nothing(con
     _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:10", "192.168.1.20")
 
     assert adguard_sync.build_category_deny_rules(conn) == []
+
+
+# ============================================================
+# build_anti_doh_rules -- 2026-09-02, closing the DNS-over-HTTPS
+# bypass found during the brute-force/injection audit
+# ============================================================
+
+def test_build_anti_doh_rules_is_never_empty():
+    # Unlike every other builder in this module, there's no DB state
+    # that could ever make this return nothing -- it's a fixed,
+    # unconditional baseline.
+    assert adguard_sync.build_anti_doh_rules() != []
+
+
+def test_build_anti_doh_rules_covers_the_firefox_canary_domain():
+    rules = adguard_sync.build_anti_doh_rules()
+    assert any("use-application-dns.net" in r for r in rules)
+
+
+def test_build_anti_doh_rules_covers_known_public_doh_providers():
+    rules = adguard_sync.build_anti_doh_rules()
+    joined = " ".join(rules)
+    for provider in ("cloudflare-dns.com", "dns.google", "dns.quad9.net"):
+        assert provider in joined
+
+
+def test_build_anti_doh_rules_produces_unscoped_rules_not_client_scoped():
+    # Deliberately not device-scoped -- see the function's own docstring
+    # for why this isn't a per-device or per-household decision. A
+    # $client= modifier would mean this file's helper functions somehow
+    # decided who it applies to; it must apply to everyone.
+    for rule in adguard_sync.build_anti_doh_rules():
+        assert "$client=" not in rule
+
+
+def test_build_anti_doh_rules_needs_no_db_connection():
+    # No `conn` parameter at all -- confirms this reads no per-household
+    # state (see the function's own docstring's last paragraph).
+    import inspect
+    assert list(inspect.signature(adguard_sync.build_anti_doh_rules).parameters) == []
+
+
+def test_sync_once_always_includes_the_anti_doh_baseline_even_with_nothing_else_configured(conn, monkeypatch):
+    """No domains, no categories, no devices at all -- every OTHER
+    builder in sync_once() returns [], but the anti-DoH baseline must
+    still be pushed."""
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: [])
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_safesearch_status", lambda *a, **k: {"enabled": False})
+    pushed = {}
+    monkeypatch.setattr(
+        adguard_sync.adguard_client, "set_custom_rules",
+        lambda base_url, u, p, rules: pushed.setdefault("rules", rules),
+    )
+
+    count = adguard_sync.sync_once(conn, "http://127.0.0.1:3000", "admin", "x")
+
+    anti_doh = adguard_sync.build_anti_doh_rules()
+    assert count == len(anti_doh)
+    assert pushed["rules"][1:-1] == anti_doh
 
 
 # ============================================================

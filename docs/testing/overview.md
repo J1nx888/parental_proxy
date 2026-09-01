@@ -664,8 +664,32 @@ limiter were removed (that logic lives in `test_rate_limit.py` now) and
 replaced with 3 new ones confirming the module's real HTTP handlers
 write the same kind of `system_events` row for a failed kid login and a
 failed admin action. 712 passed, 30 skipped on Windows (up from 692/30
-before this pass), zero regressions -- not yet re-run on the smoke-test
-VM's Linux checkout.
+before this pass), zero regressions. **Confirmed same day on the
+smoke-test VM's Linux checkout: 742 passed, 0 skipped.**
+
+**Same day, follow-up -- client-side tamper resistance / DNS-over-HTTPS
+bypass**: project owner asked whether an end user could bypass a block
+via browser dev tools; investigating it surfaced a real, unrelated
+bypass (a browser's own "Secure DNS" Settings toggle defeating all
+DNS-tier enforcement for non-bump devices) rather than the literal
+dev-tools scenario, which doesn't apply anywhere in this codebase --
+full writeup in `docs/security/overview.md` section 10. Fixed with
+`controller/adguard_sync.py`'s new `build_anti_doh_rules()`. 6 new
+tests in `tests/test_controller_adguard_sync.py`: the function is
+never empty and needs no `conn` parameter at all (it reads no
+per-household state); covers the Firefox canary domain and known
+public DoH providers; produces unscoped (not `$client=`-scoped) rules,
+since this isn't a per-device decision; and `sync_once()` includes the
+baseline even with literally nothing else configured. **2 pre-existing
+`sync_once()` tests needed real fixes, not just number bumps**: both
+had asserted an exact managed-rule count/content that assumed the
+managed block could be entirely empty or contain only what
+`build_rules()`/`build_splice_deny_rules()` compute -- neither is true
+anymore now that the anti-DoH baseline is unconditional, so each was
+rewritten to compute its expected count via
+`adguard_sync.build_anti_doh_rules()` rather than a hardcoded number,
+so a future change to that list doesn't silently re-break them the
+same way. 718 passed, 30 skipped on Windows, zero regressions.
 
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see

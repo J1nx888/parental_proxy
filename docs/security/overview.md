@@ -1007,3 +1007,89 @@ derived from request data, even partially.
 `common/db.py`'s `init_db()`/`SCHEMA` uses `executescript()` against a
 module-level constant string (the DDL) — no interpolation, not
 attacker-reachable at all.
+
+## 10. Client-side tamper resistance (2026-09-02)
+
+The project owner asked directly: can an end user (realistically, a
+kid) bypass a block by using their browser's developer tools — e.g.
+tracing a request to a blocked site and flipping some variable that
+grants access?
+
+**Verified: no, that specific mechanism doesn't exist anywhere in this
+codebase.** Every block page was read end to end
+(`dashboard/block_page_server.py`'s `_BlockPageHandler`,
+`dashboard/dashboard.py`'s `BLOCKED_BODY`/`blocked()`,
+`dashboard/captive_portal_server.py`'s login page) — each is static
+HTML with no client-side JavaScript that decides whether to grant
+access; the closest thing to interactive logic is a plain HTML
+`<form method="post">` for "Request approval"/login, both fully
+re-verified server-side on submit. `proxy/sni_helper.py` and
+`proxy/authz_helper.py` (§4 above) were also checked specifically for
+this: neither reads any client-supplied HTTP header, cookie, or query
+parameter into an allow/deny decision — every input is either Squid's
+own protocol-line fields (`%>a` source IP, `%ssl::>sni`, `%DST`,
+`%PATH`, all facts about the actual TCP/TLS connection itself, not
+something a page's JS can rewrite after the fact) or a DB-resident
+value the dashboard alone can change. There is no gate to defeat with
+a dev-tools variable because the browser is never given a page whose
+own client-side logic decides "allowed" or "blocked" in the first
+place — the connection either reaches the real destination or it
+doesn't, decided entirely by infrastructure the browser has zero
+visibility into (DNS answer, TLS termination, packet routing), before
+any content exists for dev tools to inspect or alter.
+
+**A materially more realistic bypass was found while investigating
+this, and has been closed**: **DNS-over-HTTPS (DoH)**. Firefox and
+Chrome both ship a one-click "Secure DNS"/"DNS over HTTPS" toggle in
+their own visible Settings UI — no dev tools, no technical skill,
+just a documented setting. Before this pass, turning it on completely
+defeated every bit of this project's DNS-tier enforcement (domain
+blocking, categories, schedules, SafeSearch, ad-blocking) for any
+normal, non-bump device: `phase3/nftables-manager`'s baseline rules
+(`knftables_adapter.go`) only redirect port 53 for an
+`authenticated_v4` device — port 443 (which DoH itself runs over, and
+which the browser then also uses to reach whatever real IP the DoH
+query returned) was completely untouched for that device class, so a
+DoH-resolved query and its followup connection both sailed through
+the interception layer entirely unfiltered.
+
+**Fixed**: `controller/adguard_sync.py`'s new `build_anti_doh_rules()`
+adds an unconditional, network-wide (not per-device, not admin-
+configurable, not stored in `domains`/`categories`) deny for:
+- `use-application-dns.net` — the exact domain Firefox (and some
+  Chromium builds) query before auto-enabling DoH; a network that
+  returns NXDOMAIN for it is Mozilla's own documented signal to leave
+  the system resolver in place instead
+  ([Mozilla's own KB article](https://support.mozilla.org/kb/canary-domain-use-application-dns-net)).
+- The handful of public DoH resolvers real browsers/OSes ship as
+  their default or one-click options (`cloudflare-dns.com`,
+  `mozilla.cloudflare-dns.com`, `dns.google`, `dns.quad9.net`,
+  `doh.opendns.com`, `dns.nextdns.io`, `doh.cleanbrowsing.org`) —
+  closes Chrome's own auto-upgrade path too, since Chrome probes its
+  own small hardcoded provider list and falls back to the system
+  resolver if the probe fails.
+
+Deliberately not admin-configurable and not part of the
+`domains`/`categories` tables: this isn't a household content
+decision an admin should be able to accidentally turn off, it's
+closing a hole in the mechanism those very tables depend on to mean
+anything. A household member who genuinely wants their own device
+fully outside this system already has the existing escape hatch —
+mark it `ignored` (BYPASS) — so no second one was needed here.
+
+**Accepted residual gap, not fully closed by this pass**: this list
+cannot be exhaustive (a household member could manually configure an
+obscure, unlisted DoH provider — a meaningfully smaller threat than
+"flip the setting the browser already shows by default," but not
+zero), and it only protects `authenticated_v4` (non-bump) devices at
+the DNS tier. A **bump-eligible** device's port 443 traffic already
+gets redirected to Squid regardless of what IP a DoH query returns
+(`bump_v4`'s baseline rules redirect port 443 unconditionally), and
+terminates there against an unconfigured domain (§3's hard-deny
+invariant) — so bump devices were never exposed to this gap the same
+way. Fully closing it for non-bump devices would mean giving
+DNS-tier-only devices some form of Squid's own SNI-inspection
+machinery, a materially bigger design change than this pass; revisit
+if DoH bypass attempts are ever observed in practice (the Events page,
+Phase 11, would be a reasonable place to eventually surface a signal
+for this, though nothing does yet).

@@ -3281,12 +3281,49 @@ last-resort handler. Fixed by adding the call to `dashboard.py`'s
 logic, plus new coverage in `tests/test_dashboard.py` and
 `tests/test_captive_portal_server.py` for the integration behavior and
 the new `system_events` rows) -- 712 passed / 30 skipped on Windows
-(up from 692/30 before this pass), zero regressions. Not yet re-run on
-the smoke-test VM's Linux checkout -- do that before treating this as
-fully confirmed the way this project's other passes are. Full detail in `docs/security/overview.md` sections 6
-and 9 (both updated), `docs/dashboard/routes.md`'s admin-auth and
-Events sections, and `docs/architecture/overview.md`'s file tree and
-non-obvious-decisions list.
+(up from 692/30 before this pass), zero regressions. Full detail in
+`docs/security/overview.md` sections 6 and 9 (both updated),
+`docs/dashboard/routes.md`'s admin-auth and Events sections, and
+`docs/architecture/overview.md`'s file tree and non-obvious-decisions
+list. **Confirmed on the smoke-test VM's Linux checkout same day: 742
+passed, 0 skipped** (old `fix/cross-tier-domain-enforcement` branch
+also deleted there, matching local).
+
+**Same-day follow-up: client-side tamper resistance.** Project owner
+asked directly whether an end user could bypass a block via browser
+dev tools (e.g. tracing a request and flipping a variable). Verified
+no such mechanism exists anywhere in this codebase -- every block
+page is static HTML with no client-side access decision to tamper
+with, and neither `sni_helper.py` nor `authz_helper.py` reads any
+client-supplied header/cookie/param into an allow/deny decision (full
+writeup in `docs/security/overview.md` section 10, new). Investigating
+it surfaced a materially more realistic bypass that WAS real and has
+now been closed: **DNS-over-HTTPS**. Firefox/Chrome's own one-click
+"Secure DNS" Settings toggle completely defeated DNS-tier enforcement
+for any normal (non-bump) device before this fix -- `nftables`'
+baseline rules only ever redirected port 53 for an `authenticated_v4`
+device, leaving port 443 (what DoH itself runs over, and what the
+browser then uses for the real connection too) completely untouched
+for that device class. Fixed with `controller/adguard_sync.py`'s new
+`build_anti_doh_rules()`: an unconditional, non-admin-configurable
+deny for Firefox's own documented DoH-auto-enable canary domain
+(`use-application-dns.net`) plus the handful of public DoH resolvers
+real browsers ship as default/one-click options. Deliberately NOT
+stored in `domains`/`categories` -- this isn't a content decision, it's
+closing a hole in the mechanism those tables depend on to mean
+anything; a household member who wants their own device fully outside
+this system already has the existing `ignored` (BYPASS) escape hatch.
+Accepted residual gap: an obscure, hand-configured DoH provider isn't
+covered, and bump-eligible devices were never exposed to this gap in
+the first place (their port 443 traffic already gets redirected to
+Squid regardless of what a DoH query resolves, terminating there
+against an unconfigured domain) -- fully closing the non-bump case
+would mean giving DNS-tier-only devices some of Squid's own
+SNI-inspection machinery, a bigger design change left for later. 6 new
+tests in `tests/test_controller_adguard_sync.py`; 2 pre-existing
+`sync_once()` tests needed their expected rule counts updated (the
+managed block is never fully empty anymore -- the anti-DoH baseline is
+always present). 718 passed, 30 skipped on Windows, zero regressions.
 
 ---
 

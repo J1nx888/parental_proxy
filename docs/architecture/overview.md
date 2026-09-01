@@ -228,6 +228,14 @@ take effect everywhere.
   `domains` row at all (default-allow, unchanged) -- see
   `_build_domain_deny_rules()`'s own docstring and RoadMap.md's dated
   entry.
+  - `build_anti_doh_rules()` (added 2026-09-02, no `conn` parameter --
+    it reads no per-household state at all): an unconditional,
+    non-admin-configurable deny for Firefox's DoH-auto-enable canary
+    domain plus known public DoH resolvers, always included in
+    `sync_once()`'s managed block regardless of what's configured --
+    see `docs/security/overview.md` section 10 for why this needed to
+    exist (a browser's own "Secure DNS" Settings toggle otherwise fully
+    defeated DNS-tier enforcement for any non-bump device).
   Also provides network-wide ad/
   tracker blocking for every device: its own default filter is enabled
   automatically on first configure, plus (2026-08-30) a curated set of
