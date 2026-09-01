@@ -3065,6 +3065,13 @@ left as a silent surprise for a future reader. 2 new tests (the
 capped-preview behavior, and the malformed-first-row edge case) --
 677 passed, 30 skipped (Windows), zero regressions.
 
+**Live-verified 2026-09-01** against the real smoke-test VM: imported the
+same 2-device CSV twice via real `curl -F` uploads against the running
+dashboard. First import: `"Imported 2 devices."` Re-importing the
+identical file: `"Imported 0 devices. Already known (aa:bb:cc:dd:ee:e1,
+aa:bb:cc:dd:ee:e2)."` -- both real MACs named, exactly as designed.
+Cleaned up afterward.
+
 ## Cross-cutting: security-by-design
 
 Security is designed in from the start on every phase above, not
