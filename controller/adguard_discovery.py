@@ -53,6 +53,7 @@ def run_loop(
     username: str,
     password: str,
     on_error=None,
+    on_success=None,
 ) -> PeriodicTask:
     """Starts `correlate_once()` running on a fixed interval, on its own
     background thread, until the returned `PeriodicTask.stop()` is
@@ -78,6 +79,6 @@ def run_loop(
             state["conn"] = conn
         correlate_once(conn, base_url, username, password)
 
-    pt = PeriodicTask(interval, task, on_error=on_error, thread_name="adguard-discovery")
+    pt = PeriodicTask(interval, task, on_error=on_error, on_success=on_success, thread_name="adguard-discovery")
     pt.start()
     return pt

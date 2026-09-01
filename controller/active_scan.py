@@ -131,6 +131,7 @@ def run_loop(
     stale_after_seconds: float,
     limit: int,
     on_error=None,
+    on_success=None,
 ) -> PeriodicTask:
     """Starts `scan_once()` running on a fixed interval, on its own
     background thread, until the returned `PeriodicTask.stop()` is
@@ -157,6 +158,6 @@ def run_loop(
             state["conn"] = conn
         scan_once(conn, stale_after_seconds, limit)
 
-    pt = PeriodicTask(interval, task, on_error=on_error, thread_name="active-scan")
+    pt = PeriodicTask(interval, task, on_error=on_error, on_success=on_success, thread_name="active-scan")
     pt.start()
     return pt

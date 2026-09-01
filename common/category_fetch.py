@@ -133,7 +133,7 @@ def sync_all_categories(conn: sqlite3.Connection, timeout: float = DEFAULT_TIMEO
     return results
 
 
-def run_loop(interval: float, on_error=None):
+def run_loop(interval: float, on_error=None, on_success=None):
     """Starts sync_all_categories() running on a fixed interval, on its
     own background thread -- same PeriodicTask shape as
     controller/adguard_sync.py's run_loop() and controller/discovery.py's,
@@ -152,6 +152,6 @@ def run_loop(interval: float, on_error=None):
             state["conn"] = conn
         sync_all_categories(conn)
 
-    periodic = PeriodicTask(interval, task, on_error=on_error, thread_name="category-fetch")
+    periodic = PeriodicTask(interval, task, on_error=on_error, on_success=on_success, thread_name="category-fetch")
     periodic.start()
     return periodic

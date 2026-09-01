@@ -1634,6 +1634,70 @@ def test_settings_page_shows_bulk_import_card(client):
     assert b"Bulk import devices" in resp.data
 
 
+# ============================================================
+# Events page (2026-09-01, added ahead of G1 real-network testing)
+# ============================================================
+
+def test_events_page_shows_empty_state_with_no_events(client):
+    resp = client.get("/events", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"No events recorded yet" in resp.data
+
+
+def test_events_page_lists_a_real_event(client, db_conn):
+    import system_events
+
+    system_events.log_event(db_conn, "adguard_sync", "error", "adguard sync failed: boom")
+    resp = client.get("/events", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"adguard_sync" in resp.data
+    assert b"adguard sync failed: boom" in resp.data
+    assert b"error" in resp.data
+
+
+def test_events_page_shows_recovery_severity_distinctly(client, db_conn):
+    import system_events
+
+    system_events.log_event(db_conn, "category_fetch", "recovery", "category_fetch recovered")
+    resp = client.get("/events", headers=_auth_header())
+    assert b"recovery" in resp.data
+
+
+def test_events_page_orders_newest_first(client, db_conn):
+    import system_events
+
+    system_events.log_event(db_conn, "adguard_sync", "error", "first failure")
+    system_events.log_event(db_conn, "adguard_sync", "error", "second failure")
+    resp = client.get("/events", headers=_auth_header())
+    body = resp.data.decode()
+    assert body.index("second failure") < body.index("first failure")
+
+
+def test_events_page_requires_admin_auth(client, db_conn):
+    resp = client.get("/events")
+    assert resp.status_code == 401
+
+
+def test_events_page_caps_display_at_the_limit(client, db_conn):
+    import dashboard as dashboard_mod
+    import system_events
+
+    total = dashboard_mod.EVENT_DISPLAY_LIMIT + 5
+    for i in range(total):
+        system_events.log_event(db_conn, "adguard_sync", "error", f"failure {i}")
+
+    resp = client.get("/events", headers=_auth_header())
+    body = resp.data.decode()
+    # Nothing is deleted -- all rows still exist in the table itself.
+    assert db_conn.execute("SELECT COUNT(*) c FROM system_events").fetchone()["c"] == total
+    # The page shows only the newest EVENT_DISPLAY_LIMIT -- the oldest 5
+    # ("failure 0".."failure 4") must be excluded from what's displayed.
+    for i in range(5):
+        assert f"failure {i}<" not in body, f"failure {i} should have been cut off, it's older than the cap"
+    assert f"failure {total - 1}" in body
+    assert f"Showing the most recent {dashboard_mod.EVENT_DISPLAY_LIMIT} events" in body
+
+
 def test_update_device_sets_flags_and_assigns_to_a_kid(client, db_conn):
     client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
     user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]

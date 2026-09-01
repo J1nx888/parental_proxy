@@ -578,6 +578,7 @@ def run_loop(
     password: str,
     block_page_ip: str | None = None,
     on_error=None,
+    on_success=None,
 ) -> PeriodicTask:
     """Starts `sync_once()` running on a fixed interval, on its own
     background thread, until the returned `PeriodicTask.stop()` is
@@ -606,6 +607,6 @@ def run_loop(
             state["conn"] = conn
         sync_once(conn, base_url, username, password, block_page_ip)
 
-    pt = PeriodicTask(interval, task, on_error=on_error, thread_name="adguard-sync")
+    pt = PeriodicTask(interval, task, on_error=on_error, on_success=on_success, thread_name="adguard-sync")
     pt.start()
     return pt

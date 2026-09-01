@@ -601,6 +601,31 @@ accidentally exercising that same ambiguous first-row case rather than
 the ordinary mid-batch one it was meant to test. 677 passed, 30 skipped
 (Windows), zero regressions.
 
+**2026-09-01, Events page (Phase 11)**: project owner asked whether the
+admin portal has any way to see a problem before diving into G1's
+real-network testing -- investigated the actual current state (Health's
+single non-historical `fail_open_reason`, `network_events` with zero UI,
+everything else stdout-only) rather than assuming, then built
+`system_events`/the `/events` page. 16 new tests. `tests/test_system_events.py`:
+`log_event()`'s shape and severity validation; `failure_recovery_callbacks()`
+logs every failure occurrence (not just the first, so consecutive
+timestamps show duration), logs a `recovery` row only on the actual
+failure->success transition (an ordinary success with no prior failure
+logs nothing at all -- the core "not a firehose" behavior), and two
+different sources' tracked state stays independent.
+`tests/test_controller_periodic.py`: `on_success` fires on every
+non-raising cycle, never fires for a raising one, and a dedicated
+regression test alternates failure/success and asserts every event
+before the transition is `error` and every one after is `success` --
+catching the exact class of bug (on_success firing for a failed cycle,
+or vice versa) that would silently corrupt the recovery-tracking logic
+this feature depends on. `tests/test_dashboard.py`: empty state, a real
+event listed, `recovery` severity rendered distinctly from `error`,
+newest-first ordering, admin auth required (matches every other page),
+and the display cap (`EVENT_DISPLAY_LIMIT`) hides older rows from the
+page without deleting them from the table. 692 passed, 30 skipped
+(Windows), zero regressions.
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in

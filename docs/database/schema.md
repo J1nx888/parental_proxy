@@ -456,6 +456,35 @@ This is the "outbox events" RoadMap.md's Milestone 4 refers to. Written by
 
 Indexed on `observed_at DESC` and on `device_id`.
 
+### `system_events`
+Added 2026-09-01 (Phase 11), ahead of G1 real-network testing. A
+DIFFERENT kind of event log from `network_events` above -- this one is
+operational (did a background sync/discovery loop fail or recover), not
+identity-layer (did a device's MAC/IP binding change). Deliberately not
+a firehose: only real failures (one row per occurrence) and the specific
+failure→success "recovery" transition are recorded, never a routine
+successful cycle -- see `common/system_events.py`'s own docstring.
+Written by `controller/main.py`'s `on_error`/`on_success` wiring around
+its periodic loops (AdGuard sync, category subscription fetch, active
+ARP scan, device discovery, the controller↔worker heartbeat); read by
+`dashboard/dashboard.py`'s `/events` page (`docs/dashboard/routes.md`) --
+the dashboard never writes to this table itself.
+
+| Column     | Type    | Constraints |
+|---|---|---|
+| `id`       | INTEGER | PRIMARY KEY |
+| `ts`       | TEXT    | NOT NULL |
+| `source`   | TEXT    | NOT NULL -- which loop/component, e.g. `adguard_sync`, `category_fetch`, `controller_heartbeat` |
+| `severity` | TEXT    | NOT NULL, CHECK IN (`error`, `recovery`) |
+| `message`  | TEXT    | NOT NULL |
+| `detail`   | TEXT    | nullable -- optional longer context, unused by any call site as of this writing |
+
+Indexed on `ts DESC`. Nothing prunes this table automatically -- the
+dashboard's `EVENT_DISPLAY_LIMIT` only bounds what's shown, not what's
+stored; add real pruning (mirroring the existing "Remove outdated
+devices" Settings pattern) if its growth ever actually proves to be a
+problem in practice, not before.
+
 ## Phase 8 tables (categories, schedules)
 
 **Opposite polarity from every table above**: `domains`/`user_domains`/

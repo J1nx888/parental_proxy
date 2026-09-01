@@ -106,7 +106,7 @@ def snapshot_once(conn: sqlite3.Connection) -> int:
     return len(entries)
 
 
-def run_loop(interval: float, on_error=None) -> PeriodicTask:
+def run_loop(interval: float, on_error=None, on_success=None) -> PeriodicTask:
     """Starts `snapshot_once()` running on a fixed interval, on its own
     background thread, until the returned `PeriodicTask.stop()` is
     called. Mirrors `controller/lease.py`'s `HeartbeatPacer` usage in
@@ -149,6 +149,6 @@ def run_loop(interval: float, on_error=None) -> PeriodicTask:
             state["conn"] = conn
         snapshot_once(conn)
 
-    pt = PeriodicTask(interval, task, on_error=on_error, thread_name="discovery-snapshot")
+    pt = PeriodicTask(interval, task, on_error=on_error, on_success=on_success, thread_name="discovery-snapshot")
     pt.start()
     return pt

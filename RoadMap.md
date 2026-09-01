@@ -3072,6 +3072,85 @@ identical file: `"Imported 0 devices. Already known (aa:bb:cc:dd:ee:e1,
 aa:bb:cc:dd:ee:e2)."` -- both real MACs named, exactly as designed.
 Cleaned up afterward.
 
+---
+
+## Phase 11 — Operational event log ("Events" page, built 2026-09-01)
+
+The project owner asked, ahead of G1's real-network testing, whether the
+admin portal has any way to see a problem (or hand me something concrete
+to diagnose one) without SSH/Docker CLI access. Investigated the actual
+current state rather than assuming: the Health page shows two coarse
+running/stale/fail_open badges plus a *single current* `fail_open_reason`
+string that gets overwritten every cycle (no history); `network_events`
+(MAC/IP identity conflicts) has zero dashboard UI at all; every other
+failure (AdGuard unreachable, category-fetch errors, controller↔worker
+reconnects, discovery hiccups) only ever reached Python's own `logging`
+-- container stdout, invisible from the dashboard, needing
+`docker compose logs <service>` and SSH access to see at all. Answer to
+the actual question: no, not really -- confirmed and fixed rather than
+guessed at.
+
+**Scope decided with the project owner**: key failures/recoveries only
+(not a firehose logging every routine successful cycle), on a new
+dedicated "Events" page (not folded into Health).
+
+**Shipped**:
+- `common/db.py`: new `system_events` table (`ts`, `source`, `severity`
+  CHECK'd to `error`/`recovery`, `message`, optional `detail`),
+  indexed on `ts DESC`. No migration needed (brand-new table, same
+  `CREATE TABLE IF NOT EXISTS` idiom as every other Phase 8+ table).
+- `common/system_events.py` (new): `log_event()` persists one row;
+  `failure_recovery_callbacks(source)` returns an `(on_error,
+  on_success)` pair that logs every failure occurrence (so consecutive
+  timestamps show how long something's been broken) but a `recovery`
+  row only on the specific failure->success transition, tracked via an
+  in-process closure flag -- deliberately NOT persisted across a
+  restart, so a fresh process starting up and immediately succeeding
+  is correctly never treated as a notable "recovery."
+- `controller/periodic.py`: `PeriodicTask` gained an `on_success`
+  callback (fires after every non-raising cycle) alongside its existing
+  `on_error` -- the one new primitive every periodic loop needed to make
+  recovery detection possible at all.
+- Threaded `on_success` through the 5 `run_loop()` wrappers that use
+  `PeriodicTask`: `discovery.py`, `adguard_sync.py`,
+  `adguard_discovery.py`, `active_scan.py`, `common/category_fetch.py`.
+  `controller/main.py` wires each of their `on_error`/`on_success` pairs
+  through a small `_events(source, log_message)` helper that keeps the
+  existing `log.warning(...)` reporting AND adds the new
+  `system_events` row -- one mechanism layered alongside the other, not
+  replacing it.
+- **Two loops deliberately do NOT get recovery tracking**, both
+  documented in the code rather than silently inconsistent:
+  `rtnetlink_listener.py` is a continuous event listener with no
+  discrete per-cycle "did this succeed" concept to hook a transition
+  onto (failures are still logged, one row per occurrence); the
+  controller↔worker heartbeat already surfaces its own recovery via the
+  Health page's own fail_open state transition and its reconnect logic
+  already lives in `run_cycle()`'s `_reconnect()` path, not a
+  `PeriodicTask` hook -- its failures still get a `system_events` row
+  each occurrence, just no separate recovery row.
+- `dashboard/dashboard.py`: new `/events` route + sidebar nav entry,
+  `EVENTS_BODY` listing the most recent 200 events (`EVENT_DISPLAY_LIMIT`),
+  newest first, with a severity badge (reusing the Report page's
+  allowed/blocked palette) and the existing client-side search-filter
+  widget. Nothing is ever deleted from `system_events` -- the display
+  cap only limits what's SHOWN, a future pass could add real pruning if
+  the table's growth ever actually proves to be a problem in practice,
+  not before.
+
+16 new tests (`tests/test_system_events.py`: `log_event()`'s shape and
+validation, `failure_recovery_callbacks()`'s every-failure-logged and
+recovery-only-after-a-failure behavior, independence between two
+different sources' tracked state; `tests/test_controller_periodic.py`:
+`on_success` fires on every non-raising cycle, never fires for a raising
+one, and a real regression test for the failure→success transition never
+misattributing an event to the wrong severity; `tests/test_dashboard.py`:
+empty state, a real event listed, recovery severity shown distinctly,
+newest-first ordering, admin auth required, the display cap). 692
+passed, 30 skipped (Windows), zero regressions.
+
+---
+
 ## Cross-cutting: security-by-design
 
 Security is designed in from the start on every phase above, not

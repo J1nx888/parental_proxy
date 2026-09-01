@@ -813,3 +813,31 @@ playback goes through `www.crunchyroll.com/playback`, already covered.
   schedule's `lockout_all` overlay both express through this exact same
   mechanism, so resuming a device always just means "un-pause it,"
   regardless of how many different things might have paused it.
+- **`system_events`'s failure/recovery-transition tracking lives in an
+  in-process closure, deliberately not persisted state.**
+  `common/system_events.py`'s `failure_recovery_callbacks()` tracks
+  whether a given loop is "currently failing" in a plain dict captured
+  by its returned closures, not a DB column -- so a container restart
+  implicitly and correctly resets that tracking. A process that starts
+  up and immediately succeeds is NOT a "recovery" worth a row (there was
+  no observed failure THIS process ever knew about), even if the
+  previous process instance had been failing right up until it was
+  restarted. This trades slightly-incomplete recovery visibility across
+  a restart boundary for real simplicity -- no new persisted state
+  needing its own migration/cleanup story, and every existing periodic
+  loop in this codebase already opens its own connection freshly per
+  cycle (see `discovery.run_loop()`'s own docstring on why), so
+  "just track it in memory, in the same process" is the same shape this
+  codebase already uses everywhere else.
+- **Two loops deliberately don't get `system_events` recovery
+  tracking, and it's not an oversight.** `rtnetlink_listener.py` is a
+  continuous event listener, not a fixed-interval sync -- there's no
+  discrete per-cycle "did this succeed" moment to hook a transition onto
+  the way `PeriodicTask`'s new `on_success` callback assumes; its
+  failures still get an `error` row each occurrence, there's just no
+  matching `recovery` row. The controller↔worker heartbeat's OWN
+  recovery already surfaces through the Health page's `fail_open` state
+  transition, and its actual reconnect logic lives in `run_cycle()`'s
+  `_reconnect()` path, not a `PeriodicTask` hook at all -- adding a
+  second, redundant recovery-tracking mechanism there would just be two
+  sources of truth for the same fact.

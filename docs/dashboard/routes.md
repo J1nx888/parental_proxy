@@ -612,6 +612,35 @@ shape, not an error).
   by the same `_is_stale()` logic. A missing row (interception profile
   not running) never lights this badge.
 
+### Events (`/events`)
+
+Added 2026-09-01, ahead of G1 real-network testing (project owner asked
+whether the admin portal has any way to see a problem without SSH/Docker
+CLI access -- answer at the time was no; see RoadMap.md's Phase 11
+entry). Distinct from Health above: Health shows the CURRENT state of
+exactly two subsystems (controller/arp-worker, nftables-manager); this
+page is a historical trail of real failures across every background
+sync/discovery loop (AdGuard sync, category subscription fetch, active
+ARP scan, device discovery, the controller↔worker heartbeat) plus the
+specific moment each one recovers -- populated by
+`common/system_events.py`, written to from `controller/main.py`'s own
+`on_error`/`on_success` wiring, not from this route itself.
+
+- `GET /events` -> `events_page()` -- reads the most recent
+  `EVENT_DISPLAY_LIMIT` (200) rows from `system_events`, newest first.
+  Renders `EVENTS_BODY`: a table (When/Source/Severity/Message) with the
+  same client-side `data-filter-table` search box other list pages use,
+  a severity badge (`error` reuses the "blocked" red, `recovery` reuses
+  "allowed" green), and an empty-state message when nothing has ever
+  failed. Nothing is ever deleted from `system_events` by this route --
+  `EVENT_DISPLAY_LIMIT` only bounds what's DISPLAYED, not what's stored;
+  a future pass could add real pruning if the table's growth ever
+  actually proves to be a problem, not before.
+- No write routes on this page -- `system_events` rows are only ever
+  written by `controller/main.py`'s background loops
+  (`common/system_events.py`'s `log_event()`/
+  `failure_recovery_callbacks()`), never by the dashboard directly.
+
 ### Settings (`/settings`)
 
 - `GET /settings` -> `settings_page()` -- reads `local_network`,

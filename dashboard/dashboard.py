@@ -194,7 +194,7 @@ try { if (localStorage.getItem("pp_sidebar_collapsed") === "1") document.documen
 </script>
 </head>
 <body>
-{% set page_titles = {'report': 'Report', 'users': 'Users', 'domains': 'Domains', 'categories': 'Categories', 'schedules': 'Schedules', 'devices': 'Devices', 'health': 'Health', 'settings': 'Settings'} %}
+{% set page_titles = {'report': 'Report', 'users': 'Users', 'domains': 'Domains', 'categories': 'Categories', 'schedules': 'Schedules', 'devices': 'Devices', 'health': 'Health', 'events': 'Events', 'settings': 'Settings'} %}
 <div class="app-shell">
   <nav class="sidebar">
     <a class="sidebar-brand" href="{{ url_for('report') }}">
@@ -229,6 +229,10 @@ try { if (localStorage.getItem("pp_sidebar_collapsed") === "1") document.documen
       <a class="sidebar-item {{ 'active' if active=='health' else '' }}" href="{{ url_for('health_page') }}" title="Health">
         <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
         <span class="sidebar-label">Health{% if interception_down %} <span class="badge blocked">!</span>{% endif %}</span>
+      </a>
+      <a class="sidebar-item {{ 'active' if active=='events' else '' }}" href="{{ url_for('events_page') }}" title="Events">
+        <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        <span class="sidebar-label">Events</span>
       </a>
       <a class="sidebar-item {{ 'active' if active=='settings' else '' }}" href="{{ url_for('settings_page') }}" title="Settings">
         <svg class="sidebar-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -3558,6 +3562,59 @@ def _get_runtime_row(conn):
         "nft_mode, nft_last_healthy_at, nft_fail_reason "
         "FROM interception_runtime WHERE singleton_id = 1"
     ).fetchone()
+
+
+EVENTS_BODY = """
+<div class="card">
+<h2>System events</h2>
+<p class="hint">
+  Real failures and recoveries from this box's own background sync/
+  discovery loops (AdGuard sync, category subscription fetch, active ARP
+  scan, device discovery, the controller&harr;arp-worker heartbeat) --
+  added 2026-09-01 so there's somewhere to look besides
+  <code>docker compose logs</code> when something's wrong. Deliberately
+  NOT a firehose: a routine successful cycle is never logged here, only
+  an actual failure (one row per occurrence, so consecutive timestamps
+  show how long something's been broken) and the specific moment it
+  recovers. This is a smaller, more focused source than the Report
+  page's own activity log, which is about kids' browsing, not this
+  box's own operational health.
+</p>
+{% if events %}<input type="search" data-filter-table="eventsTable" placeholder="Search events&hellip;" style="margin-bottom:.6rem; width:100%; max-width:280px;">{% endif %}
+<div class="table-scroll">
+<table id="eventsTable">
+  <tr><th>When</th><th>Source</th><th>Severity</th><th>Message</th></tr>
+  {% for e in events %}
+  <tr>
+    <td>{{ e.ts }}</td>
+    <td><code>{{ e.source }}</code></td>
+    <td><span class="badge {{ 'blocked' if e.severity == 'error' else 'allowed' }}">{{ e.severity }}</span></td>
+    <td>{{ e.message }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4"><em>No events recorded yet -- nothing has failed since this table existed, or the interception layer isn't running (see <a href="{{ url_for('health_page') }}">Health</a>).</em></td></tr>
+  {% endfor %}
+</table>
+</div>
+{% if events|length >= event_limit %}
+<p class="hint">Showing the most recent {{ event_limit }} events.</p>
+{% endif %}
+</div>
+"""
+
+EVENT_DISPLAY_LIMIT = 200
+
+
+@app.route("/events")
+@require_admin
+def events_page():
+    conn = get_db()
+    events = conn.execute(
+        "SELECT ts, source, severity, message FROM system_events ORDER BY id DESC LIMIT ?",
+        (EVENT_DISPLAY_LIMIT,),
+    ).fetchall()
+    body = render_template_string(EVENTS_BODY, events=events, event_limit=EVENT_DISPLAY_LIMIT)
+    return render("events", body)
 
 
 @app.route("/health")

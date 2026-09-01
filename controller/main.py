@@ -59,6 +59,7 @@ import readiness
 import rtnetlink_listener
 import health
 import sdnotify
+import system_events
 from ipc_client import Target, WorkerClient, WorkerConnectionError
 from lease import HeartbeatPacer
 from reconcile import AppliedState, DesiredState, reconcile
@@ -319,61 +320,99 @@ def run(
         log.warning("heartbeat failed: %s", exc)
         if isinstance(exc, WorkerConnectionError):
             heartbeat_worker_dead.set()
+        # No system_events recovery-transition tracking here (unlike the
+        # loops below) -- a dead worker already surfaces via the Health
+        # page's own fail_open state, and reconnect logic already lives
+        # in this function's own _reconnect() path, not in a PeriodicTask
+        # on_success hook. Still worth a row so an admin can see WHEN and
+        # HOW OFTEN this happened, even without a matching recovery row.
+        conn = None
+        try:
+            import db as _db
+
+            conn = _db.get_conn()
+            system_events.log_event(conn, "controller_heartbeat", "error", f"heartbeat failed: {exc}")
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _events(source: str, log_message: str):
+        """Combines this function's existing log.warning(...) reporting
+        with system_events' own failure/recovery tracking for one named
+        periodic loop -- see system_events.failure_recovery_callbacks()'s
+        docstring for why recoveries are tracked via an in-process
+        closure rather than state persisted across a restart."""
+        event_error, event_success = system_events.failure_recovery_callbacks(source)
+
+        def on_error(exc: Exception) -> None:
+            log.warning(log_message, exc)
+            event_error(exc)
+
+        return on_error, event_success
 
     pacer = HeartbeatPacer(heartbeat_interval, _send_heartbeat, on_error=_on_heartbeat_error)
     pacer.start()
 
     discovery_task = None
     if discovery_interval is not None:
-        discovery_task = discovery.run_loop(
-            discovery_interval,
-            on_error=lambda exc: log.warning("discovery snapshot failed: %s", exc),
-        )
+        _on_error, _on_success = _events("discovery", "discovery snapshot failed: %s")
+        discovery_task = discovery.run_loop(discovery_interval, on_error=_on_error, on_success=_on_success)
 
     rtnetlink_task = None
     if enable_rtnetlink:
-        rtnetlink_task = rtnetlink_listener.run_loop(
-            on_error=lambda exc: log.warning("rtnetlink listener failed: %s", exc),
-        )
+        # No on_success/recovery tracking here -- unlike the fixed-
+        # interval loops below, this is a continuous event listener with
+        # no discrete per-cycle "did this succeed" concept to hook a
+        # recovery transition onto; on_error still gets a system_events
+        # row per occurrence via _events(), the recovery half of the
+        # pair is just never called.
+        _on_error, _ = _events("rtnetlink_listener", "rtnetlink listener failed: %s")
+        rtnetlink_task = rtnetlink_listener.run_loop(on_error=_on_error)
 
     adguard_task = None
     if adguard_interval is not None:
         readiness.wait_for_adguard(
             adguard_url, adguard_username, adguard_password, timeout=adguard_ready_timeout
         )
+        _on_error, _on_success = _events("adguard_sync", "adguard sync failed: %s")
         adguard_task = adguard_sync.run_loop(
             adguard_interval,
             adguard_url,
             adguard_username,
             adguard_password,
             block_page_ip=block_page_ip,
-            on_error=lambda exc: log.warning("adguard sync failed: %s", exc),
+            on_error=_on_error,
+            on_success=_on_success,
         )
 
     adguard_discovery_task = None
     if adguard_discovery_interval is not None:
+        _on_error, _on_success = _events("adguard_discovery", "adguard discovery correlation failed: %s")
         adguard_discovery_task = adguard_discovery.run_loop(
             adguard_discovery_interval,
             adguard_url,
             adguard_username,
             adguard_password,
-            on_error=lambda exc: log.warning("adguard discovery correlation failed: %s", exc),
+            on_error=_on_error,
+            on_success=_on_success,
         )
 
     active_scan_task = None
     if active_scan_interval is not None:
+        _on_error, _on_success = _events("active_scan", "active ARP scan failed: %s")
         active_scan_task = active_scan.run_loop(
             active_scan_interval,
             active_scan_stale_after,
             active_scan_limit,
-            on_error=lambda exc: log.warning("active ARP scan failed: %s", exc),
+            on_error=_on_error,
+            on_success=_on_success,
         )
 
     category_fetch_task = None
     if category_fetch_interval is not None:
+        _on_error, _on_success = _events("category_fetch", "category subscription fetch failed: %s")
         category_fetch_task = category_fetch.run_loop(
-            category_fetch_interval,
-            on_error=lambda exc: log.warning("category subscription fetch failed: %s", exc),
+            category_fetch_interval, on_error=_on_error, on_success=_on_success
         )
 
     sdnotify.ready()

@@ -24,6 +24,15 @@ class PeriodicTask:
     anything on the caller's behalf. A raised exception is reported via
     `on_error` (if given) rather than propagating, so one bad cycle never
     kills the background thread.
+
+    `on_success` (added 2026-09-01 for `common/system_events.py`'s
+    failure->recovery transition tracking) fires after every cycle that
+    does NOT raise -- including the ordinary case where nothing was ever
+    failing to begin with. It's the caller's job (see
+    `system_events.failure_recovery_callbacks()`) to decide whether a
+    given success is notable; this class makes no judgment about that,
+    it just reports every non-raising cycle the same way it reports
+    every raising one via `on_error`.
     """
 
     def __init__(
@@ -31,12 +40,14 @@ class PeriodicTask:
         interval: float,
         task: Callable[[], None],
         on_error: Callable[[Exception], None] | None = None,
+        on_success: Callable[[], None] | None = None,
         *,
         thread_name: str = "periodic-task",
     ) -> None:
         self._interval = interval
         self._task = task
         self._on_error = on_error
+        self._on_success = on_success
         self._thread_name = thread_name
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -63,3 +74,6 @@ class PeriodicTask:
                 # transient failure doesn't permanently stop the task.
                 if self._on_error is not None:
                     self._on_error(exc)
+            else:
+                if self._on_success is not None:
+                    self._on_success()

@@ -403,6 +403,30 @@ CREATE TABLE IF NOT EXISTS network_events (
 CREATE INDEX IF NOT EXISTS idx_network_events_observed ON network_events(observed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_network_events_device ON network_events(device_id);
 
+-- Operational event trail (2026-09-01, added ahead of G1 real-network
+-- testing so an admin has SOMETHING to look at in the dashboard besides
+-- `docker compose logs`): every long-running periodic sync/discovery
+-- loop in controller/main.py already reports its own failures via a
+-- PeriodicTask on_error callback -- previously that only ever went to
+-- Python's own `logging` (container stdout, invisible from the
+-- dashboard, needs SSH/Docker CLI to see at all). This table gives
+-- those same failures (and the failure->success "recovery" transition,
+-- via PeriodicTask's new on_success hook) a persistent, admin-visible
+-- home. Deliberately NOT a firehose: by design (project owner's own
+-- scope decision), only real failures and recoveries are recorded here
+-- -- not every routine successful cycle, which would make this table
+-- pure noise within hours. See common/system_events.py.
+CREATE TABLE IF NOT EXISTS system_events (
+    id       INTEGER PRIMARY KEY,
+    ts       TEXT NOT NULL,
+    source   TEXT NOT NULL,   -- which loop/component, e.g. 'adguard_sync', 'category_fetch'
+    severity TEXT NOT NULL CHECK (severity IN ('error', 'recovery')),
+    message  TEXT NOT NULL,
+    detail   TEXT             -- optional longer context, e.g. the exception's own str()
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_events_ts ON system_events(ts DESC);
+
 CREATE TABLE IF NOT EXISTS access_log (
     id          INTEGER PRIMARY KEY,
     ts          TEXT NOT NULL,
