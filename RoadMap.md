@@ -2816,6 +2816,79 @@ passing, zero regressions.
 
 ---
 
+## Phase 9 — SafeSearch & YouTube Restricted Mode (G3, built 2026-09-01)
+
+Part of a broader gap-analysis pass (see
+`C:\Users\jonat\.claude\plans\i-want-to-replace-partitioned-spark.md`,
+approved by the project owner) that re-validated the whole project
+against the "replace Bark Home + 4 named features" goal and found
+several parity/feature gaps (G1–G8). G3 — "no SafeSearch/Restricted Mode
+enforcement anywhere" — was the first one picked up, ahead of G6/G1 per
+the project owner's own explicit ordering.
+
+**Found a genuine first-class mechanism already built into AdGuard Home**,
+rather than hand-rolling DNS rewrites as the gap-analysis plan had
+sketched: `GET /control/safesearch/status` / `PUT
+/control/safesearch/settings`, confirmed live 2026-09-01 against the
+real smoke-test VM instance before writing any code. Shape:
+`{"enabled", "bing", "duckduckgo", "ecosia", "google", "pixabay",
+"yandex", "youtube"}`, all booleans. Confirmed this is a REAL DNS
+rewrite, not just a config flag that does nothing until some other
+mechanism reads it: with `enabled: true`, `dig www.google.com` returned
+a CNAME to `forcesafesearch.google.com`, and `dig www.youtube.com`
+returned a CNAME to `restrictmoderate.youtube.com` (YouTube's own
+*moderate* level — AdGuard's toggle has no strict/moderate choice of its
+own).
+
+Matches Bark Home's own behavior exactly: this is a single network-wide
+toggle, not a per-device setting — Bark Home doesn't offer per-kid
+SafeSearch either, so no `$client=`-scoped equivalent was built.
+
+**Shipped**:
+- `common/adguard_client.py`: `get_safesearch_status()` /
+  `set_safesearch_settings()`, same style as the existing filter-list
+  functions (also updated those four functions' own docstrings from
+  "NOT yet confirmed live" to confirmed, per the smoke-test VM pass
+  documented above).
+- `controller/adguard_sync.py`: `sync_safesearch()`, wired into
+  `sync_once()` alongside `sync_category_subscriptions()`. Reconciles
+  ONLY the master `enabled` flag against `settings.safesearch_enabled`
+  — deliberately never touches the per-service booleans
+  (`google`/`youtube`/`bing`/etc.), so an admin who's gone into AdGuard's
+  own UI and turned off one specific service keeps that choice untouched
+  by this project's own reconciliation.
+- `dashboard/dashboard.py`: a Settings page card ("SafeSearch & YouTube
+  Restricted Mode", one checkbox) + `POST /settings/safesearch`. Defaults
+  OFF (`db.set_setting_if_absent(conn, "safesearch_enabled", "0")`,
+  bootstrapped alongside the other Phase 8 settings) — an admin opts in
+  explicitly, since this changes real search-engine behavior network-wide
+  the moment it's turned on.
+
+11 new tests (3 in `tests/test_adguard_client.py`, 5 in
+`tests/test_controller_adguard_sync.py` including one proving an admin's
+own per-service AdGuard customization survives a reconcile untouched, 3
+in `tests/test_dashboard.py`) — 655 passed, 30 skipped (Windows) / 674+11
+expected on Linux, zero regressions.
+
+**Not yet live-verified end-to-end**: the dashboard toggle → `settings`
+write → controller's next `sync_once()` → real AdGuard state chain was
+exercised piece-by-piece (the AdGuard API calls live, the toggle/route
+via the local pytest suite) but never as one continuous flow through a
+real running dashboard + controller pair. Worth a quick check next time
+the VM is up, same "verify the seams, not just the pieces" discipline as
+everything else in this project.
+
+Deliberately NOT built: AdGuard Home's separate `/control/parental/*`
+"Parental Control" endpoint (a third-party adult-content blocklist
+AdGuard used to run server-side) — that's a different, older feature
+this project's own `categories` table (Phase 8) already covers via the
+"Adult" starter category, and is widely reported discontinued in recent
+AdGuard Home releases since the backend service it depended on was shut
+down. Not verified live one way or the other; simply irrelevant to what
+G3 actually needed.
+
+---
+
 ## Cross-cutting: security-by-design
 
 Security is designed in from the start on every phase above, not

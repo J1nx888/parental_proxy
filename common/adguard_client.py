@@ -323,15 +323,17 @@ def get_query_log(
 # line per domain the way build_category_deny_rules() does for a small,
 # per-target category.
 #
-# **NOT yet verified live** (unlike every function above this point in this
-# module, all confirmed 2026-08-30/31 against a real running instance) --
-# these three functions are built from AdGuard Home's published
-# openapi.yaml, not confirmed against a real running instance (no
-# Docker available locally when written; the project's smoke-test VM was
-# offline). Treat the request/response shapes below as a strong draft, not
-# confirmed fact, until checked against a live instance -- same "verify
-# live, don't trust docs alone" discipline this module's own docstring
-# describes learning the hard way, repeatedly, on every function above.
+# **Confirmed live 2026-09-01** against a real running AdGuard Home
+# v0.107.79 instance on the smoke-test VM, once it came back up --
+# written from openapi.yaml alone originally (no Docker available
+# locally at the time; the smoke-test VM was offline), then verified
+# with direct curl calls plus a real end-to-end run of
+# sync_category_subscriptions() against a scratch 5,001-domain category
+# before being trusted the way every other function in this module is.
+# All four request/response shapes below turned out correct on the
+# first live check -- no surprises, unlike most of this project's other
+# from-openapi-alone guesses (see RoadMap.md's dated entry for the full
+# verification writeup).
 # ==========================================================================
 
 def get_filters_status(
@@ -339,7 +341,7 @@ def get_filters_status(
 ) -> list[dict]:
     """The `filters` array from `/control/filtering/status` -- each entry
     at least `id`/`enabled`/`name`/`url`/`rules_count` per AdGuard's
-    openapi.yaml (NOT yet confirmed live -- see module note above)."""
+    openapi.yaml -- confirmed live 2026-09-01, see module note above."""
     body = _request(
         f"{base_url.rstrip('/')}/control/filtering/status",
         method="GET",
@@ -361,8 +363,8 @@ def add_filter_url(
     base_url: str, username: str, password: str, name: str, url: str, timeout: float = DEFAULT_TIMEOUT
 ) -> None:
     """Subscribes AdGuard Home to `url` as a new managed filter list named
-    `name` -- per openapi.yaml (NOT yet confirmed live -- see module note
-    above), `POST /control/filtering/add_url` with body
+    `name` -- per openapi.yaml (confirmed live 2026-09-01, see module
+    note above), `POST /control/filtering/add_url` with body
     `{"name", "url", "whitelist": false}`. Behavior when `url` is already
     subscribed is unconfirmed -- callers (adguard_sync.py) should check
     `get_filters_status()` first rather than relying on this being a safe
@@ -382,7 +384,7 @@ def remove_filter_url(
 ) -> None:
     """Unsubscribes AdGuard Home from `url` -- `POST
     /control/filtering/remove_url` with body `{"url", "whitelist": false}`
-    (NOT yet confirmed live -- see module note above)."""
+    -- confirmed live 2026-09-01, see module note above."""
     _request(
         f"{base_url.rstrip('/')}/control/filtering/remove_url",
         method="POST",
@@ -400,8 +402,8 @@ def set_filter_url_enabled(
     """Toggles an already-subscribed filter's `enabled` state without
     removing it -- `POST /control/filtering/set_url` with body
     `{"url", "whitelist": false, "data": {"enabled", "name", "url"}}`,
-    identified by URL rather than id per openapi.yaml (NOT yet confirmed
-    live -- see module note above). This is what lets a schedule-gated
+    identified by URL rather than id per openapi.yaml (confirmed live
+    2026-09-01, see module note above). This is what lets a schedule-gated
     global category (adguard_sync.py) turn its subscription on/off as the
     schedule's window opens/closes, without adding/removing it from
     AdGuard's filter list entirely each time. `name` must be passed again
@@ -414,5 +416,81 @@ def set_filter_url_enabled(
         username=username,
         password=password,
         json_body={"url": url, "whitelist": False, "data": {"enabled": enabled, "name": name, "url": url}},
+        timeout=timeout,
+    )
+
+
+# ==========================================================================
+# G3 (2026-09-01): SafeSearch / YouTube Restricted Mode -- Bark Home parity
+# (RoadMap.md's Phase 8 gap-list addendum). AdGuard Home has a genuine
+# first-class feature for exactly this, per its own openapi.yaml --
+# **confirmed live 2026-09-01** against a real running instance before
+# writing controller/adguard_sync.py's caller: `GET
+# /control/safesearch/status` returns `{"enabled", "bing", "duckduckgo",
+# "ecosia", "google", "pixabay", "yandex", "youtube"}` (all booleans);
+# `PUT /control/safesearch/settings` takes the identical shape and
+# returns `200 OK` (plain text, not JSON). Confirmed this is a REAL DNS
+# rewrite, not just a config flag: with `enabled: true`, `dig
+# www.google.com` returned a CNAME to `forcesafesearch.google.com`, and
+# `dig www.youtube.com` returned a CNAME to `restrictmoderate.youtube.com`
+# (YouTube's own *moderate* restriction level -- AdGuard's toggle has no
+# strict/moderate choice, it's whatever Google's own forcesafesearch
+# infrastructure applies for that hostname).
+#
+# This mirrors Bark Home's own behavior exactly: SafeSearch/Restricted
+# Mode is a single network-wide toggle there too, not a per-device
+# setting -- so unlike the category/schedule machinery elsewhere in this
+# project, there is deliberately no `$client=`-scoped equivalent here.
+# `openapi.yaml` also lists a legacy `/control/parental/*` "Parental
+# Control" endpoint (a third-party adult-content blocklist AdGuard used
+# to run server-side) -- NOT used here: that's a different, older
+# feature this project's own `categories` table (Phase 8) already covers
+# via the "Adult" starter category, and separately, is widely reported
+# discontinued in recent AdGuard Home releases since the backend service
+# it depended on was shut down -- not verified live one way or the
+# other, simply irrelevant to what G3 actually needs.
+# ==========================================================================
+
+
+def get_safesearch_status(
+    base_url: str, username: str, password: str, timeout: float = DEFAULT_TIMEOUT
+) -> dict:
+    """The current SafeSearch config -- confirmed live 2026-09-01, see
+    module note above. `adguard_sync.py`'s `sync_safesearch()` reads
+    this first so it can preserve whatever an admin has set per-service
+    directly in AdGuard's own UI, changing only the master `enabled`
+    flag this project owns."""
+    body = _request(
+        f"{base_url.rstrip('/')}/control/safesearch/status",
+        method="GET",
+        username=username,
+        password=password,
+        timeout=timeout,
+    )
+    try:
+        decoded = json.loads(body)
+    except ValueError as exc:
+        raise AdGuardError(f"malformed JSON from {base_url}/control/safesearch/status: {exc}") from exc
+    if not isinstance(decoded, dict) or "enabled" not in decoded:
+        raise AdGuardError(f"{base_url}/control/safesearch/status had no 'enabled' field")
+    return decoded
+
+
+def set_safesearch_settings(
+    base_url: str, username: str, password: str, config: dict, timeout: float = DEFAULT_TIMEOUT
+) -> None:
+    """Replaces AdGuard's SafeSearch config wholesale -- `PUT
+    /control/safesearch/settings`, confirmed live 2026-09-01 to accept
+    and echo back exactly the shape `get_safesearch_status()` returns
+    (there is no partial-patch form; every field must be supplied).
+    Callers should always start from a fresh `get_safesearch_status()`
+    result and only change the one field they mean to, same discipline
+    `set_filter_url_enabled()` above follows for filters."""
+    _request(
+        f"{base_url.rstrip('/')}/control/safesearch/settings",
+        method="PUT",
+        username=username,
+        password=password,
+        json_body=config,
         timeout=timeout,
     )

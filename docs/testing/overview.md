@@ -513,6 +513,29 @@ schedules/categories cleaned up afterward; a stray discovery-loop
 binding conflict hit mid-test (see RoadMap.md) was resolved without
 needing any code change.
 
+**2026-09-01, G3 (SafeSearch/Restricted Mode)**: 11 new tests. 3 in
+`tests/test_adguard_client.py` for `get_safesearch_status()`/
+`set_safesearch_settings()` (shape confirmed live before writing these,
+see RoadMap.md's Phase 9 entry). 5 in `tests/test_controller_adguard_sync.py`
+for `sync_safesearch()` via `_FakeAdGuardClient` (extended with
+`get_safesearch_status`/`set_safesearch_settings`): enables when the
+setting is on and AdGuard is currently off, disables the reverse way, a
+no-op when already matching, defaults off when the setting was never
+configured at all, and -- the one that matters most for this feature's
+whole "don't clobber an admin's own AdGuard customization" premise --
+confirms per-service booleans (`duckduckgo`/`pixabay` off in the fake)
+survive a reconcile untouched, only `enabled` changes. 3 in
+`tests/test_dashboard.py` for the new Settings card and
+`POST /settings/safesearch` (checked → `"1"`, unchecked → `"0"`).
+Also had to patch 4 pre-existing `sync_once()`/`run_loop()`-level tests
+in `tests/test_controller_adguard_sync.py` that don't care about
+SafeSearch at all -- wiring `sync_safesearch()` into `sync_once()` meant
+they started hitting the fake client's (previously untouched)
+`get_safesearch_status`, which none of them had mocked; added a plain
+`{"enabled": False}` stub to each (matching the setting's own untouched
+default) rather than changing what they actually test. 655 passed, 30
+skipped (Windows) -- zero regressions.
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in

@@ -614,6 +614,13 @@ shape, not an error).
   settings. Flashes an error (not a 500) if the settings are incomplete
   or AdGuard is unreachable; otherwise flashes how many filter lists had
   new content (0 is a normal, healthy result). Added 2026-08-30.
+- `POST /settings/safesearch` -> `update_safesearch()` (G3, 2026-09-01) --
+  one checkbox field `safesearch_enabled`. Only writes
+  `settings.safesearch_enabled` (`"1"`/`"0"`) -- doesn't call AdGuard
+  directly; `controller/adguard_sync.py`'s `sync_safesearch()` picks up
+  the change on its own next cycle, same "dashboard writes intent,
+  controller reconciles reality" split as every other AdGuard-facing
+  setting on this page. Defaults `"0"` (off) on first run.
 
 ## Notable UI/UX behaviors
 

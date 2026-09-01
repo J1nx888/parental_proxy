@@ -2568,3 +2568,27 @@ def test_update_household_time_zone_rejects_garbage(client, db_conn):
     )
     assert "error=1" in resp.headers["Location"]
     assert db_mod.get_setting(db_conn, "household_time_zone", "UTC") == "UTC"
+
+
+def test_settings_page_shows_safesearch_toggle(client):
+    resp = client.get("/settings", headers=_auth_header())
+    assert resp.status_code == 200
+    assert b"SafeSearch" in resp.data
+
+
+def test_update_safesearch_checked_saves_on(client, db_conn):
+    import db as db_mod
+
+    resp = client.post("/settings/safesearch", data={"safesearch_enabled": "1"}, headers=_auth_header())
+    assert resp.status_code == 302
+    assert db_mod.get_setting(db_conn, "safesearch_enabled") == "1"
+
+
+def test_update_safesearch_unchecked_saves_off(client, db_conn):
+    import db as db_mod
+
+    db_mod.set_setting(db_conn, "safesearch_enabled", "1")
+    db_conn.commit()
+    resp = client.post("/settings/safesearch", data={}, headers=_auth_header())
+    assert resp.status_code == 302
+    assert db_mod.get_setting(db_conn, "safesearch_enabled") == "0"

@@ -68,6 +68,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 import adguard_client
+import db
 import matching
 import schedule_eval
 from matching import MAX_SCOPED_CATEGORY_DOMAINS
@@ -515,14 +516,46 @@ def _strip_managed_block(rules: list[str]) -> list[str]:
         return rules[:start]
 
 
+def sync_safesearch(
+    conn: sqlite3.Connection, base_url: str, username: str, password: str, timeout: float = adguard_client.DEFAULT_TIMEOUT
+) -> None:
+    """G3 (Bark Home parity): reconciles AdGuard Home's own native
+    SafeSearch/Restricted-Mode master toggle against this project's
+    `settings.safesearch_enabled` key (dashboard's Settings page),
+    same "recompute and reconcile every cycle" discipline as everything
+    else in this module. Confirmed live 2026-09-01 -- see
+    common/adguard_client.py's own module note.
+
+    Network-wide only, matching Bark Home's own behavior exactly --
+    there is no per-user/group/device equivalent here, unlike
+    categories/schedules elsewhere in this module.
+
+    Deliberately touches ONLY the `enabled` field, never the per-service
+    booleans (`google`/`youtube`/`bing`/etc.) -- those are left exactly
+    as AdGuard's own status reports them, so an admin who has gone into
+    AdGuard's own UI and turned off, say, `pixabay` specifically keeps
+    that choice untouched by this project's own reconciliation. This
+    project only ever offers the one master on/off from its own
+    Settings page.
+    """
+    desired = db.get_setting(conn, "safesearch_enabled", "0") == "1"
+    current = adguard_client.get_safesearch_status(base_url, username, password, timeout=timeout)
+    if bool(current.get("enabled")) == desired:
+        return
+    payload = dict(current)
+    payload["enabled"] = desired
+    adguard_client.set_safesearch_settings(base_url, username, password, payload, timeout=timeout)
+
+
 def sync_once(
     conn: sqlite3.Connection, base_url: str, username: str, password: str, block_page_ip: str | None = None
 ) -> int:
     """One full sync cycle. Returns the number of managed CUSTOM rules
     pushed (0 is a normal, healthy state -- see build_rules' own
     docstring) -- does not count native filter-subscription toggles from
-    `sync_category_subscriptions()`, a separate mechanism (Phase 8) with
-    its own success/failure shape."""
+    `sync_category_subscriptions()` or the SafeSearch master toggle from
+    `sync_safesearch()`, separate mechanisms (Phase 8/G3) each with
+    their own success/failure shape."""
     managed = (
         build_rules(conn, block_page_ip)
         + build_splice_deny_rules(conn, block_page_ip)
@@ -534,6 +567,7 @@ def sync_once(
     new_rules = preserved if not managed else preserved + [_MARKER_BEGIN, *managed, _MARKER_END]
     adguard_client.set_custom_rules(base_url, username, password, new_rules)
     sync_category_subscriptions(conn, base_url, username, password)
+    sync_safesearch(conn, base_url, username, password)
     return len(managed)
 
 

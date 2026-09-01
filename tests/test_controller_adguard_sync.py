@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import pytest
 
 import adguard_sync
+import db
 
 
 def _insert_domain(conn, pattern: str, mode: str = "bump", is_global: bool = True) -> int:
@@ -313,6 +314,7 @@ def test_sync_once_pushes_both_bump_and_splice_rule_sets(conn, monkeypatch):
     _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=False)
 
     monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: [])
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_safesearch_status", lambda *a, **k: {"enabled": False})
     pushed = {}
     monkeypatch.setattr(
         adguard_sync.adguard_client, "set_custom_rules",
@@ -373,6 +375,7 @@ def test_sync_once_preserves_admin_rules_and_replaces_the_managed_block(conn, mo
         adguard_sync._MARKER_END,
     ]
     monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: list(existing))
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_safesearch_status", lambda *a, **k: {"enabled": False})
 
     pushed = {}
     monkeypatch.setattr(
@@ -395,6 +398,7 @@ def test_sync_once_with_nothing_to_deny_still_clears_a_stale_managed_block(conn,
     must still be cleared, not left in place forever."""
     existing = ["! kept", adguard_sync._MARKER_BEGIN, "/stale/$client=1.2.3.4", adguard_sync._MARKER_END]
     monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: list(existing))
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_safesearch_status", lambda *a, **k: {"enabled": False})
 
     pushed = {}
     monkeypatch.setattr(
@@ -424,6 +428,7 @@ def test_run_loop_calls_sync_repeatedly(conn, monkeypatch):
 
     calls = []
     monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: [])
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_safesearch_status", lambda *a, **k: {"enabled": False})
     monkeypatch.setattr(
         adguard_sync.adguard_client, "set_custom_rules",
         lambda base_url, u, p, rules: calls.append(rules),
@@ -441,6 +446,7 @@ def test_run_loop_calls_sync_repeatedly(conn, monkeypatch):
 
 def test_run_loop_stops_promptly(conn, monkeypatch):
     monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: [])
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_safesearch_status", lambda *a, **k: {"enabled": False})
     monkeypatch.setattr(adguard_sync.adguard_client, "set_custom_rules", lambda *a, **k: None)
 
     task = adguard_sync.run_loop(interval=0.05, base_url="http://x", username="a", password="b")
@@ -588,9 +594,13 @@ class _FakeAdGuardClient:
 
     DEFAULT_TIMEOUT = 5.0
 
-    def __init__(self, existing_filters=None):
+    def __init__(self, existing_filters=None, safesearch=None):
         self.filters = list(existing_filters or [])
         self.calls = []
+        self.safesearch = dict(safesearch) if safesearch is not None else {
+            "enabled": False, "bing": True, "duckduckgo": True, "ecosia": True,
+            "google": True, "pixabay": True, "yandex": True, "youtube": True,
+        }
 
     def get_filters_status(self, base_url, username, password, timeout=None):
         return self.filters
@@ -604,6 +614,13 @@ class _FakeAdGuardClient:
         for f in self.filters:
             if f["url"] == url:
                 f["enabled"] = enabled
+
+    def get_safesearch_status(self, base_url, username, password, timeout=None):
+        return dict(self.safesearch)
+
+    def set_safesearch_settings(self, base_url, username, password, config, timeout=None):
+        self.calls.append(("safesearch", dict(config)))
+        self.safesearch = dict(config)
 
 
 def test_sync_category_subscriptions_skips_categories_at_or_under_threshold(conn, monkeypatch):
@@ -667,3 +684,85 @@ def test_sync_category_subscriptions_never_removes_an_existing_filter(conn, monk
     # is_global=False and no gating schedule -- should be disabled, not removed.
     assert fake.calls == [("set_enabled", "https://example.invalid/porn.txt", False)]
     assert len(fake.filters) == 1
+
+
+# ============================================================
+# G3: sync_safesearch
+# ============================================================
+
+def test_sync_safesearch_enables_when_setting_on_and_adguard_currently_off(conn, monkeypatch):
+    db.set_setting(conn, "safesearch_enabled", "1")
+    conn.commit()
+    fake = _FakeAdGuardClient(safesearch={
+        "enabled": False, "bing": True, "duckduckgo": True, "ecosia": True,
+        "google": True, "pixabay": True, "yandex": True, "youtube": True,
+    })
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    adguard_sync.sync_safesearch(conn, "http://x", "admin", "pw")
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0][0] == "safesearch"
+    assert fake.calls[0][1]["enabled"] is True
+
+
+def test_sync_safesearch_disables_when_setting_off_and_adguard_currently_on(conn, monkeypatch):
+    db.set_setting(conn, "safesearch_enabled", "0")
+    conn.commit()
+    fake = _FakeAdGuardClient(safesearch={
+        "enabled": True, "bing": True, "duckduckgo": True, "ecosia": True,
+        "google": True, "pixabay": True, "yandex": True, "youtube": True,
+    })
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    adguard_sync.sync_safesearch(conn, "http://x", "admin", "pw")
+
+    assert fake.calls[0][1]["enabled"] is False
+
+
+def test_sync_safesearch_is_a_noop_when_already_matching(conn, monkeypatch):
+    db.set_setting(conn, "safesearch_enabled", "1")
+    conn.commit()
+    fake = _FakeAdGuardClient(safesearch={
+        "enabled": True, "bing": True, "duckduckgo": True, "ecosia": True,
+        "google": True, "pixabay": True, "yandex": True, "youtube": True,
+    })
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    adguard_sync.sync_safesearch(conn, "http://x", "admin", "pw")
+
+    assert fake.calls == []
+
+
+def test_sync_safesearch_defaults_off_when_setting_never_configured(conn, monkeypatch):
+    # No settings row at all -- must default to "off", never silently on.
+    fake = _FakeAdGuardClient(safesearch={
+        "enabled": False, "bing": True, "duckduckgo": True, "ecosia": True,
+        "google": True, "pixabay": True, "yandex": True, "youtube": True,
+    })
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    adguard_sync.sync_safesearch(conn, "http://x", "admin", "pw")
+
+    assert fake.calls == []
+
+
+def test_sync_safesearch_never_touches_per_service_booleans(conn, monkeypatch):
+    """An admin's own AdGuard-UI customization (duckduckgo/pixabay off,
+    say) must survive this project's own reconciliation untouched --
+    only the master 'enabled' flag is this project's business."""
+    db.set_setting(conn, "safesearch_enabled", "1")
+    conn.commit()
+    fake = _FakeAdGuardClient(safesearch={
+        "enabled": False, "bing": True, "duckduckgo": False, "ecosia": True,
+        "google": True, "pixabay": False, "yandex": True, "youtube": True,
+    })
+    monkeypatch.setattr(adguard_sync, "adguard_client", fake)
+
+    adguard_sync.sync_safesearch(conn, "http://x", "admin", "pw")
+
+    pushed = fake.calls[0][1]
+    assert pushed["duckduckgo"] is False
+    assert pushed["pixabay"] is False
+    assert pushed["bing"] is True
+    assert pushed["enabled"] is True

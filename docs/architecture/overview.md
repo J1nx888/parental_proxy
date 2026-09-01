@@ -790,3 +790,15 @@ playback goes through `www.crunchyroll.com/playback`, already covered.
   all -- the same reason `common/adguard_client.py` (the REST client) and
   `controller/adguard_sync.py` (the scheduling/business logic on top of
   it) are already split the way they are.
+- **G3's `sync_safesearch()` only ever writes the `enabled` field of
+  AdGuard's SafeSearch config, never the per-service booleans**
+  (`google`/`youtube`/`bing`/etc.), even though `PUT
+  /control/safesearch/settings` has no partial-patch form -- every field
+  must be resupplied on every call. It does this by reading the current
+  config first and only flipping the one field this project owns, the
+  same "don't clobber an admin's own customization" discipline
+  `adguard_sync.py`'s custom-rules merge and `sync_category_subscriptions()`
+  already apply to AdGuard's other settings. Unlike categories/schedules
+  elsewhere in this file, SafeSearch is deliberately network-wide only --
+  matching Bark Home's own behavior -- with no per-user/group/device
+  scoping built at all.

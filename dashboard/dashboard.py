@@ -115,6 +115,11 @@ def bootstrap_admin() -> None:
         # common/db.py's schedules table comment), so changing this later
         # never silently moves an existing schedule's meaning.
         db.set_setting_if_absent(conn, "household_time_zone", os.environ.get("HOUSEHOLD_TIME_ZONE", "UTC"))
+        # G3: SafeSearch/Restricted Mode defaults OFF -- an admin opts in
+        # explicitly from Settings, since this changes real search-engine
+        # behavior network-wide the moment it's turned on (see
+        # controller/adguard_sync.py's sync_safesearch() docstring).
+        db.set_setting_if_absent(conn, "safesearch_enabled", "0")
         conn.commit()
     finally:
         conn.close()
@@ -3330,6 +3335,25 @@ SETTINGS_BODY = """
 </div>
 
 <div class="card">
+<h2>SafeSearch &amp; YouTube Restricted Mode</h2>
+<p class="hint">
+  Forces Google/Bing/DuckDuckGo/Ecosia/Yandex/Pixabay SafeSearch and
+  YouTube Restricted Mode for every device on the network, via AdGuard
+  Home's own built-in feature -- the same DNS-rewrite mechanism Bark
+  Home uses, and just as network-wide (there's no per-kid/per-device
+  version of this). Takes effect on the controller's next sync cycle,
+  not instantly.
+</p>
+<form class="add-form" method="post" action="{{ url_for('update_safesearch') }}">
+  <label><input type="checkbox" name="safesearch_enabled" value="1" {{ 'checked' if safesearch_enabled }}> Force SafeSearch &amp; Restricted Mode</label>
+  <button class="add" type="submit">Save</button>
+</form>
+{% if not adguard_configured %}
+<p class="hint"><strong>Not configured yet</strong> -- set AdGuard's connection details above first.</p>
+{% endif %}
+</div>
+
+<div class="card">
 <h2>Local network</h2>
 <form class="add-form" method="post" action="{{ url_for('update_local_network') }}">
   <input type="text" name="local_network" value="{{ local_network }}" style="flex:1; min-width:280px;">
@@ -3423,6 +3447,7 @@ def settings_page():
     adguard_username = db.get_setting(conn, "adguard_username", "admin")
     adguard_password = db.get_setting(conn, "adguard_password", "")
     household_time_zone = db.get_setting(conn, "household_time_zone", "UTC")
+    safesearch_enabled = db.get_setting(conn, "safesearch_enabled", "0") == "1"
     body = render_template_string(
         SETTINGS_BODY, local_network=local_network, admin_username=admin_username,
         block_page_mode=block_page_mode, device_stale_days=device_stale_days,
@@ -3431,8 +3456,24 @@ def settings_page():
         adguard_configured=bool(adguard_url and adguard_password),
         household_time_zone=household_time_zone,
         available_time_zones=sorted(zoneinfo.available_timezones()),
+        safesearch_enabled=safesearch_enabled,
     )
     return render("settings", body)
+
+
+@app.route("/settings/safesearch", methods=["POST"])
+@require_admin
+def update_safesearch():
+    """G3: the master SafeSearch/Restricted-Mode on/off. Only writes the
+    setting -- controller/adguard_sync.py's sync_safesearch() picks it up
+    and reconciles AdGuard's real config on its own next cycle, same
+    "dashboard writes intent, controller applies it" pattern as every
+    other AdGuard-facing setting on this page."""
+    enabled = "1" if request.form.get("safesearch_enabled") else "0"
+    conn = get_db()
+    db.set_setting(conn, "safesearch_enabled", enabled)
+    conn.commit()
+    return flash_redirect("settings_page", "Saved.")
 
 
 @app.route("/settings/household-time-zone", methods=["POST"])

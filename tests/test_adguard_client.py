@@ -367,3 +367,42 @@ def test_set_filter_url_enabled_posts_the_expected_body(monkeypatch):
         "whitelist": False,
         "data": {"enabled": False, "name": "Gambling", "url": "https://example.invalid/gambling.txt"},
     }
+
+
+# ---------------------------- G3: SafeSearch / Restricted Mode ------------
+
+def test_get_safesearch_status_returns_the_config(monkeypatch):
+    config = {
+        "enabled": True, "bing": True, "duckduckgo": True, "ecosia": True,
+        "google": True, "pixabay": True, "yandex": True, "youtube": True,
+    }
+    monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response(config))
+    result = adguard_client.get_safesearch_status("http://127.0.0.1:3000", "admin", "x")
+    assert result == config
+
+
+def test_get_safesearch_status_rejects_a_response_missing_enabled(monkeypatch):
+    monkeypatch.setattr(adguard_client._OPENER, "open", lambda r, timeout=None: _json_response({}))
+    with pytest.raises(adguard_client.AdGuardError, match="enabled"):
+        adguard_client.get_safesearch_status("http://127.0.0.1:3000", "admin", "x")
+
+
+def test_set_safesearch_settings_puts_the_expected_body(monkeypatch):
+    captured = {}
+
+    def fake_open(request, timeout=None):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["body"] = json.loads(request.data)
+        return FakeResponse(b"")
+
+    monkeypatch.setattr(adguard_client._OPENER, "open", fake_open)
+    config = {
+        "enabled": True, "bing": True, "duckduckgo": False, "ecosia": True,
+        "google": True, "pixabay": False, "yandex": True, "youtube": True,
+    }
+    adguard_client.set_safesearch_settings("http://127.0.0.1:3000", "admin", "x", config)
+
+    assert captured["url"] == "http://127.0.0.1:3000/control/safesearch/settings"
+    assert captured["method"] == "PUT"
+    assert captured["body"] == config
