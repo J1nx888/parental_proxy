@@ -712,17 +712,62 @@ LAN-scoped captive-portal login, an attacker who already needs local
 network access to even reach it is a meaningfully smaller threat model
 than an internet-facing one.
 
+**Correction, 2026-09-02**: this section used to list the dashboard
+admin login as the one significant real gap left ("no rate limiting at
+all"). A dedicated audit (prompted by the project owner, ahead of a
+planned full code-review pass) closed it: `require_admin` now shares
+the exact same mechanism the captive portal already used, factored out
+into `common/rate_limit.py`'s `RateLimiter` (5 failed attempts / 60s,
+per source IP, in-memory) rather than a second implementation --
+`dashboard.py` and `captive_portal_server.py` each hold their own
+separate instance (different network surfaces, deliberately not sharing
+a budget). Same "use up the budget on wrong guesses" closure as the
+portal: a rate-limited request is rejected (`429`, `Retry-After: 60`)
+*before* even checking the supplied credentials, which also means an
+attacker can no longer force repeated 260,000-iteration PBKDF2
+computations by flooding once already limited. Only a request that
+actually supplied an `Authorization` header counts against the budget
+or gets checked against it at all — the routine credential-less first
+request every browser's very first hit on this origin triggers isn't a
+guessing attempt (it can never succeed either way) and would otherwise
+risk rate-limiting normal multi-device household use rather than an
+attacker, who must supply *some* credential guess to have any hope of
+succeeding and so can never dodge the counter this way.
+
+**Failed attempts are now dashboard-visible, not just in container
+logs** (same 2026-09-02 pass): a wrong-password attempt against either
+the dashboard admin login or either of the captive portal's two forms
+now also writes a `system_events` row (`source` one of
+`dashboard_admin_login`, `captive_portal_login`,
+`captive_portal_admin_action`; `severity='error'`), visible on the
+`/events` page (Phase 11) alongside every other operational failure —
+see `docs/dashboard/routes.md`'s Events section, now updated to reflect
+that the dashboard itself writes here too, not only
+`controller/main.py`'s background loops. The attempted *password* is
+never logged anywhere, in `system_events` or in `logging` calls — only
+the source IP and the attempted username, truncated to 100 characters
+before being stored (that field is fully attacker-controlled on every
+attempt, and `system_events` has no row-count pruning yet, see Phase
+11's own note). A successful login logs nothing at all, matching
+`system_events`'s own deliberately-not-a-firehose design (see
+`common/system_events.py`'s docstring) -- only the failure is a
+"real event" worth a row.
+
+**A related, independently-found bug fixed in the same pass**: the
+dashboard container never called `logging.basicConfig()` anywhere
+(unlike `controller/main.py`, which does) -- every `log.info()`/
+`log.warning()` call in `dashboard.py`, `captive_portal_server.py`, and
+`block_page_server.py`, including the *pre-existing* failed-login
+`log.info()` calls in `captive_portal_server.py` from Phase 4, silently
+never reached `docker compose logs dashboard` for INFO-level calls (only
+WARNING+ ones surfaced, via Python's own bare last-resort handler).
+Fixed by adding the same call to `dashboard.py`'s `main()` -- in `main()`
+specifically, not at module import time, so importing this module for
+tests never installs a handler on the root logger.
+
 Still true, and still worth an extending agent knowing explicitly
 before pointing any part of this system at the internet:
 
-- **Dashboard admin login** (`require_admin` / `_check_admin_auth` in
-  `dashboard/dashboard.py`): no failed-attempt counter, no delay, no
-  lockout, no CAPTCHA. An attacker with network access to the dashboard port
-  can attempt unlimited HTTP Basic credential guesses. PBKDF2 at 260,000
-  iterations (§1) raises the cost of guessing per attempt, but nothing caps
-  the number of attempts. Unlike the captive portal above, this one still
-  has no rate limiting at all -- worth closing the same way if this doc's
-  own §7 LAN-only assumption ever changes.
 - **No IP-based throttling** anywhere in `common/squid_helper.py` or
   `matching.py`.
 - **Squid's side has no login left to brute-force at all** (§3) — a
@@ -732,8 +777,15 @@ before pointing any part of this system at the internet:
   nothing to guess, but also nothing standing between "controls that IP"
   and "is treated as that device's assigned user" — see §7's LAN-trust
   discussion for why this is accepted rather than mitigated.
+- **Both the dashboard's and the portal's limiters are in-memory and
+  per-process**, resetting on a restart and never shared across a
+  multi-worker deployment (this app runs as a single waitress process,
+  so that's moot today, but would need revisiting if that ever changes)
+  -- an attacker who can force/wait out a container restart gets a fresh
+  budget. Acceptable for a LAN-scoped household tool, not for an
+  internet-facing one.
 
-For the admin login and Squid's IP-based identity, the only mitigating
+For the admin login and Squid's IP-based identity, the other mitigating
 factors present are architectural, not brute-force-specific: (a)
 `_check_admin_auth`'s password comparison is constant-time
 (`hmac.compare_digest` inside `verify_password`), removing a timing
@@ -742,9 +794,9 @@ is *not itself authentication* and is explicitly not one — currently
 limits who can even reach the dashboard's login prompt, or spoof a
 bump-enabled device's IP, to begin with in the intended LAN-only
 deployment. If this system is ever deployed such that the dashboard is
-reachable from the internet, brute-force protection (rate limiting,
-lockout, fail2ban-style IP banning, or a WAF in front) would need to be
-added — nothing in the current code provides it.
+reachable from the internet, IP-based throttling for Squid's identity
+model and a persisted (not in-memory) lockout store would need to be
+added — nothing in the current code provides either.
 
 ---
 
@@ -920,3 +972,38 @@ dashboard's combobox widget, relabeled `BLOCK_ACCESS_SELECTS`) for an
 inverted meaning is a deliberate consistency choice, not a naming
 coincidence; the dashboard's copy says "Block for Everyone" specifically
 so this isn't mistaken for the Domains page's grant.
+
+## 9. SQL injection audit (2026-09-02)
+
+Full sweep, prompted by the project owner ahead of a planned full
+code-review pass: every `.execute()`/`.executemany()`/`.executescript()`
+call across the Python codebase (`common/`, `controller/`, `dashboard/`,
+`proxy/`, `defaults/`) and every `db.QueryRow`/`db.Exec` call in the Go
+side (`phase3/nftables-manager/internal/dbsource/sqlite.go`) — clean.
+No dynamic SQL text is ever built from request-derived or otherwise
+untrusted data anywhere in this codebase; every value that varies by
+request goes through a `?` bind parameter, never string interpolation,
+concatenation, or `%`/`.format()` substitution into the query text
+itself.
+
+The one pattern worth calling out explicitly, since a naive grep for
+`execute(f"` flags it: `dashboard/dashboard.py`'s `_set_quarantine(conn,
+where_sql, params, *, paused)` (G6) and `report()`'s (Report page)
+`where_sql` filter-building both f-string-interpolate a `WHERE` clause
+into the query text. This is safe in both cases because `where_sql` is
+never built from request data — every call site passes one of a small,
+fixed set of hardcoded literal clause strings (e.g. `"id = ?"`,
+`"user_id = ? AND ignored = 0"`, `"ignored = 0"`), chosen by which
+Python code path executes, never a string built from `request.form`/
+`request.args`. Every actual value that varies per request (a device
+id, a user id, a status filter) still flows through `params` as a bind
+parameter in every one of these queries. This is a query-shape
+selector, not a template filled with untrusted input — a genuinely
+different (and safe) pattern from the injection-vulnerable version a
+surface-level grep might mistake it for. Anyone extending either
+function should keep it that way: never make `where_sql` itself
+derived from request data, even partially.
+
+`common/db.py`'s `init_db()`/`SCHEMA` uses `executescript()` against a
+module-level constant string (the DDL) — no interpolation, not
+attacker-reachable at all.

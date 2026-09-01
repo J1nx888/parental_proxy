@@ -634,6 +634,39 @@ independent `recovery` rows for both, confirming the per-source
 failure-tracking closures stay correctly isolated against a real
 concurrent failure, not just the sequential ones the unit tests exercise.
 
+**2026-09-02, brute-force & SQL-injection audit**: project owner asked
+for a dedicated security pass on authentication specifically, ahead of
+a planned full code-review. SQL injection: audited every `.execute()`
+call in the codebase (plus the Go side's `db.QueryRow`/`db.Exec`
+calls) -- clean, no dynamic SQL text built from untrusted input
+anywhere; see `docs/security/overview.md` §9 for the one pattern
+(`_set_quarantine()`/`report()`'s `where_sql` f-string interpolation)
+that needed a closer look before being cleared as safe. Brute-force:
+found the dashboard's HTTP-Basic admin login had no rate limiting at
+all (a gap this doc's own security section had already flagged),
+unlike the captive portal's login form. 12 new tests in the new
+`tests/test_rate_limit.py` (pure sliding-window logic against the new
+shared `common/rate_limit.RateLimiter` -- becomes limited at exactly
+`max_attempts`, not one before or after; `clear()` resets one key
+without affecting another; failures outside the window correctly
+expire; two separate instances never share state, proving
+`dashboard.py` and `captive_portal_server.py`'s separate budgets
+actually stay separate). 7 new tests in `tests/test_dashboard.py`:
+5 wrong passwords then rate-limited (even against a correct 6th
+attempt); 4 wrong then correct still succeeds; a success clears the
+count so 4-more-wrong afterward still doesn't trip it; credential-less
+requests (the routine first hit any browser makes) never count against
+the budget at all; a wrong password writes a `system_events` row
+(username present, password absent from the message) while a correct
+login or a credential-less request write none. `tests/test_captive_portal_server.py`'s
+two old pure-logic tests against the module's former hand-rolled
+limiter were removed (that logic lives in `test_rate_limit.py` now) and
+replaced with 3 new ones confirming the module's real HTTP handlers
+write the same kind of `system_events` row for a failed kid login and a
+failed admin action. 712 passed, 30 skipped on Windows (up from 692/30
+before this pass), zero regressions -- not yet re-run on the smoke-test
+VM's Linux checkout.
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in

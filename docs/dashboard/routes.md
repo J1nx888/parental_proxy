@@ -48,6 +48,16 @@ credentials stored in the `settings` table (`admin_username`,
   `request.authorization`, hands it to `_check_admin_auth()`, and returns a
   bare `401` with a `WWW-Authenticate: Basic` header on failure -- this is
   what makes the browser pop its native Basic Auth prompt.
+- **Brute-force protection (2026-09-02)**: `require_admin` also checks a
+  per-source-IP `common/rate_limit.RateLimiter` (5 failures/60s) before
+  even calling `_check_admin_auth()` -- a request that's already
+  over the limit gets a bare `429`/`Retry-After: 60` without the
+  (expensive, 260,000-iteration PBKDF2) password check ever running.
+  Only a request that actually supplied an `Authorization` header counts
+  against the budget; the routine credential-less first hit every
+  browser makes on a fresh origin doesn't. A wrong-password attempt also
+  writes a `system_events` row (see this file's own Events section) --
+  see `docs/security/overview.md` section 6 for the full writeup.
 - `_check_admin_auth()` (~line 99) loads `admin_username` /
   `admin_password_hash` from `db.get_setting()` and calls
   `auth.verify_password(basic_auth.password, expected_hash)`. Hashing itself
@@ -669,7 +679,12 @@ sync/discovery loop (AdGuard sync, category subscription fetch, active
 ARP scan, device discovery, the controller↔worker heartbeat) plus the
 specific moment each one recovers -- populated by
 `common/system_events.py`, written to from `controller/main.py`'s own
-`on_error`/`on_success` wiring, not from this route itself.
+`on_error`/`on_success` wiring, not from this route itself. **2026-09-02:
+a second category of writer joined** -- failed login attempts against
+the dashboard's own admin auth and the captive portal's two forms (see
+this section's own route notes below and `docs/security/overview.md`
+section 6), so this page now doubles as the brute-force-attempt signal
+the project owner asked for, not only an operational-health trail.
 
 - `GET /events` -> `events_page()` -- reads the most recent
   `EVENT_DISPLAY_LIMIT` (200) rows from `system_events`, newest first.
@@ -681,10 +696,18 @@ specific moment each one recovers -- populated by
   `EVENT_DISPLAY_LIMIT` only bounds what's DISPLAYED, not what's stored;
   a future pass could add real pruning if the table's growth ever
   actually proves to be a problem, not before.
-- No write routes on this page -- `system_events` rows are only ever
-  written by `controller/main.py`'s background loops
-  (`common/system_events.py`'s `log_event()`/
-  `failure_recovery_callbacks()`), never by the dashboard directly.
+- No write routes on **this page** -- but as of 2026-09-02, this
+  dashboard process itself IS one of the writers into `system_events`,
+  not only `controller/main.py`'s background loops: `require_admin`
+  (this file's admin-auth section) logs a `dashboard_admin_login` error
+  row on a wrong-password attempt, and
+  `captive_portal_server.py` logs `captive_portal_login`/
+  `captive_portal_admin_action` error rows the same way -- see
+  `docs/security/overview.md` section 6. None of these three sources
+  have a matching "recovery" event (a successful login isn't logged at
+  all, matching `system_events`'s own not-a-firehose design) -- they're
+  pure failure counters, same shape as `rtnetlink_listener.py`'s own
+  error-only entries (§9 of the architecture doc).
 
 ### Settings (`/settings`)
 

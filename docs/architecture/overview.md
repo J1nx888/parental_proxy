@@ -69,6 +69,9 @@ common/                      shared Python modules, imported by both containers
                                 subscription_url, replaces only its source='subscription' rows
   sdnotify.py                    stdlib-only systemd sd_notify client (READY=1/WATCHDOG=1),
                                 used by the controller's heartbeat pacer
+  rate_limit.py                  RateLimiter -- shared per-IP sliding-window brute-force
+                                limiter (2026-09-02), used by dashboard.py's admin login AND
+                                captive_portal_server.py's two forms, each its own instance
 
 controller/                   Python control-plane container (added 2026-08-30, see
                                 docker-compose.yml's "interception" profile below)
@@ -940,3 +943,13 @@ playback goes through `www.crunchyroll.com/playback`, already covered.
   `_reconnect()` path, not a `PeriodicTask` hook at all -- adding a
   second, redundant recovery-tracking mechanism there would just be two
   sources of truth for the same fact.
+- **`dashboard.py` and `captive_portal_server.py` are also
+  `system_events` writers now (2026-09-02), not just `controller/`'s
+  background loops.** A failed login/admin-action attempt logs an
+  `error` row with no matching `recovery` -- same "pure failure
+  counter" shape as `rtnetlink_listener.py` above, since "someone typed
+  the right password eventually" isn't a notable recovery worth its own
+  row (a successful login logs nothing at all). See
+  `docs/security/overview.md` section 6 for the full brute-force-audit
+  writeup this came out of, and `common/rate_limit.py` for the shared
+  limiter mechanism both files now use.

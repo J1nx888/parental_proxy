@@ -19,6 +19,7 @@ import auth
 import captive_portal_server
 import db
 import identity
+import rate_limit
 
 MAC_A = "aa:bb:cc:dd:ee:01"
 # The real source address of every http.client request this test file
@@ -30,15 +31,18 @@ IP_1 = "127.0.0.1"
 
 @pytest.fixture(autouse=True)
 def _reset_rate_limit():
-    """The rate limiter's own state (see captive_portal_server.py's own
-    comment on why it's a module-level dict, not per-instance) would
-    otherwise leak between tests -- every test in this file's real HTTP
-    requests come from the same source address (127.0.0.1), so a failed
-    login recorded by one test would count against a completely
-    unrelated later test without this."""
-    captive_portal_server._failed_attempts.clear()
+    """The shared common/rate_limit.RateLimiter instance's own state
+    (see captive_portal_server.py's own comment on why it's a
+    module-level instance, not per-request) would otherwise leak between
+    tests -- every test in this file's real HTTP requests come from the
+    same source address (127.0.0.1), so a failed login recorded by one
+    test would count against a completely unrelated later test without
+    this. Swapping in a fresh instance (rather than reaching into its
+    private dict) resets it the same way a real process restart would."""
+    captive_portal_server._LOGIN_LIMITER = rate_limit.RateLimiter(
+        captive_portal_server._MAX_ATTEMPTS, captive_portal_server._WINDOW_SECONDS
+    )
     yield
-    captive_portal_server._failed_attempts.clear()
 
 
 @pytest.fixture
@@ -303,23 +307,11 @@ def test_login_ip_is_looked_up_independent_of_which_device_it_belongs_to(server,
 # security-by-design practice (RoadMap.md's cross-cutting section).
 # ============================================================
 
-def test_is_rate_limited_pure_logic():
-    ip = "203.0.113.5"  # TEST-NET-3, never a real request source here
-    assert captive_portal_server._is_rate_limited(ip) is False
-    for _ in range(captive_portal_server._MAX_ATTEMPTS):
-        captive_portal_server._record_failed_attempt(ip)
-    assert captive_portal_server._is_rate_limited(ip) is True
-
-
-def test_clear_failed_attempts_resets_the_pure_logic():
-    ip = "203.0.113.6"
-    for _ in range(captive_portal_server._MAX_ATTEMPTS):
-        captive_portal_server._record_failed_attempt(ip)
-    assert captive_portal_server._is_rate_limited(ip) is True
-
-    captive_portal_server._clear_failed_attempts(ip)
-
-    assert captive_portal_server._is_rate_limited(ip) is False
+# Pure sliding-window logic (is_limited/record_failure/clear, window
+# expiry) is now covered by tests/test_rate_limit.py against
+# common/rate_limit.RateLimiter directly, since that's where the logic
+# actually lives (2026-09-02) -- this file keeps only the integration-
+# level coverage below (real HTTP requests through the real handler).
 
 
 def test_rate_limit_blocks_further_attempts_after_the_max(server, conn):
@@ -343,6 +335,38 @@ def test_rate_limit_blocks_further_attempts_after_the_max(server, conn):
     assert row["is_authenticated"] == 0, "the rate-limited attempt must not have logged the device in"
 
 
+# ============================================================
+# Failed-login visibility on the dashboard's own Events page --
+# added 2026-09-02 alongside the rate-limiter refactor, so an admin has
+# somewhere to see a guessing attack besides docker compose logs.
+# ============================================================
+
+def test_failed_kid_login_logs_a_system_event(server, conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _add_user(conn, "kid1", "correcthorse")
+
+    _post(server, "kid1", "wrongpassword")
+
+    row = conn.execute(
+        "SELECT source, severity, message FROM system_events ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["source"] == "captive_portal_login"
+    assert row["severity"] == "error"
+    assert IP_1 in row["message"]
+    assert "kid1" in row["message"]
+    assert "correcthorse" not in row["message"], "the password itself must never be logged"
+
+
+def test_successful_kid_login_logs_no_system_event(server, conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _add_user(conn, "kid1", "correcthorse")
+
+    _post(server, "kid1", "correcthorse")
+
+    count = conn.execute("SELECT COUNT(*) c FROM system_events").fetchone()["c"]
+    assert count == 0, "system_events is deliberately not a firehose -- a normal successful login isn't an event"
+
+
 def test_a_successful_login_clears_the_failure_count(server, conn):
     identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
     _add_user(conn, "kid1", "correcthorse")
@@ -352,7 +376,7 @@ def test_a_successful_login_clears_the_failure_count(server, conn):
     status, body = _post(server, "kid1", "correcthorse")
     assert "signed in" in body.lower(), "one attempt below the limit must still succeed with the right password"
 
-    assert captive_portal_server._is_rate_limited(IP_1) is False
+    assert captive_portal_server._LOGIN_LIMITER.is_limited(IP_1) is False
 
 
 # ============================================================
@@ -442,6 +466,21 @@ def test_admin_action_with_wrong_admin_password_is_rejected(server, conn):
     assert "incorrect admin" in body.lower()
     row = conn.execute("SELECT bypass_login FROM devices WHERE mac_address = ?", (MAC_A,)).fetchone()
     assert row["bypass_login"] == 0
+
+
+def test_failed_admin_action_logs_a_system_event(server, conn):
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _set_admin_credentials(conn)
+
+    _post_admin(server, "admin", "wrongpassword", "bypass")
+
+    row = conn.execute(
+        "SELECT source, severity, message FROM system_events ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["source"] == "captive_portal_admin_action"
+    assert row["severity"] == "error"
+    assert IP_1 in row["message"]
+    assert "adminpw" not in row["message"], "the password itself must never be logged"
 
 
 def test_admin_action_cannot_be_done_with_kid_credentials(server, conn):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
 import re
 import secrets
@@ -37,9 +38,13 @@ import category_fetch
 import cr_api
 import db
 import matching
+import rate_limit
 import schedule_eval
+import system_events
 
 CA_CERT_PATH = Path(os.environ.get("PP_CA_CERT_PATH", "/config/ssl_cert/ca_cert.pem"))
+
+log = logging.getLogger("dashboard")
 
 app = Flask(__name__)
 
@@ -143,14 +148,74 @@ def _check_admin_auth(basic_auth) -> bool:
     return auth.verify_admin_credentials(basic_auth.username, basic_auth.password, expected_user, expected_hash)
 
 
+# Brute-force protection, added 2026-09-02 after an audit (prompted by the
+# project owner, ahead of a planned full code-review) found this login had
+# NONE -- every one of this dashboard's ~80 routes sits behind
+# require_admin below, and an attacker with network access to the
+# dashboard port could attempt unlimited HTTP Basic credential guesses
+# (see docs/security/overview.md section 6, now corrected). Reuses
+# dashboard/captive_portal_server.py's own already-reasoned-about limiter
+# mechanism via common/rate_limit.py rather than a second implementation.
+# A SEPARATE instance from the portal's own limiter, deliberately -- these
+# are different network surfaces (this dashboard's own bind address/port
+# vs. the portal's :3131, reachable by different populations of devices),
+# so a flood against one should never exhaust the other's budget.
+_ADMIN_LOGIN_LIMITER = rate_limit.RateLimiter(max_attempts=5, window_seconds=60.0)
+
+# Caps how much of an attacker-controlled username this module will ever
+# write into system_events.message -- see captive_portal_server.py's own
+# identical constant/reasoning for why.
+_LOGGED_USERNAME_MAX_LEN = 100
+
+
+def _log_failed_admin_login(client_ip: str, username: str) -> None:
+    """Dashboard-visible Events-page row for a failed admin login,
+    alongside (not instead of) the log.warning call at the one caller
+    below -- same "layer, don't replace" principle
+    common/system_events.py's own docstring already established.  Never
+    logs the attempted password, only the username and source IP."""
+    truncated = username[:_LOGGED_USERNAME_MAX_LEN]
+    conn = get_db()
+    try:
+        system_events.log_event(
+            conn, "dashboard_admin_login", "error",
+            f"Failed admin login attempt from {client_ip} (username: {truncated!r})",
+        )
+    finally:
+        conn.close()
+
+
 def require_admin(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if not _check_admin_auth(request.authorization):
+        client_ip = request.remote_addr or "unknown"
+        basic_auth = request.authorization
+        # Only a request that actually supplied credentials counts
+        # against the budget or gets checked against it -- the routine
+        # "no Authorization header yet" 401 every browser's very first
+        # request to this origin triggers isn't a guessing attempt (it
+        # can never succeed either way), and counting it would risk
+        # rate-limiting normal multi-device household use rather than
+        # an actual attacker, who must supply *some* credential guess to
+        # have any hope of succeeding and so can never dodge the counter
+        # this way.
+        if basic_auth is not None and _ADMIN_LOGIN_LIMITER.is_limited(client_ip):
+            log.warning("rate-limited dashboard admin login attempt from %s", client_ip)
+            return Response(
+                "Too many failed login attempts. Wait a minute and try again.", 429,
+                {"Retry-After": "60"},
+            )
+        if not _check_admin_auth(basic_auth):
+            if basic_auth is not None:
+                _ADMIN_LOGIN_LIMITER.record_failure(client_ip)
+                log.warning("failed admin login attempt from %s (username: %r)", client_ip, basic_auth.username)
+                _log_failed_admin_login(client_ip, basic_auth.username)
             return Response(
                 "Authentication required", 401,
                 {"WWW-Authenticate": 'Basic realm="Parental Proxy Admin"'},
             )
+        if basic_auth is not None:
+            _ADMIN_LOGIN_LIMITER.clear(client_ip)
         return view(*args, **kwargs)
     return wrapped
 
@@ -3961,6 +4026,19 @@ _boot_conn.close()
 
 
 def main() -> None:
+    # Found 2026-09-02 while auditing brute-force protection: this
+    # container never called logging.basicConfig() anywhere (unlike
+    # controller/main.py, which does), so every log.info()/log.warning()
+    # call in this file AND in captive_portal_server.py/
+    # block_page_server.py -- including the pre-existing failed-login
+    # log.info() calls in captive_portal_server.py -- silently never
+    # reached `docker compose logs dashboard` at all for INFO-level
+    # calls; only WARNING+ ones surfaced, via Python's own bare
+    # last-resort handler. In main() (not at module import time) so
+    # importing this module for tests never installs a handler on the
+    # root logger.
+    logging.basicConfig(level=logging.INFO)
+
     host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("DASHBOARD_PORT", "8787"))
     from waitress import serve

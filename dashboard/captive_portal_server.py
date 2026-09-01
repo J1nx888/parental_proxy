@@ -85,12 +85,13 @@ import html
 import logging
 import sqlite3
 import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
 import auth
 import db
+import rate_limit
+import system_events
 from device_identity import resolve_device
 
 log = logging.getLogger("dashboard.captive_portal_server")
@@ -101,35 +102,38 @@ log = logging.getLogger("dashboard.captive_portal_server")
 # section): a login form an unauthenticated device can reach with no
 # rate limiting at all is an obvious guessing-attack surface,
 # especially since a kid's own password is realistically short/weak.
-# In-memory only, per source IP, deliberately not a new DB table --
-# losing lockout state across a dashboard restart is an acceptable
-# tradeoff for a first pass (this is still a LAN-only surface; Phase 6
-# would need to revisit this if/when it's ever exposed beyond the LAN).
-# A module-level dict + lock (not per-instance) since BaseHTTPRequestHandler
-# gets a fresh instance per request/connection -- state has to live
-# somewhere that outlives any single request.
+# 2026-09-02: factored the actual limiter mechanism out into
+# common/rate_limit.py so dashboard.py's own HTTP-Basic admin login
+# (audited the same day, found to have none at all) can reuse it
+# rather than a second hand-rolled copy -- see that module's docstring.
+# Still one shared instance for BOTH forms below (kid login and the
+# portal admin action), a deliberate choice, not an oversight -- see
+# _handle_admin_action's own comment.
 _MAX_ATTEMPTS = 5
 _WINDOW_SECONDS = 60.0
-_failed_attempts: dict[str, list[float]] = {}
-_failed_attempts_lock = threading.Lock()
+_LOGIN_LIMITER = rate_limit.RateLimiter(_MAX_ATTEMPTS, _WINDOW_SECONDS)
+
+# Caps how much of an attacker-controlled username this module will ever
+# write into system_events.message -- that column has no length limit of
+# its own, and this is a field a hostile client fully controls on every
+# single failed attempt.
+_LOGGED_USERNAME_MAX_LEN = 100
 
 
-def _is_rate_limited(client_ip: str) -> bool:
-    now = time.monotonic()
-    with _failed_attempts_lock:
-        recent = [t for t in _failed_attempts.get(client_ip, []) if now - t < _WINDOW_SECONDS]
-        _failed_attempts[client_ip] = recent
-        return len(recent) >= _MAX_ATTEMPTS
-
-
-def _record_failed_attempt(client_ip: str) -> None:
-    with _failed_attempts_lock:
-        _failed_attempts.setdefault(client_ip, []).append(time.monotonic())
-
-
-def _clear_failed_attempts(client_ip: str) -> None:
-    with _failed_attempts_lock:
-        _failed_attempts.pop(client_ip, None)
+def _log_failed_login(conn: sqlite3.Connection, source: str, client_ip: str, username: str) -> None:
+    """Writes a dashboard-visible Events-page row for a failed login/
+    admin-action attempt, alongside (not instead of) the log.info/
+    log.warning calls at each call site below -- same "layer, don't
+    replace" principle common/system_events.py's own docstring already
+    established for controller/main.py's background loops. Never logs
+    the attempted password, only the username and source IP -- a kid's
+    (or an attacker's) mistyped password is still a real, sensitive
+    credential-adjacent string not worth persisting anywhere."""
+    truncated = username[:_LOGGED_USERNAME_MAX_LEN]
+    system_events.log_event(
+        conn, source, "error",
+        f"Failed login attempt from {client_ip} (username: {truncated!r})",
+    )
 
 _PAGE_TEMPLATE = """\
 <!doctype html><html><head><meta charset='utf-8'>
@@ -339,7 +343,7 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
 
     def _handle_login(self, conn: sqlite3.Connection, username: str, password: str) -> None:
         client_ip = self.client_address[0]
-        if _is_rate_limited(client_ip):
+        if _LOGIN_LIMITER.is_limited(client_ip):
             log.warning("rate-limited login attempt from %s", client_ip)
             self._send_html(
                 200, _render("Too many attempts -- wait a minute before trying again.", groups=_fetch_groups(conn))
@@ -367,12 +371,13 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
 
         user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
         if user is None or not auth.verify_password(password, user["password_hash"]):
-            _record_failed_attempt(client_ip)
+            _LOGIN_LIMITER.record_failure(client_ip)
             log.info("failed login for username=%r from device %s", username, device["mac_address"])
+            _log_failed_login(conn, "captive_portal_login", client_ip, username)
             self._send_html(200, _render("Incorrect username or password.", groups=_fetch_groups(conn)))
             return
 
-        _clear_failed_attempts(client_ip)
+        _LOGIN_LIMITER.clear(client_ip)
 
         # Grants DNS-tier access ONLY -- never bump_enabled, matching
         # Phase 4's design sketch exactly (RoadMap.md). COALESCE so a
@@ -407,7 +412,7 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
         # than a separate budget -- see this module's own docstring for
         # why that's the more conservative choice (this surface grants
         # strictly more than the kid login ever does).
-        if _is_rate_limited(client_ip):
+        if _LOGIN_LIMITER.is_limited(client_ip):
             log.warning("rate-limited admin action attempt from %s", client_ip)
             self._send_html(
                 200,
@@ -421,15 +426,16 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
         expected_user = db.get_setting(conn, "admin_username")
         expected_hash = db.get_setting(conn, "admin_password_hash")
         if not auth.verify_admin_credentials(admin_username, admin_password, expected_user, expected_hash):
-            _record_failed_attempt(client_ip)
+            _LOGIN_LIMITER.record_failure(client_ip)
             log.info("failed portal admin action attempt from %s", client_ip)
+            _log_failed_login(conn, "captive_portal_admin_action", client_ip, admin_username)
             self._send_html(
                 200,
                 _render(admin_error="Incorrect admin username or password.", groups=_fetch_groups(conn)),
             )
             return
 
-        _clear_failed_attempts(client_ip)
+        _LOGIN_LIMITER.clear(client_ip)
 
         device = resolve_device(conn, client_ip)
         if device is None:

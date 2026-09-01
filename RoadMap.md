@@ -3214,6 +3214,82 @@ mocked one. Cleaned up (`DELETE FROM system_events`) afterward.
 
 ---
 
+## Brute-force & SQL-injection audit (2026-09-02)
+
+The project owner asked for a dedicated security pass -- checking for
+SQL injection and brute-force exposure, especially around
+authentication, and making sure a failed login gets logged somewhere an
+admin can actually see it -- ahead of the planned full code-review.
+
+**SQL injection: audited clean.** Every `.execute()`/`.executemany()`/
+`.executescript()` call across the whole Python codebase, plus the Go
+side's `db.QueryRow`/`db.Exec` calls in
+`phase3/nftables-manager/internal/dbsource/sqlite.go`, was checked for
+dynamic SQL text built from untrusted input (f-strings, `%`-formatting,
+`.format()`, string concatenation feeding a query). None found -- every
+value that varies by request goes through a `?` bind parameter. One
+pattern needed a closer look before being cleared: `dashboard.py`'s
+`_set_quarantine()` (G6) and `report()` (Report page) both
+f-string-interpolate a `WHERE` clause into their query text, but
+`where_sql` in both cases is always chosen from a small, fixed set of
+hardcoded literal strings by which code path runs -- never built from
+`request.form`/`request.args` -- so this is a query-shape selector, not
+an injectable template. Full writeup, including the exact reasoning
+future work must preserve, in `docs/security/overview.md` section 9
+(new).
+
+**Brute-force: one real gap found and fixed.** The captive portal's
+login form (Phase 4) already had a real per-IP rate limiter; the
+dashboard's own HTTP-Basic admin login -- guarding every one of its
+~80 routes -- had none at all, a gap this doc's own security section
+had flagged but left open. Fixed by factoring the portal's limiter
+mechanism out into a new shared module, `common/rate_limit.py`
+(`RateLimiter`: 5 failed attempts / 60s per source IP, in-memory), and
+giving `dashboard.py`'s `require_admin` its own instance of it (a
+separate budget from the portal's, deliberately -- different network
+surfaces). A rate-limited request is rejected (`429`, `Retry-After: 60`)
+*before* the password check runs at all, so flooding past the limit
+can no longer force repeated 260,000-iteration PBKDF2 computations
+either. Only a request that actually supplied credentials counts
+against the budget -- the routine credential-less first hit every
+browser makes on a fresh origin doesn't, avoiding a false lockout from
+normal multi-device household use.
+
+**Failed logins are now dashboard-visible.** A wrong-password attempt
+against the dashboard admin login OR either of the captive portal's two
+forms now writes a `system_events` "error" row (`dashboard_admin_login`
+/ `captive_portal_login` / `captive_portal_admin_action`), visible on
+the `/events` page (Phase 11) -- directly answering "can I see if
+someone's trying to break in" without SSH/Docker CLI access. Only the
+source IP and attempted username are logged (truncated to 100 chars,
+since that field is fully attacker-controlled on every attempt) --
+never the password, on any successful OR failed attempt. A successful
+login logs nothing, matching `system_events`'s own deliberately-not-a-
+firehose design.
+
+**An independently-found bug, fixed in the same pass**: the dashboard
+container never called `logging.basicConfig()` anywhere (unlike
+`controller/main.py`, which does) -- every `log.info()` call in
+`dashboard.py`, `captive_portal_server.py`, and `block_page_server.py`,
+including the *pre-existing* Phase-4 failed-login `log.info()` calls in
+`captive_portal_server.py`, silently never reached `docker compose logs
+dashboard`; only `log.warning()`+ calls surfaced, via Python's own bare
+last-resort handler. Fixed by adding the call to `dashboard.py`'s
+`main()`.
+
+20 new tests (`tests/test_rate_limit.py` for the shared limiter's pure
+logic, plus new coverage in `tests/test_dashboard.py` and
+`tests/test_captive_portal_server.py` for the integration behavior and
+the new `system_events` rows) -- 712 passed / 30 skipped on Windows
+(up from 692/30 before this pass), zero regressions. Not yet re-run on
+the smoke-test VM's Linux checkout -- do that before treating this as
+fully confirmed the way this project's other passes are. Full detail in `docs/security/overview.md` sections 6
+and 9 (both updated), `docs/dashboard/routes.md`'s admin-auth and
+Events sections, and `docs/architecture/overview.md`'s file tree and
+non-obvious-decisions list.
+
+---
+
 ## Cross-cutting: security-by-design
 
 Security is designed in from the start on every phase above, not

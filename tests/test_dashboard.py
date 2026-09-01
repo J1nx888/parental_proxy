@@ -78,6 +78,88 @@ def test_ca_cert_route_requires_no_auth(client):
     assert resp.status_code != 401
 
 
+# ============================================================
+# ADMIN LOGIN BRUTE-FORCE PROTECTION -- added 2026-09-02 after an audit
+# found this login had none at all (docs/security/overview.md section 6).
+# ============================================================
+
+def test_five_wrong_passwords_then_rate_limited(client):
+    for _ in range(5):
+        resp = client.get("/users", headers=_auth_header(password="nope"))
+        assert resp.status_code == 401
+
+    # The 6th attempt is blocked outright -- even with the CORRECT
+    # password this time, matching the captive portal's own "don't let
+    # an attacker use up the budget on wrong guesses and slip the right
+    # one in at the end" reasoning.
+    resp = client.get("/users", headers=_auth_header())
+    assert resp.status_code == 429
+    assert resp.headers.get("Retry-After") == "60"
+
+
+def test_four_wrong_passwords_then_correct_still_succeeds(client):
+    for _ in range(4):
+        client.get("/users", headers=_auth_header(password="nope"))
+
+    resp = client.get("/users", headers=_auth_header())
+    assert resp.status_code == 200
+
+
+def test_a_successful_login_clears_the_admin_failure_count(client):
+    for _ in range(4):
+        client.get("/users", headers=_auth_header(password="nope"))
+    resp = client.get("/users", headers=_auth_header())
+    assert resp.status_code == 200
+
+    # Even after that success, 4 MORE wrong attempts still must not trip
+    # the limiter -- the earlier failures were cleared, not merely
+    # topped up to exactly the boundary.
+    for _ in range(4):
+        resp = client.get("/users", headers=_auth_header(password="nope"))
+        assert resp.status_code == 401
+    resp = client.get("/users", headers=_auth_header())
+    assert resp.status_code == 200
+
+
+def test_requests_with_no_credentials_at_all_never_count_against_the_limit(client):
+    # A browser's routine first, credential-less request to a fresh
+    # origin (always a 401) is not a guessing attempt -- it can never
+    # succeed either way -- and must never contribute to the same budget
+    # a real wrong-password guess does.
+    for _ in range(10):
+        resp = client.get("/users")
+        assert resp.status_code == 401
+
+    resp = client.get("/users", headers=_auth_header())
+    assert resp.status_code == 200
+
+
+def test_wrong_password_logs_a_system_event(client, db_conn):
+    client.get("/users", headers=_auth_header(username="admin", password="nope"))
+
+    row = db_conn.execute(
+        "SELECT source, severity, message FROM system_events ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["source"] == "dashboard_admin_login"
+    assert row["severity"] == "error"
+    assert "admin" in row["message"]
+    assert "nope" not in row["message"], "the password itself must never be logged"
+
+
+def test_correct_login_logs_no_system_event(client, db_conn):
+    client.get("/users", headers=_auth_header())
+
+    count = db_conn.execute("SELECT COUNT(*) c FROM system_events").fetchone()["c"]
+    assert count == 0, "system_events is deliberately not a firehose -- a normal successful login isn't an event"
+
+
+def test_credential_less_request_logs_no_system_event(client, db_conn):
+    client.get("/users")
+
+    count = db_conn.execute("SELECT COUNT(*) c FROM system_events").fetchone()["c"]
+    assert count == 0
+
+
 def test_index_redirects_to_report(client):
     resp = client.get("/", headers=_auth_header())
     assert resp.status_code == 302
