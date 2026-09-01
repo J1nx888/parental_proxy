@@ -2964,6 +2964,77 @@ more rows.
 
 ---
 
+## G5/G7 discussion (2026-09-01) + bulk device import
+
+Per the project owner's own stated order, discussed G5 (captive-portal
+session model) and G7 (gate-existing-devices cutover step) before
+starting any G1 prep work.
+
+**G5(a), DHCP lease-change window -- resolved as accepted risk, not a
+code change.** Project owner asked whether tracking MAC instead of IP
+would sidestep this. Answer: `device_bindings` already tracks MAC as the
+durable identity; IP still matters because **every actual enforcement
+point is IP-based by the nature of its protocol**, not by choice --
+AdGuard Home's `$client=` modifier is IP/CIDR-only (DNS carries no MAC),
+and Squid's `device_identity.resolve_user()` sees only a TCP source IP
+(no MAC once the OS strips the Ethernet frame). The one genuine
+exception is nftables itself: because this box does real L2 interception
+(ARP-spoofing), it actually sees every packet's original source MAC, so
+`authenticated_v4`/`quarantine_v4`/etc. COULD in principle be redefined
+as `ether_addr` sets instead of `ipv4_addr` sets, closing the DHCP-window
+gap for whether a device is intercepted/classified at all. That would
+NOT close it for AdGuard/Squid's own IP-keyed decisions, and it's a real
+refactor (Go-side set types, the controller<->nftables-manager DB/IPC
+shape all currently carry `ipv4_address`) -- **decided not to build this
+now**, logged here as a legitimate future refinement, not attempted
+blind. The live rtnetlink listener (Milestone 4) already reacts near-
+instantly to neighbor-table changes, and since the box sees all traffic
+anyway a renewed IP typically gets re-bound the moment the device sends
+its next packet -- the real-world window size is squarely a G1
+real-network question, not something to guess at from here.
+
+**G5(b), MAC-randomization login friction -- accepted as-is.** Project
+owner: "I believe we should accept the friction for now... I don't see
+it as a show stopper." Not revisited unless real-world use proves
+otherwise.
+
+**G7, gate-existing-devices cutover -- resolved by policy, zero code
+needed.** Project owner: start every real deployment completely empty,
+no devices added by hand before the captive portal goes live. This
+fully closes the original gap (the `is_authenticated` default mismatch
+only matters if devices exist in the table before the portal is
+enabled) -- every device gets auto-discovered and correctly created at
+`is_authenticated=0`/PREAUTH from day one, with nothing to migrate.
+Documented as an explicit setup instruction in
+`docs/deployment/setup.md`, not left as an unstated assumption.
+
+**New feature identified, tracked separately per the project owner's own
+request, NOT built now: a first-time setup wizard** (walks a fresh admin
+through the CA cert, admin password, initial user setup, domain
+configuration, etc.). Logged here and in memory as a distinct future
+feature -- out of scope for this session.
+
+**Bulk CSV device import -- built the same day**, a setup-time
+convenience the project owner asked for directly (not a cutover
+requirement, since "start fresh" already resolved G7): a Settings page
+card (`dashboard/dashboard.py`), `POST /devices/import`, accepts a CSV
+upload (`mac_address,label` per row, auto-detects and skips a header row
+via `normalize_mac()` on the first cell). Every imported row lands as a
+plain Unassigned device, identical in shape to one added by hand via
+`add_device()` -- **deliberately no second, parallel assignment UI**;
+"prompt the admin to select the desired profile/group" is just the
+existing Devices list's per-row Manage link, reused rather than
+duplicated. `INSERT OR IGNORE` on the `mac_address` UNIQUE constraint
+means an already-known device is silently skipped (and counted) rather
+than erroring the whole batch or clobbering that device's existing
+label/assignment. 9 new tests in `tests/test_dashboard.py` (header
+auto-detection, headerless CSV, duplicate-skip-without-clobbering,
+invalid-MAC-row skipping, empty-file and no-file error paths, admin-auth
+required, imported rows are plain unassigned). 675 passed, 30 skipped
+(Windows), zero regressions.
+
+---
+
 ## Cross-cutting: security-by-design
 
 Security is designed in from the start on every phase above, not

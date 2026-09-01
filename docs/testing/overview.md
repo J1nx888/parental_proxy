@@ -569,6 +569,17 @@ Whole-house/per-kid were verified at the SQL layer only (same
 `_set_quarantine()` write against more rows, already proven by the unit
 tests and by per-device's own real nftables round-trip).
 
+**2026-09-01, bulk CSV device import (G7 follow-on)**: 9 new tests in
+`tests/test_dashboard.py` -- valid rows with a header (auto-skipped),
+headerless CSV, a duplicate MAC skipped without clobbering the existing
+device's own label, a row with no valid MAC skipped without aborting
+the rest of the batch, empty-file and no-file-selected error paths,
+admin auth required, and an imported row lands exactly as
+`add_device()`'s own plain-Unassigned shape (no user/group/ignored).
+First file-upload test in this suite -- Flask's test client accepts a
+`(BytesIO, filename)` tuple for a multipart field with no new fixtures
+needed. 675 passed, 30 skipped (Windows), zero regressions.
+
 **Same night, sixth follow-up**: closed out the design sketch's
 "reminder screen" bullet from both directions (see
 docs/architecture/overview.md). 3 new tests in

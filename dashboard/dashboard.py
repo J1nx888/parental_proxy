@@ -14,6 +14,8 @@ public certificate, not a secret, and every client device needs to fetch it.
 """
 from __future__ import annotations
 
+import csv
+import io
 import os
 import re
 import secrets
@@ -2569,6 +2571,72 @@ def add_device():
     return flash_redirect("devices", f"Added {mac}.")
 
 
+@app.route("/devices/import", methods=["POST"])
+@require_admin
+def import_devices():
+    """G7 follow-on (2026-09-01): a fresh setup starts with zero devices
+    (the project owner's own decision -- see docs/deployment/setup.md),
+    so this exists purely as a setup-time convenience for entering many
+    already-known devices (e.g. exported from the router's client list)
+    faster than one at a time, not to solve any gating/migration problem.
+
+    Every imported row lands as a plain Unassigned device, same shape as
+    add_device() above (no user/group/ignored) -- the actual "select the
+    desired profile/group" step this was asked for is just the existing
+    Devices list's per-row Manage link; deliberately not a second,
+    parallel assignment UI duplicating what's already there.
+
+    CSV format: one row per device, `mac_address,label` (label
+    optional). A header row is auto-detected and skipped -- if the
+    first row's first cell doesn't parse as a MAC (normalize_mac()),
+    it's treated as a header rather than a data row. `INSERT OR IGNORE`
+    on the mac_address UNIQUE constraint means an already-known MAC is
+    silently skipped (counted, not overwritten) rather than erroring out
+    the whole batch or clobbering an existing assignment.
+    """
+    file = request.files.get("csv_file")
+    if not file or not file.filename:
+        return flash_redirect("devices", "Choose a CSV file first.", error=True)
+    try:
+        content = file.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return flash_redirect("devices", "Couldn't read that file as text -- is it really a CSV?", error=True)
+
+    rows = [row for row in csv.reader(io.StringIO(content)) if row and any(cell.strip() for cell in row)]
+    if not rows:
+        return flash_redirect("devices", "That CSV had no rows.", error=True)
+
+    start = 1 if normalize_mac(rows[0][0]) is None else 0
+
+    conn = get_db()
+    added = 0
+    skipped_duplicate = 0
+    skipped_invalid = 0
+    now = db.now_iso()
+    for row in rows[start:]:
+        mac = normalize_mac(row[0]) if row else None
+        if mac is None:
+            skipped_invalid += 1
+            continue
+        label = row[1].strip() if len(row) > 1 and row[1].strip() else None
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO devices (mac_address, label, created_at) VALUES (?, ?, ?)",
+            (mac, label, now),
+        )
+        if cur.rowcount:
+            added += 1
+        else:
+            skipped_duplicate += 1
+    conn.commit()
+
+    parts = [f"Imported {added} device{'s' if added != 1 else ''}."]
+    if skipped_duplicate:
+        parts.append(f"{skipped_duplicate} already known.")
+    if skipped_invalid:
+        parts.append(f"{skipped_invalid} row{'s' if skipped_invalid != 1 else ''} had no valid MAC address.")
+    return flash_redirect("devices", " ".join(parts), error=(added == 0))
+
+
 @app.route("/devices/bypass_login", methods=["POST"])
 @require_admin
 def bypass_login_device():
@@ -3578,6 +3646,23 @@ SETTINGS_BODY = """
   <input type="text" name="admin_username" value="{{ admin_username }}" placeholder="Admin username">
   <input type="password" name="admin_password" placeholder="New password (leave blank to keep current)">
   <button class="add" type="submit">Save</button>
+</form>
+</div>
+
+<div class="card">
+<h2>Bulk import devices</h2>
+<p class="hint">
+  A CSV of known devices -- one row per device, <code>MAC address,Device name</code>
+  (a header row is fine and gets skipped automatically). Useful for a
+  fresh setup: export your router's client list, or type one up by hand,
+  rather than adding devices one at a time. Every row becomes a plain
+  <strong>Unassigned</strong> device (same as adding one by hand) --
+  nothing is auto-assigned to a kid or group. After importing, assign
+  each one from the <a href="{{ url_for('devices') }}">Devices</a> page.
+</p>
+<form class="add-form" method="post" action="{{ url_for('import_devices') }}" enctype="multipart/form-data">
+  <input type="file" name="csv_file" accept=".csv,text/csv" required>
+  <button class="add" type="submit">Import</button>
 </form>
 </div>
 

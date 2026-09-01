@@ -92,6 +92,22 @@ or non-interactive deploys:
 5. Approve shows/sites per user ahead of time, or reactively from the
    **Report** page as blocks show up.
 
+**Before enabling the captive portal (Phase 4) for real: start with zero
+devices pre-added.** (Decided 2026-09-01, resolving G7's "gate existing
+devices" cutover question with a policy instead of a code change.) The
+schema defaults a hand-added device's `is_authenticated` to `1`
+(trusted) while a device the interception layer *discovers* on its own
+gets created at `0` (gated, per `common/identity.py`'s `record_binding()`)
+-- if any devices already exist in the table with the trusted default
+before the portal goes live, they'll never be forced to log in. Adding
+devices manually under **Devices** (step 4 above) is still exactly right
+for setting up SSL-Bump ahead of time; just don't do it for devices you
+intend the portal to actually gate. Already have a list of known MACs
+(e.g. exported from the router's client list)? Settings' **Bulk import
+devices** card accepts a CSV (`mac_address,label` per row) and adds them
+all as plain Unassigned devices in one step, rather than needing them
+added one at a time.
+
 ## Six-service architecture
 
 Six services, defined in `docker-compose.yml` at the project root.

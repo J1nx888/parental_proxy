@@ -494,6 +494,17 @@ actual captive-portal login screen itself is still Phase 4, not built).
   group_id, ignored)` triple -- see `DEVICE_ASSIGNMENT_SELECT`'s combined
   dropdown). Inserts into `devices`; duplicate MAC (UNIQUE constraint) ->
   error flash.
+- `POST /devices/import` -> `import_devices()` (2026-09-01, a G7
+  setup-convenience feature, on Settings not this page -- see
+  `docs/deployment/setup.md`) -- multipart file field `csv_file`, one
+  `mac_address,label` row per device. Auto-detects and skips a header
+  row (via `normalize_mac()` on the first cell -- if it's not a valid
+  MAC, that row is treated as a header, not data). `INSERT OR IGNORE` on
+  the UNIQUE `mac_address` constraint -- an already-known MAC is
+  silently skipped and counted, never overwritten. Every row lands
+  exactly like `add_device()` with no assignment (plain Unassigned) --
+  there's no separate bulk-assignment step; assign each one afterward
+  from this page's own per-row Manage link.
 - `GET /devices/<int:device_id>` -> `device_detail()` -- one device's
   editable assignment, `bump_enabled`, and `bypass_login` checkboxes.
   Renders `DEVICE_DETAIL_BODY`. Redirects to `devices` with an error flash

@@ -1467,6 +1467,114 @@ def test_add_device_duplicate_mac_rejected(client, db_conn):
     assert count == 1
 
 
+# ============================================================
+# G7 follow-on: bulk CSV device import
+# ============================================================
+
+def _csv_upload(text: str, filename: str = "devices.csv"):
+    import io as io_mod
+    return {"csv_file": (io_mod.BytesIO(text.encode("utf-8")), filename)}
+
+
+def test_import_devices_adds_rows_and_skips_a_header(client, db_conn):
+    csv_text = "MAC,Name\naa:bb:cc:dd:ee:10,Alex's Tablet\naa:bb:cc:dd:ee:11,Kitchen TV\n"
+    resp = client.post(
+        "/devices/import", data=_csv_upload(csv_text), headers=_auth_header(),
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 302
+    assert "Imported+2" in resp.headers["Location"] or "Imported 2" in resp.headers["Location"]
+
+    rows = db_conn.execute("SELECT mac_address, label FROM devices ORDER BY mac_address").fetchall()
+    assert [dict(r) for r in rows] == [
+        {"mac_address": "aa:bb:cc:dd:ee:10", "label": "Alex's Tablet"},
+        {"mac_address": "aa:bb:cc:dd:ee:11", "label": "Kitchen TV"},
+    ]
+
+
+def test_import_devices_headerless_csv_still_works(client, db_conn):
+    csv_text = "aa:bb:cc:dd:ee:12,Roku\n"
+    resp = client.post(
+        "/devices/import", data=_csv_upload(csv_text), headers=_auth_header(),
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT label FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:12'").fetchone()
+    assert row["label"] == "Roku"
+
+
+def test_import_devices_skips_duplicate_macs_without_clobbering_assignment(client, db_conn):
+    client.post(
+        "/devices/add", data={"mac_address": "aa:bb:cc:dd:ee:13", "label": "Original label"},
+        headers=_auth_header(),
+    )
+    csv_text = "aa:bb:cc:dd:ee:13,Overwritten label\naa:bb:cc:dd:ee:14,New Device\n"
+    resp = client.post(
+        "/devices/import", data=_csv_upload(csv_text), headers=_auth_header(),
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 302
+    count = db_conn.execute("SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    assert count == 2  # the duplicate wasn't inserted a second time
+    row = db_conn.execute("SELECT label FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:13'").fetchone()
+    assert row["label"] == "Original label", "an existing device's own data must never be overwritten by an import"
+
+
+def test_import_devices_skips_rows_with_no_valid_mac(client, db_conn):
+    csv_text = "not-a-mac,Bad Row\naa:bb:cc:dd:ee:15,Good Row\n"
+    resp = client.post(
+        "/devices/import", data=_csv_upload(csv_text), headers=_auth_header(),
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 302
+    count = db_conn.execute("SELECT COUNT(*) c FROM devices").fetchone()["c"]
+    assert count == 1
+    row = db_conn.execute("SELECT * FROM devices").fetchone()
+    assert row["mac_address"] == "aa:bb:cc:dd:ee:15"
+
+
+def test_import_devices_requires_a_file(client, db_conn):
+    resp = client.post("/devices/import", data={}, headers=_auth_header(), content_type="multipart/form-data")
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT COUNT(*) c FROM devices").fetchone()["c"] == 0
+
+
+def test_import_devices_empty_csv_flashes_error(client, db_conn):
+    resp = client.post(
+        "/devices/import", data=_csv_upload("\n\n"), headers=_auth_header(),
+        content_type="multipart/form-data",
+    )
+    assert "error=1" in resp.headers["Location"]
+
+
+def test_import_devices_requires_admin_auth(client, db_conn):
+    resp = client.post(
+        "/devices/import", data=_csv_upload("aa:bb:cc:dd:ee:16,X"), content_type="multipart/form-data",
+    )
+    assert resp.status_code == 401
+    assert db_conn.execute("SELECT COUNT(*) c FROM devices").fetchone()["c"] == 0
+
+
+def test_imported_devices_are_plain_unassigned(client, db_conn):
+    """The whole point is a fast way to enter known devices, not a
+    parallel assignment UI -- every imported row must land exactly like
+    a hand-added one via add_device(), fully unassigned."""
+    client.post(
+        "/devices/import", data=_csv_upload("aa:bb:cc:dd:ee:17,X"), headers=_auth_header(),
+        content_type="multipart/form-data",
+    )
+    row = db_conn.execute("SELECT * FROM devices WHERE mac_address = 'aa:bb:cc:dd:ee:17'").fetchone()
+    assert row["user_id"] is None
+    assert row["group_id"] is None
+    assert row["ignored"] == 0
+    assert row["is_authenticated"] == 1
+
+
+def test_settings_page_shows_bulk_import_card(client):
+    resp = client.get("/settings", headers=_auth_header())
+    assert b"Bulk import devices" in resp.data
+
+
 def test_update_device_sets_flags_and_assigns_to_a_kid(client, db_conn):
     client.post("/users/add", data={"username": "kid1", "password": "pw"}, headers=_auth_header())
     user_id = db_conn.execute("SELECT id FROM users WHERE username = 'kid1'").fetchone()[0]
