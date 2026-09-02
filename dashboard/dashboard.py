@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import io
+import ipaddress
 import logging
 import os
 import re
@@ -2009,6 +2010,64 @@ def categories():
     return render("categories", body)
 
 
+_PRIVATE_SUBSCRIPTION_HOST_ERROR = (
+    "That URL points at a private/internal address, which isn't allowed for a "
+    "subscription URL -- it gets fetched automatically by a background job with "
+    "no further checks."
+)
+
+
+def _validate_subscription_url(raw: str) -> tuple[str | None, str | None]:
+    """Validates an admin-supplied category subscription_url before it's
+    ever stored. Returns (normalized_url, None) on success, or
+    (None, error_message) on failure.
+
+    Added 2026-09-02, a real gap found by code review: this field used
+    to be stored with ZERO validation, unlike the sibling
+    add_domain_from_url()'s URL-accepting flow (which strictly checks
+    hostname syntax), despite being fetched server-side later by
+    controller/category_fetch.py's own background sync job with no
+    restriction applied at the point of entry -- an SSRF-adjacent risk
+    if this field is ever pointed at an internal/link-local address
+    (this box's own AdGuard admin API, a router's admin page, a cloud
+    metadata endpoint).
+
+    Mirrors add_domain_from_url()'s scheme/hostname-syntax checks, then
+    goes further: an IP-literal hostname is resolved via the stdlib
+    `ipaddress` module and rejected if it's loopback/link-local/private/
+    reserved -- no legitimate public blocklist subscription is ever a
+    private IP literal. Deliberately NOT a full SSRF fix: a hostname
+    that only RESOLVES to a private address at fetch time (DNS
+    rebinding) isn't caught here, since that needs checking the actual
+    resolved IP at fetch time, in category_fetch.py, not just the
+    stored string -- tracked as a known, smaller residual gap rather
+    than silently claimed as fully closed.
+    """
+    if not re.match(r"^https?://", raw, re.IGNORECASE):
+        raw = "https://" + raw
+    hostname = urlparse(raw).hostname
+    if not hostname or not re.match(
+        r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$", hostname
+    ):
+        return None, "That doesn't look like a valid URL."
+    # "localhost"/"*.localhost" are the obvious non-IP-literal way to
+    # target this same box -- ipaddress.ip_address() below only
+    # recognizes an actual numeric IP string, not a hostname that
+    # merely resolves to loopback, so this needs its own explicit check.
+    lower_host = hostname.lower()
+    if lower_host == "localhost" or lower_host.endswith(".localhost"):
+        return None, _PRIVATE_SUBSCRIPTION_HOST_ERROR
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip = None  # a real hostname, not an IP literal -- nothing further to check here
+    if ip is not None and (
+        ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved or ip.is_multicast
+    ):
+        return None, _PRIVATE_SUBSCRIPTION_HOST_ERROR
+    return raw, None
+
+
 @app.route("/categories/add", methods=["POST"])
 @require_admin
 def add_category():
@@ -2016,6 +2075,10 @@ def add_category():
     subscription_url = request.form.get("subscription_url", "").strip() or None
     if not name:
         return flash_redirect("categories", "Name is required.", error=True)
+    if subscription_url:
+        subscription_url, error = _validate_subscription_url(subscription_url)
+        if error:
+            return flash_redirect("categories", error, error=True)
     conn = get_db()
     try:
         conn.execute(

@@ -2723,6 +2723,43 @@ def test_add_category_requires_a_name(client, db_conn):
     assert db_conn.execute("SELECT * FROM categories").fetchone() is None
 
 
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://127.0.0.1/rules.txt",
+        "http://localhost/rules.txt",
+        "http://169.254.169.254/latest/meta-data/",  # cloud metadata endpoint
+        "http://192.168.1.1/admin",
+        "http://10.0.0.5/internal",
+        "http://[::1]/rules.txt",
+    ],
+)
+def test_add_category_rejects_a_private_subscription_url(client, db_conn, bad_url):
+    """Regression test for a real gap (fixed 2026-09-02): subscription_url
+    used to be stored with zero validation despite being fetched
+    server-side later with no restriction -- an SSRF-adjacent risk if
+    pointed at an internal address (this box's own admin APIs, a
+    router, a cloud metadata endpoint)."""
+    resp = client.post(
+        "/categories/add", data={"name": "Evil", "subscription_url": bad_url}, headers=_auth_header()
+    )
+    assert "error=1" in resp.headers["Location"]
+    assert db_conn.execute("SELECT * FROM categories WHERE name = 'Evil'").fetchone() is None
+
+
+def test_add_category_accepts_a_normal_public_subscription_url(client, db_conn):
+    resp = client.post(
+        "/categories/add",
+        data={"name": "Gambling", "subscription_url": "raw.githubusercontent.com/example/list.txt"},
+        headers=_auth_header(),
+    )
+    assert resp.status_code == 302
+    row = db_conn.execute("SELECT subscription_url FROM categories WHERE name = 'Gambling'").fetchone()
+    assert row["subscription_url"] == "https://raw.githubusercontent.com/example/list.txt", (
+        "a scheme-less URL should be normalized to https://, matching add_domain_from_url()'s own convention"
+    )
+
+
 def test_add_category_rejects_a_duplicate_name(client):
     client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
     resp = client.post("/categories/add", data={"name": "Gambling"}, headers=_auth_header())
