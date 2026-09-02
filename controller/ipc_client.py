@@ -105,7 +105,26 @@ class WorkerClient:
         return cls(sock)
 
     def close(self) -> None:
-        self._sock.close()
+        # Fixed 2026-09-02, a real race found by code review: every
+        # other method here holds self._lock for the duration of its
+        # socket access, but this one didn't -- so a caller's close()
+        # (e.g. run()'s _reconnect() replacing a dead client) could run
+        # concurrently with the heartbeat pacer's own thread still
+        # blocked mid-request inside _read_frame()'s socket.recv() on
+        # this exact object. Closing the fd out from under a thread
+        # blocked in recv() can, on POSIX, let that fd number get
+        # reused by a different socket opened moments later (e.g. the
+        # replacement connection _reconnect() opens right after this
+        # call) -- so the still-blocked recv() could, in the worst
+        # case, read bytes belonging to an unrelated connection instead
+        # of failing cleanly. Holding the same lock every other method
+        # uses serializes this against them the same way -- the tradeoff
+        # is that close() can now itself block on a concurrent in-flight
+        # request, but connect()'s own socket.settimeout() (default 5s)
+        # already bounds how long any single recv() can actually block
+        # for, so this is a bounded wait, not a risk of hanging forever.
+        with self._lock:
+            self._sock.close()
 
     def replace_targets(
         self,

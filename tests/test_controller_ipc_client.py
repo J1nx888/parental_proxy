@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 
 import pytest
 
@@ -318,4 +319,46 @@ def test_concurrent_calls_from_multiple_threads_do_not_corrupt_the_stream():
         )
     finally:
         client.close()
+        worker_sock.close()
+
+
+def test_close_waits_for_an_in_flight_request_instead_of_racing_it():
+    """Regression test for a real race (fixed 2026-09-02): unlike every
+    other WorkerClient method, close() didn't hold self._lock, so it
+    could run concurrently with another thread still blocked mid-request
+    inside _read_frame()'s socket.recv() -- e.g. run()'s _reconnect()
+    closing a client the heartbeat pacer thread is still using.
+    Confirms close() now BLOCKS until an in-flight request's own lock
+    hold ends (here, via that request's own recv() timeout firing),
+    rather than returning immediately and racing it."""
+    client, worker_sock = _make_pair()
+    client._sock.settimeout(0.3)  # short, so the test doesn't wait long
+    try:
+        blocked_call_done = threading.Event()
+
+        def blocked_heartbeat():
+            try:
+                client.heartbeat(1)  # worker never replies -- times out
+            except Exception:  # noqa: BLE001 -- expected: a timeout-driven WorkerConnectionError
+                pass
+            blocked_call_done.set()
+
+        t = threading.Thread(target=blocked_heartbeat)
+        t.start()
+        time.sleep(0.05)  # let the thread actually enter recv() and take the lock first
+
+        started = time.monotonic()
+        client.close()
+        elapsed = time.monotonic() - started
+
+        assert blocked_call_done.is_set(), (
+            "close() returned before the in-flight request finished -- "
+            "it is not actually serialized against a concurrent caller"
+        )
+        assert elapsed >= 0.2, (
+            f"close() returned in {elapsed:.3f}s, far faster than the blocked call's own 0.3s "
+            "timeout -- it did not actually wait for the lock"
+        )
+        t.join(timeout=2)
+    finally:
         worker_sock.close()
