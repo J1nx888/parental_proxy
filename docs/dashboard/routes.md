@@ -692,10 +692,13 @@ the project owner asked for, not only an operational-health trail.
   same client-side `data-filter-table` search box other list pages use,
   a severity badge (`error` reuses the "blocked" red, `recovery` reuses
   "allowed" green), and an empty-state message when nothing has ever
-  failed. Nothing is ever deleted from `system_events` by this route --
-  `EVENT_DISPLAY_LIMIT` only bounds what's DISPLAYED, not what's stored;
-  a future pass could add real pruning if the table's growth ever
-  actually proves to be a problem, not before.
+  failed. This route itself never deletes anything -- `EVENT_DISPLAY_LIMIT`
+  only bounds what's DISPLAYED here, not what's stored. **2026-09-02**:
+  the table itself now has a real cap (`common/system_events.py`'s
+  `_MAX_STORED_EVENTS`, 5000), enforced by `log_event()` pruning back
+  down to it after every insert -- added once failed-login attempts
+  (rate-limited but never fully blocked) made this table's growth
+  attacker-influenceable, not just organic.
 - No write routes on **this page** -- but as of 2026-09-02, this
   dashboard process itself IS one of the writers into `system_events`,
   not only `controller/main.py`'s background loops: `require_admin`

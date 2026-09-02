@@ -31,6 +31,37 @@ def test_log_event_rejects_an_invalid_severity(conn):
     assert conn.execute("SELECT COUNT(*) c FROM system_events").fetchone()["c"] == 0
 
 
+def test_log_event_prunes_back_down_to_the_cap(conn, monkeypatch):
+    """Regression test for a real gap (fixed 2026-09-02): this table had
+    no row cap at all, and became attacker-influenceable once failed
+    login attempts (rate-limited but never fully blocked) started
+    writing here too -- an attacker who never once succeeds could grow
+    it indefinitely. A small cap (monkeypatched down from the real 5000
+    so this test doesn't need to insert thousands of rows) confirms
+    log_event() actually prunes back down to it after every insert,
+    keeping the NEWEST rows."""
+    monkeypatch.setattr(system_events, "_MAX_STORED_EVENTS", 3)
+
+    for i in range(5):
+        system_events.log_event(conn, "adguard_sync", "error", f"failure {i}")
+
+    rows = conn.execute("SELECT message FROM system_events ORDER BY id").fetchall()
+    assert len(rows) == 3, f"expected the table capped at 3 rows, got {len(rows)}"
+    assert [r["message"] for r in rows] == ["failure 2", "failure 3", "failure 4"], (
+        "expected the OLDEST rows pruned, newest 3 kept"
+    )
+
+
+def test_log_event_never_prunes_below_the_cap(conn, monkeypatch):
+    monkeypatch.setattr(system_events, "_MAX_STORED_EVENTS", 10)
+
+    for i in range(3):
+        system_events.log_event(conn, "adguard_sync", "error", f"failure {i}")
+
+    count = conn.execute("SELECT COUNT(*) c FROM system_events").fetchone()["c"]
+    assert count == 3, "pruning must never remove rows when already under the cap"
+
+
 def test_failure_recovery_callbacks_logs_every_failure_occurrence(conn):
     # failure_recovery_callbacks() opens its OWN connection internally
     # (db.get_conn(), per its own docstring) rather than accepting one

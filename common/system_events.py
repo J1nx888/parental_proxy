@@ -38,6 +38,22 @@ import db
 
 _VALID_SEVERITIES = ("error", "recovery")
 
+# Added 2026-09-02, closing a real gap found by code review: this
+# table's own original design (see this module's docstring above) was
+# "not a firehose" purely by construction -- only real failures and
+# their recovery ever get a row, never a routine successful cycle --
+# which was a sound bound when every writer was an organic operational
+# loop. Once dashboard.py/captive_portal_server.py started also writing
+# here for failed login attempts (still rate-limited to a handful per
+# minute per surface per IP, but never fully blocked, only throttled),
+# this table gained its first ATTACKER-CONTROLLED writer: someone who
+# never once succeeds can still grow it indefinitely just by repeatedly
+# failing a login. No cap or pruning existed anywhere -- EVENT_DISPLAY_LIMIT
+# on the /events page only ever bounded what's DISPLAYED, never what's
+# stored. This caps the table itself, independent of who's writing to
+# it or why.
+_MAX_STORED_EVENTS = 5000
+
 
 def log_event(
     conn: sqlite3.Connection, source: str, severity: str, message: str, detail: str | None = None
@@ -48,12 +64,25 @@ def log_event(
     the state machine, this just records" split `common/identity.py`'s
     `record_binding()` uses for its own event log
     (`network_events`, a different table for a different kind of
-    event -- MAC/IP identity changes, not operational failures)."""
+    event -- MAC/IP identity changes, not operational failures).
+
+    Prunes back down to `_MAX_STORED_EVENTS` after every insert (see
+    that constant's own comment for why this exists at all) -- cheap
+    at this table's realistic write rate (rare organic failures, plus a
+    rate-limited handful of failed-login rows per minute at worst), and
+    simpler to reason about than pruning on a schedule: the cap holds
+    after every single write, with no separate periodic job that could
+    fall behind or be forgotten."""
     if severity not in _VALID_SEVERITIES:
         raise ValueError(f"severity must be one of {_VALID_SEVERITIES}, got {severity!r}")
     conn.execute(
         "INSERT INTO system_events (ts, source, severity, message, detail) VALUES (?, ?, ?, ?, ?)",
         (db.now_iso(), source, severity, message, detail),
+    )
+    conn.execute(
+        "DELETE FROM system_events WHERE id NOT IN "
+        "(SELECT id FROM system_events ORDER BY id DESC LIMIT ?)",
+        (_MAX_STORED_EVENTS,),
     )
     conn.commit()
 
