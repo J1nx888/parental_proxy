@@ -75,6 +75,44 @@ def record_binding(
     """
     seen_at = seen_at or db.now_iso()
 
+    # Wrapped in an explicit transaction (fixed 2026-09-02, a real race
+    # found by code review): every statement in _record_binding_locked()
+    # below used to run as its own independent autocommit (common/db.py
+    # opens connections with isolation_level=None), so two
+    # near-simultaneous record_binding() calls for the same IP with
+    # different MACs (plausible: the rtnetlink listener and a periodic
+    # discovery snapshot both observing at once) could each read "no
+    # active conflict" before either wrote its own INSERT, leaving TWO
+    # active=1 device_bindings rows for the same IP --
+    # device_identity.resolve_device()'s `ORDER BY last_seen_at DESC
+    # LIMIT 1` would then pick one nondeterministically, attributing
+    # traffic to the wrong device. `BEGIN IMMEDIATE` acquires SQLite's
+    # write lock up front (not deferred to the first write inside), so
+    # a second concurrent caller blocks here for the whole check-then-
+    # act sequence rather than racing it -- relying on db.get_conn()'s
+    # own `busy_timeout=5000` to wait rather than fail outright.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _record_binding_locked(conn, mac_address, ipv4_address, source, seen_at, confidence)
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
+
+
+def _record_binding_locked(
+    conn: sqlite3.Connection,
+    mac_address: str,
+    ipv4_address: str,
+    source: str,
+    seen_at: str,
+    confidence: float,
+) -> None:
+    """The actual body of record_binding() -- assumed to already be
+    running inside the BEGIN IMMEDIATE transaction that function opens,
+    so every early `return` here is safe: the caller commits (or, on an
+    exception, rolls back) uniformly regardless of how this exits."""
     existing = conn.execute(
         "SELECT id FROM device_bindings WHERE mac_address = ? AND ipv4_address = ?",
         (mac_address, ipv4_address),

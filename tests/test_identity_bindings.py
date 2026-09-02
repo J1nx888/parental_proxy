@@ -3,6 +3,7 @@ conflict handling, and the network_events log."""
 from __future__ import annotations
 
 import json
+import threading
 
 import db
 import identity
@@ -299,3 +300,78 @@ def test_touch_binding_by_ip_ignores_an_inactive_binding_for_the_same_ip(conn):
     assert rows[MAC_A]["last_seen_at"] == "2026-08-29T00:00:00Z"  # untouched
     assert rows[MAC_B]["active"] == 1
     assert rows[MAC_B]["last_seen_at"] == "2026-08-29T02:00:00Z"  # this is the one that got touched
+
+
+# ============================================================
+# Concurrency -- fixed 2026-09-02, a real race found by code review
+# ============================================================
+
+def test_record_binding_never_leaves_two_active_bindings_for_one_ip(conn, monkeypatch):
+    """Regression test for a real bug: record_binding()'s conflict
+    check (is this IP already actively bound to a DIFFERENT mac?) and
+    its own write used to run as separate autocommit statements
+    (common/db.py opens with isolation_level=None) with nothing making
+    the two atomic. Two near-simultaneous callers observing the SAME IP
+    for two DIFFERENT, both-brand-new MACs could each read "no active
+    conflict" before either had written its own row, so neither
+    deactivated the other -- leaving TWO active=1 device_bindings rows
+    for one IP, an invariant nothing else in this codebase expects to
+    ever be violated (device_identity.resolve_device()'s `ORDER BY
+    last_seen_at DESC LIMIT 1` picks one of the two nondeterministically).
+
+    Deterministic, not a hope-the-scheduler-cooperates race:
+    MAC_A's thread is paused (via a monkeypatched
+    _existing_device_id_for_mac, the read that runs right after both
+    conflict checks and before any write for a brand-new IP with no
+    prior bindings) after it has already read "no conflict" but before
+    it writes anything. MAC_B's thread is only started once MAC_A is
+    confirmed paused there. Pre-fix, nothing stops MAC_B from running
+    to completion in the meantime (it also reads "no conflict" and
+    writes its own active row) before MAC_A is released to write its
+    own -- reproducing the bug on every run. Post-fix, MAC_B blocks
+    inside its own BEGIN IMMEDIATE (MAC_A's transaction still holds the
+    write lock) until MAC_A is released and commits, at which point
+    MAC_B's own (now-unblocked) read correctly sees MAC_A's committed
+    row as the real conflict and deactivates it -- no deadlock either
+    way, since MAC_B never itself waits on a signal only MAC_A's own
+    completion can provide."""
+    import identity as identity_module
+
+    mac_a_paused = threading.Event()
+    release_mac_a = threading.Event()
+    real_lookup = identity_module._existing_device_id_for_mac
+
+    def paused_lookup(conn_arg, mac_address):
+        if mac_address == MAC_A:
+            mac_a_paused.set()
+            release_mac_a.wait(timeout=5)
+        return real_lookup(conn_arg, mac_address)
+
+    monkeypatch.setattr(identity_module, "_existing_device_id_for_mac", paused_lookup)
+
+    def call_record_binding(mac):
+        own_conn = db.get_conn()  # sqlite3.Connection objects are thread-affined
+        try:
+            identity.record_binding(own_conn, mac, IP_1, source="rtnetlink")
+        finally:
+            own_conn.close()
+
+    t1 = threading.Thread(target=call_record_binding, args=(MAC_A,))
+    t1.start()
+    assert mac_a_paused.wait(timeout=5), "MAC_A's thread never reached the pause point"
+
+    t2 = threading.Thread(target=call_record_binding, args=(MAC_B,))
+    t2.start()
+    t2.join(timeout=5)  # pre-fix: completes freely. Post-fix: blocked on BEGIN IMMEDIATE, still alive.
+
+    release_mac_a.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)  # post-fix, MAC_B can only finish once MAC_A's commit releases the lock
+
+    active = conn.execute(
+        "SELECT mac_address FROM device_bindings WHERE ipv4_address = ? AND active = 1", (IP_1,)
+    ).fetchall()
+    assert len(active) == 1, (
+        f"expected exactly one active binding for {IP_1}, got {[r['mac_address'] for r in active]} -- "
+        "the conflict-check-then-write sequence let both writers through"
+    )
