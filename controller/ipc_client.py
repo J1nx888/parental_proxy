@@ -18,7 +18,22 @@ PROTOCOL_VERSION = 1
 
 class WorkerError(RuntimeError):
     """Raised when the worker replies with a "fault" message, an
-    unsupported protocol version, or an unexpected op."""
+    unsupported protocol version, or an unexpected op.
+
+    `reason`/`action` (added 2026-09-02) are populated only for a real
+    "fault" reply -- the worker's own structured explanation of what
+    went wrong (e.g. reason="lease_expired",
+    action="entering_repair_only_mode") -- and stay None for every
+    other kind of WorkerError (a malformed frame, an unexpected op, a
+    version mismatch), none of which carry that shape. A caller that
+    needs to react differently to a specific fault (see
+    controller/main.py's run_cycle()) should check these attributes
+    rather than parsing the exception's own message string."""
+
+    def __init__(self, message: str, *, reason: str | None = None, action: str | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.action = action
 
 
 class WorkerConnectionError(WorkerError):
@@ -143,7 +158,9 @@ class WorkerClient:
             raise WorkerError(f"worker replied with unsupported protocol version: {reply!r}")
         if reply.get("op") == "fault":
             raise WorkerError(
-                f"worker fault: reason={reply.get('reason')!r} action={reply.get('action')!r}"
+                f"worker fault: reason={reply.get('reason')!r} action={reply.get('action')!r}",
+                reason=reply.get("reason"),
+                action=reply.get("action"),
             )
         return reply
 

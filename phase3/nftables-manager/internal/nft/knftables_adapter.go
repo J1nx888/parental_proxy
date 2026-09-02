@@ -117,13 +117,49 @@ func (m *Manager) EnsureBaseline(ctx context.Context) error {
 // (nftables can't see hostnames below the TLS layer, so it can't be
 // selective by domain the way Squid can) -- see RoadMap.md's Squid
 // intercept-mode section.
+// tcp dport 853 (DNS-over-TLS) redirects, added 2026-09-02 to close a
+// real, silent DNS-tier bypass found by code review: before this, ONLY
+// port 53 was ever touched, so a device with DoT enabled (e.g. Android's
+// one-tap Settings > Private DNS, no browser setting or technical skill
+// needed) resolved every domain via an encrypted TLS session straight to
+// whatever public resolver it was pointed at, with AdGuard's domain/
+// category/schedule/SafeSearch/anti-DoH rules never in the path at all.
+// Redirecting to :5353 -- the SAME plain-DNS port 53 already redirects
+// to -- is deliberate, not a mistake: AdGuard's listener there speaks
+// plain DNS, not TLS, so a redirected DoT ClientHello simply fails the
+// handshake (this box has no certificate a random public resolver's
+// hostname would validate against, and minting one would mean actually
+// terminating arbitrary TLS, a materially bigger undertaking than
+// blocking). A failed handshake is the desired outcome here, matching
+// how this project already treats an unconfigured bump-mode domain
+// (deny the connection outright, see docs/security/overview.md) rather
+// than attempting to impersonate the far end -- most DNS stacks fall
+// back to their configured plaintext resolver (which IS then correctly
+// filtered) when a DoT upstream is unreachable. No UDP 853 rule needed:
+// DNS-over-TLS is TCP-only (RFC 7858).
+//
+// bump_v4 needs no port-853 rule of its own: a bump-eligible device is
+// ALWAYS also a member of authenticated_v4 (see the "two independent
+// axes" comment above), so the authenticated_v4 rule below already
+// covers it.
+//
+// Known, pre-existing asymmetry NOT addressed here (out of scope for
+// this fix, flagged for a future look): unauthenticated_v4 has no tcp
+// dport 53 rule, only udp -- a PREAUTH device using TCP-based plain DNS
+// (large responses, some resolvers' defaults) would bypass the DNS
+// redirect the same way DoT did, though it can never reach an actual
+// destination beyond this box's own :5353 either way once port 853 is
+// closed off, since PREAUTH's only other open door is tcp/80 to the
+// captive portal.
 var baselineRules = []string{
 	"ip saddr @bypass_v4 return",
 	"ip saddr @bump_v4 tcp dport 80 redirect to :3129",
 	"ip saddr @bump_v4 tcp dport 443 redirect to :3130",
 	"ip saddr @authenticated_v4 udp dport 53 redirect to :5353",
 	"ip saddr @authenticated_v4 tcp dport 53 redirect to :5353",
+	"ip saddr @authenticated_v4 tcp dport 853 redirect to :5353",
 	"ip saddr @unauthenticated_v4 udp dport 53 redirect to :5353",
+	"ip saddr @unauthenticated_v4 tcp dport 853 redirect to :5353",
 	"ip saddr @unauthenticated_v4 tcp dport 80 redirect to :3131",
 	"ip saddr @quarantine_v4 counter drop",
 }

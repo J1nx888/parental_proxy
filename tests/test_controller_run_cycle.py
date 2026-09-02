@@ -79,7 +79,16 @@ def test_successful_cycle_reports_healthy(conn):
         worker_sock.close()
 
 
-def test_worker_fault_reports_fail_open_without_raising(conn):
+def test_lease_expired_fault_reports_repair_only_not_fail_open(conn):
+    """Fixed 2026-09-02: a lease_expired/entering_repair_only_mode fault
+    is the worker's own controlled, self-limiting self-correction (it
+    already restored real MACs and stopped poisoning on its own) --
+    genuinely different from a dead/unreachable worker, and the
+    dashboard has a dedicated amber badge for exactly this distinction
+    (see dashboard/dashboard.py's HEALTH_MODE_BADGE_CLASS). Previously
+    this collapsed into the same red fail_open badge as every other
+    WorkerError, making interception_runtime.mode's 'repair_only' value
+    unreachable dead code."""
     client, worker_sock = _make_client()
     try:
         def fake_worker():
@@ -97,8 +106,38 @@ def test_worker_fault_reports_fail_open_without_raising(conn):
         assert applied is None, "a failed cycle must not fabricate an AppliedState"
 
         row = _runtime_row(conn)
-        assert row["mode"] == "fail_open"
+        assert row["mode"] == "repair_only"
         assert "lease_expired" in row["fail_open_reason"]
+    finally:
+        client.close()
+        worker_sock.close()
+
+
+def test_a_fault_with_a_different_action_still_reports_fail_open(conn):
+    """Only the specific, documented entering_repair_only_mode action
+    gets the amber repair_only treatment -- every other kind of fault
+    (a genuinely unexpected one, or any future fault type that isn't a
+    controlled self-correction) still reports the red fail_open state,
+    same as before this fix."""
+    client, worker_sock = _make_client()
+    try:
+        def fake_worker():
+            _read_line(worker_sock)
+            _send_line(worker_sock, {
+                "v": 1, "op": "fault", "reason": "something_else",
+                "action": "connection_closed",
+            })
+
+        t = threading.Thread(target=fake_worker)
+        t.start()
+        applied = run_cycle(client, _placeholder_desired_state, None, health_conn=conn, policy_conn=None)
+        t.join(timeout=2)
+
+        assert applied is None
+
+        row = _runtime_row(conn)
+        assert row["mode"] == "fail_open"
+        assert "something_else" in row["fail_open_reason"]
     finally:
         client.close()
         worker_sock.close()

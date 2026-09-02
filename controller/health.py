@@ -69,3 +69,37 @@ def report_fail_open(
             (applied_generation, reason),
         )
     conn.commit()
+
+
+def report_repair_only(conn: sqlite3.Connection, reason: str) -> None:
+    """Call this specifically when the worker itself has reported (via
+    its own unsolicited "fault" IPC message, reason="lease_expired",
+    action="entering_repair_only_mode") that it already sent one
+    corrective ARP-restoration round and stopped actively poisoning on
+    its own -- a controlled, self-limiting state, genuinely different
+    from an outright dead/unreachable worker (report_fail_open, above).
+
+    Added 2026-09-02, closing a real gap found by code review:
+    `interception_runtime.mode`'s dedicated 'repair_only' value (with
+    its own amber dashboard badge, distinct from fail_open's red one --
+    see dashboard/dashboard.py's HEALTH_MODE_BADGE_CLASS) previously had
+    no writer anywhere in the codebase; every WorkerError, including
+    this exact fault, collapsed into report_fail_open(), so an admin
+    could never tell "the worker process crashed" apart from "the
+    worker's lease merely expired and it already self-corrected."
+
+    Kept as its own function (not a mode= parameter bolted onto
+    report_fail_open) so a future third state is just as easy to add
+    without threading a growing enum through one function's signature.
+    Deliberately leaves applied_generation untouched, same reasoning as
+    report_fail_open's own None-generation case: the worker's own
+    internal state changed here, not the IPC round-trip that would
+    produce a fresh generation to report."""
+    conn.execute(
+        "INSERT INTO interception_runtime (singleton_id, mode, fail_open_reason) "
+        "VALUES (1, 'repair_only', ?) "
+        "ON CONFLICT(singleton_id) DO UPDATE SET mode = 'repair_only', "
+        "fail_open_reason = excluded.fail_open_reason",
+        (reason,),
+    )
+    conn.commit()

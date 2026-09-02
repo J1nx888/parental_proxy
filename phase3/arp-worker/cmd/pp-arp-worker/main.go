@@ -13,6 +13,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -49,6 +50,13 @@ func main() {
 		log.Fatalf("resolve interface %s: %v", *ifaceName, err)
 	}
 
+	// Queried directly from the OS, not trusted from anything the
+	// controller sends -- see controllerHandler.selfIP's own comment.
+	selfIP, subnet, err := firstIPv4Addr(ifi)
+	if err != nil {
+		log.Fatalf("determine %s's own IPv4 address: %v", *ifaceName, err)
+	}
+
 	sender, err := arpio.Dial(ifi)
 	if err != nil {
 		log.Fatalf("dial ARP client on %s (needs CAP_NET_RAW): %v", *ifaceName, err)
@@ -61,7 +69,7 @@ func main() {
 	}
 	w := worker.New(sender, ifi.HardwareAddr, cfg)
 
-	h := &controllerHandler{worker: w}
+	h := &controllerHandler{worker: w, selfIP: selfIP, subnet: subnet}
 	h.lease = worker.NewLeaseMonitor(cfg.Interval, *leaseMissedCycles, h.onLeaseExpired)
 	defer h.lease.Stop()
 
@@ -70,6 +78,7 @@ func main() {
 		log.Fatalf("listen on %s: %v", *socketPath, err)
 	}
 	defer srv.Close()
+	h.notifier = srv // see controllerHandler.notifier's own comment on this ordering
 
 	go func() {
 		if err := srv.Serve(); err != nil {
@@ -111,6 +120,22 @@ func watchdogLoop() {
 type controllerHandler struct {
 	worker *worker.Worker
 	lease  *worker.LeaseMonitor
+	// selfIP/subnet (added 2026-09-02) are this worker's own bound
+	// interface's IPv4 address/network, queried directly from the OS at
+	// startup (see firstIPv4Addr) rather than trusted from anything the
+	// controller sends -- used by HandleReplaceTargets to run every
+	// candidate target through worker.ValidateTargets before it's ever
+	// handed to ApplyGeneration. See that call site's own comment for
+	// why bypass_v4 isn't checked here yet too.
+	selfIP net.IP
+	subnet *net.IPNet
+	// notifier is set once, right after ipc.Listen returns (see main()
+	// below) -- necessarily after this struct itself is constructed,
+	// since ipc.Listen needs the handler as an argument. onLeaseExpired
+	// only ever fires later, once the lease monitor's own timer expires
+	// (at the earliest, one full lease duration after startup), so this
+	// ordering is safe in practice; nil-checked below regardless.
+	notifier *ipc.Server
 }
 
 func (h *controllerHandler) HandleReplaceTargets(m ipc.ReplaceTargets) []any {
@@ -128,13 +153,31 @@ func (h *controllerHandler) HandleReplaceTargets(m ipc.ReplaceTargets) []any {
 		targets = append(targets, worker.Target{IP: ip, MAC: mac})
 	}
 
-	// TODO(Milestone 2 hardening): run these through
-	// worker.ValidateTargets (gateway/self/broadcast/multicast/bypass
-	// rejection) before ApplyGeneration -- the controller is expected
-	// to have already filtered bypass_v4 out, but the worker should
-	// not trust that blindly. Needs the subnet and bypass set threaded
-	// through from a controller-supplied field not yet in the wire
-	// schema; left as an open item rather than guessed at here.
+	// Fixed 2026-09-02 (was a TODO, and dead-code review separately
+	// found this simply wasn't being called at all): run every
+	// candidate through worker.ValidateTargets before it's ever handed
+	// to ApplyGeneration, so a controller-side bug or race can't make
+	// this worker send poisoning ARPs claiming ownership of the gateway,
+	// broadcast, multicast, or its own address -- see safety.go's own
+	// doc comment.
+	//
+	// bypass_v4 is still NOT checked here (passing nil for that
+	// parameter) -- unlike self/gateway/broadcast/multicast, which this
+	// handler can determine entirely on its own (selfIP/subnet are
+	// queried from the OS at startup, gw comes from this same message),
+	// the bypass set is authoritative only on the controller's side
+	// (device_bindings/devices.ignored) and isn't part of the
+	// replace_targets wire schema today. Closing that residual gap
+	// needs a new wire field threaded through
+	// controller/ipc_client.py's replace_targets() and its callers, not
+	// something to guess at here -- tracked as a separate follow-up.
+	accepted, rejected := worker.ValidateTargets(h.selfIP, gw, h.subnet, nil, targets)
+	for _, r := range rejected {
+		log.Printf("rejected target %s (%s): %s", r.Target.IP, r.Target.MAC, r.Reason)
+		failures = append(failures, r.Target.IP.String())
+	}
+	targets = accepted
+
 	gen := worker.Generation{ID: m.Generation, Gateway: gw, Targets: targets, FullDuplex: m.FullDuplex}
 	h.worker.ApplyGeneration(context.Background(), gen)
 	h.lease.Rearm() // a fresh replace_targets is exactly the "must not auto-resume without an explicit new generation" trigger from the design doc
@@ -162,6 +205,33 @@ func (h *controllerHandler) HandleShutdown(m ipc.ShutdownMsg) []any {
 func (h *controllerHandler) onLeaseExpired() {
 	log.Print("lease expired: no heartbeat received in time, entering repair-only mode")
 	h.worker.Shutdown() // sends one corrective round and drops the stale generation, per the design doc's lease rule
+
+	// Fixed 2026-09-02: this used to be the ENTIRE function -- a purely
+	// local log line, with no way for the controller (or, through it,
+	// the admin dashboard) to ever learn this happened at all. For a
+	// household with an unchanging device list, controller/reconcile.py
+	// only sends a fresh replace_targets (the only thing that re-arms
+	// this lease) when desired state actually changes, so nothing would
+	// ever prompt the worker to speak again -- interception silently and
+	// permanently stopped while interception_runtime.mode kept reading
+	// "running" forever. h.notifier is nil only in the narrow startup
+	// window before ipc.Listen returns (see main(), below) -- lease
+	// expiry can't fire before then, since LeaseMonitor needs at least
+	// one full lease duration to elapse first, but this is checked
+	// rather than assumed.
+	if h.notifier != nil {
+		err := h.notifier.Notify(ipc.Fault{
+			V: ipc.ProtocolVersion, Op: "fault",
+			Reason: "lease_expired", Action: "entering_repair_only_mode",
+		})
+		if err != nil {
+			// No active connection to notify -- the controller is
+			// already disconnected (it'll notice this same repair-only
+			// state some other way, e.g. its own heartbeat timing out),
+			// not a reason to treat this as a fatal worker-side error.
+			log.Printf("could not notify controller of lease expiry (no active connection?): %v", err)
+		}
+	}
 }
 
 func parseMACOrNil(s string) net.HardwareAddr {
@@ -170,4 +240,30 @@ func parseMACOrNil(s string) net.HardwareAddr {
 		return nil
 	}
 	return mac
+}
+
+// firstIPv4Addr returns ifi's own IPv4 address and subnet -- used to
+// populate controllerHandler.selfIP/subnet so worker.ValidateTargets
+// can reject a candidate target that is this worker's own address or
+// that subnet's broadcast address (see safety.go's own doc comment on
+// why that matters), without trusting either value from the
+// controller. An interface can carry more than one address; the first
+// IPv4 one found is used, matching this project's existing assumption
+// elsewhere that the worker's LAN-facing interface has exactly one
+// IPv4 address that matters.
+func firstIPv4Addr(ifi *net.Interface) (net.IP, *net.IPNet, error) {
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return nil, nil, fmt.Errorf("list addresses on %s: %w", ifi.Name, err)
+	}
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ip4 := ipNet.IP.To4(); ip4 != nil {
+			return ip4, ipNet, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("no IPv4 address found on %s", ifi.Name)
 }

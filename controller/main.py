@@ -60,7 +60,7 @@ import rtnetlink_listener
 import health
 import sdnotify
 import system_events
-from ipc_client import Target, WorkerClient, WorkerConnectionError
+from ipc_client import Target, WorkerClient, WorkerConnectionError, WorkerError
 from lease import HeartbeatPacer
 from reconcile import AppliedState, DesiredState, reconcile
 
@@ -316,10 +316,25 @@ def run(
     # actually detect this.
     heartbeat_worker_dead = threading.Event()
 
+    # Added 2026-09-02, same cross-thread-signaling shape as
+    # heartbeat_worker_dead above: the worker's own unsolicited
+    # lease-expiry fault (see phase3/arp-worker's ipc.Server.Notify) is
+    # asynchronous, so it can arrive as the "reply" to whichever request
+    # this connection happens to send next -- which, in practice, is
+    # often a routine heartbeat rather than run_cycle()'s own
+    # replace_targets/reconcile call. run_cycle()'s docstring documents
+    # it as the sole writer of health_conn's mode column specifically to
+    # avoid two threads racing on that write, so this thread must NOT
+    # call health.report_repair_only() directly -- it only records the
+    # reason here; the main loop below performs the actual write.
+    heartbeat_repair_only = {"reason": None}
+
     def _on_heartbeat_error(exc: Exception) -> None:
         log.warning("heartbeat failed: %s", exc)
         if isinstance(exc, WorkerConnectionError):
             heartbeat_worker_dead.set()
+        elif isinstance(exc, WorkerError) and exc.action == "entering_repair_only_mode":
+            heartbeat_repair_only["reason"] = str(exc)
         # No system_events recovery-transition tracking here (unlike the
         # loops below) -- a dead worker already surfaces via the Health
         # page's own fail_open state, and reconnect logic already lives
@@ -443,6 +458,16 @@ def run(
                     )
                 except WorkerConnectionError as exc:
                     _reconnect(str(exc))
+                # Checked AFTER run_cycle(), on the main thread, same
+                # single-writer discipline as every other health_conn
+                # write here -- see heartbeat_repair_only's own comment
+                # above for why the heartbeat thread itself never calls
+                # health.report_repair_only() directly.
+                repair_reason = heartbeat_repair_only["reason"]
+                if repair_reason is not None:
+                    heartbeat_repair_only["reason"] = None
+                    if health_conn is not None:
+                        health.report_repair_only(health_conn, repair_reason)
             time.sleep(poll_interval)
     finally:
         pacer.stop()
@@ -534,6 +559,24 @@ def run_cycle(
                 health.report_healthy(health_conn, applied.generation if applied else 0)
     except WorkerConnectionError:
         raise  # let run() handle reconnection -- see this function's own docstring
+    except WorkerError as exc:
+        # A real reply from a live worker, just an unhappy one -- most
+        # commonly the worker's own unsolicited lease-expiry fault
+        # (added 2026-09-02: the worker now actually sends this instead
+        # of silently self-correcting with zero signal, see
+        # phase3/arp-worker's ipc.Server.Notify). Distinguish that
+        # specific, self-limiting case (repair_only -- the worker
+        # already restored real MACs and stopped poisoning on its own)
+        # from every other WorkerError (fail_open), so the dashboard's
+        # amber vs. red badge actually means something -- see
+        # health.report_repair_only()'s own docstring for why this was
+        # previously unreachable.
+        log.warning("reconcile cycle failed: %s", exc)
+        if health_conn is not None:
+            if exc.action == "entering_repair_only_mode":
+                health.report_repair_only(health_conn, str(exc))
+            else:
+                health.report_fail_open(health_conn, str(exc))
     except Exception as exc:  # noqa: BLE001 -- deliberately broad, see run()'s own docstring
         log.warning("reconcile cycle failed: %s", exc)
         if health_conn is not None:

@@ -223,3 +223,68 @@ func TestEnsureBaseline_IsIdempotentAcrossRepeatedCalls(t *testing.T) {
 			len(baselineRules), len(rulesAfterSecond))
 	}
 }
+
+// TestBaselineRules_RedirectsDNSOverTLS is a regression test for a real
+// DNS-tier bypass found by code review (2026-09-02): before this fix,
+// baselineRules only ever touched port 53, so a device with
+// DNS-over-TLS enabled (e.g. Android's one-tap Settings > Private DNS)
+// resolved every domain over an encrypted TCP/853 session this project
+// never saw at all, bypassing every domain/category/schedule/SafeSearch
+// rule. Confirms the fix at the same Go-slice level a future accidental
+// removal of these two lines would be caught at.
+func TestBaselineRules_RedirectsDNSOverTLS(t *testing.T) {
+	want := []string{
+		"ip saddr @authenticated_v4 tcp dport 853 redirect to :5353",
+		"ip saddr @unauthenticated_v4 tcp dport 853 redirect to :5353",
+	}
+	for _, w := range want {
+		found := false
+		for _, r := range baselineRules {
+			if r == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected baselineRules to contain %q (DNS-over-TLS redirect), it did not -- full ruleset: %v", w, baselineRules)
+		}
+	}
+}
+
+// TestEnsureBaseline_InstallsDNSOverTLSRedirect_AgainstFake is the
+// stronger, end-to-end version of the test above: confirms
+// EnsureBaseline actually installs both port-853 rules into the real
+// prerouting chain (via knftables' own in-memory Fake), not just that
+// the Go source slice happens to contain the right strings.
+func TestEnsureBaseline_InstallsDNSOverTLSRedirect_AgainstFake(t *testing.T) {
+	fake := knftables.NewFake(knftables.InetFamily, "parental_proxy")
+	m := &Manager{nft: fake}
+	ctx := context.Background()
+
+	if err := m.EnsureBaseline(ctx); err != nil {
+		t.Fatalf("EnsureBaseline: %v", err)
+	}
+
+	rules, err := fake.ListRules(ctx, "prerouting")
+	if err != nil {
+		t.Fatalf("ListRules: %v", err)
+	}
+
+	wantAuth := "ip saddr @authenticated_v4 tcp dport 853 redirect to :5353"
+	wantUnauth := "ip saddr @unauthenticated_v4 tcp dport 853 redirect to :5353"
+	var gotAuth, gotUnauth bool
+	for _, r := range rules {
+		switch r.Rule {
+		case wantAuth:
+			gotAuth = true
+		case wantUnauth:
+			gotUnauth = true
+		}
+	}
+	if !gotAuth {
+		t.Errorf("expected the real prerouting chain to contain %q after EnsureBaseline, it did not", wantAuth)
+	}
+	if !gotUnauth {
+		t.Errorf("expected the real prerouting chain to contain %q after EnsureBaseline, it did not", wantUnauth)
+	}
+}
