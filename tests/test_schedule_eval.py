@@ -45,6 +45,33 @@ def test_same_day_window_inactive_on_unscheduled_day():
     assert schedule_eval.schedule_is_active(_schedule(), now) is False
 
 
+def test_equal_start_and_end_time_means_active_all_day():
+    """Regression test for a real bug (fixed 2026-09-02): "00:00" to
+    "00:00" is the natural way an admin would type "block all day," but
+    the same-day branch's own [start, end) range is empty when start ==
+    end, so this used to silently never activate, on any day, at any
+    hour."""
+    schedule = _schedule(start_time="00:00", end_time="00:00")
+    for hour in (0, 6, 12, 18, 23):
+        now = datetime(2026, 8, 31, hour, 30, tzinfo=timezone.utc)  # Monday, a scheduled day
+        assert schedule_eval.schedule_is_active(schedule, now) is True, f"expected active at {hour:02d}:30"
+
+
+def test_equal_start_and_end_time_still_respects_days_of_week():
+    schedule = _schedule(start_time="00:00", end_time="00:00")
+    now = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)  # Saturday -- not scheduled
+    assert schedule_eval.schedule_is_active(schedule, now) is False
+
+
+def test_a_genuine_nonzero_equal_time_also_means_all_day():
+    # Not just the "00:00" special case -- ANY equal start/end (e.g. an
+    # admin picking "09:00" to "09:00" by mistake, or deliberately)
+    # means "the whole day" under this same fix, not just midnight.
+    schedule = _schedule(start_time="09:00", end_time="09:00")
+    now = datetime(2026, 8, 31, 3, 0, tzinfo=timezone.utc)  # well before 09:00
+    assert schedule_eval.schedule_is_active(schedule, now) is True
+
+
 def test_overnight_window_active_in_evening_leg():
     bedtime = _schedule(days_of_week="mon", start_time="21:00", end_time="06:00")
     now = datetime(2026, 8, 31, 22, 0, tzinfo=timezone.utc)  # Monday 22:00

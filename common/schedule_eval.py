@@ -56,7 +56,20 @@ def schedule_is_active(schedule_row: sqlite3.Row, now_utc: datetime) -> bool:
     now_minutes = local.hour * 60 + local.minute
     today_code = _DAY_CODES[local.weekday()]
 
-    if start_minutes <= end_minutes:
+    if start_minutes == end_minutes:
+        # Fixed 2026-09-02, a real bug found by code review: equal
+        # start/end times (e.g. "00:00" to "00:00") is the natural way
+        # an admin would type "block all day" -- but the same-day
+        # branch below evaluates `start_minutes <= now_minutes <
+        # end_minutes`, which is X <= now < X for any X, a range no
+        # integer ever satisfies. That silently made a full-day
+        # lockout schedule NEVER activate, on any day, with no error
+        # anywhere to reveal why. Treated as "active all day on a
+        # scheduled day" instead, matching what an admin who typed this
+        # almost certainly meant.
+        return today_code in days
+
+    if start_minutes < end_minutes:
         # Same-day window: active only on a scheduled day, only inside
         # [start, end).
         return today_code in days and start_minutes <= now_minutes < end_minutes
