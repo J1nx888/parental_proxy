@@ -71,9 +71,17 @@ def _reject_cross_origin_writes():
 
 
 def get_db():
-    conn = db.get_conn()
-    db.init_db(conn)
-    return conn
+    # Fixed 2026-09-02, a real efficiency gap found by code review:
+    # this used to also call db.init_db(conn) here -- re-executing the
+    # entire 29-statement CREATE TABLE IF NOT EXISTS schema script plus
+    # _migrate()'s 3 PRAGMA table_info introspection queries on EVERY
+    # single request. The schema is a property of the database FILE,
+    # not of any one connection, so it only ever needs establishing
+    # once per process lifetime -- done explicitly at import time,
+    # right before bootstrap_admin() (see the bottom of this file),
+    # rather than as a side effect of every route handler's own call
+    # here.
+    return db.get_conn()
 
 
 # ==========================================================
@@ -4092,6 +4100,7 @@ def update_admin():
     return flash_redirect("settings_page", "Saved.")
 
 
+db.init_db()  # once per process, not per request -- see get_db()'s own comment above
 bootstrap_admin()
 
 _boot_conn = db.get_conn()
