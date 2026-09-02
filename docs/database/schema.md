@@ -352,7 +352,20 @@ captive-portal gate's own flag, live as of Phase 4 (`dashboard/captive_portal_se
 admin creates directly through the dashboard (implies trust), but
 `common/identity.py`'s `record_binding()` now overrides it to 0 for a
 genuinely new, auto-discovered MAC (Phase 4 milestone 1), landing it in
-`PolicyClass.PREAUTH` until it logs in; `bypass_login` = exempts a
+`PolicyClass.PREAUTH` until it logs in. **Confirmed live, not just by
+design, 2026-09-02**: `dashboard.py`'s `add_device()`/`import_devices()`
+were checked and neither one ever sets `is_authenticated`, so a bulk-
+imported or hand-added device really does land fully authenticated with
+zero captive-portal gate -- initially mistaken for a regression of the
+same bug `bypass_login` had (see below), until the project owner
+clarified the real motivating case: a browser-less IoT device (a smart
+plug, a thermostat -- anything that can never render the portal's login
+page) would be permanently, unrecoverably locked out if gated the same
+way an auto-discovered MAC is. Admin-entered = known/trusted = the
+vouching act itself, the same way "never seen this MAC before" is
+treated as not-vouched-for and gated. Do not "fix" this asymmetry.
+
+`bypass_login` = exempts a
 device from the LOGIN requirement specifically (not from interception
 or policy generally, unlike `ignored`) -- **real bug found and fixed
 2026-08-31**: `classify_device()` never actually consulted this column

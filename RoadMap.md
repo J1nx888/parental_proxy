@@ -1399,7 +1399,75 @@ also passes. Full auto-discovery (`--no-discovery`/`--no-rtnetlink`/
 `--no-active-scan` all removed) also still needs its own dedicated,
 deliberately separate verification pass before real deployment, now
 that the scope-control bug that motivated disabling it is understood
-and fixed.
+and fixed -- see below: the discovery/classification half of this was
+verified the same day (Phase A), deliberately with `arp-worker` kept
+idle throughout, so it still hasn't been proven safe to let a newly-
+discovered device actually become a live poisoning target
+automatically at real-household scale. That composition -- discovery
+enabled AND arp-worker actually acting on it -- is the remaining,
+separate step.
+
+### Discovery re-verification + captive-portal live check (2026-09-02, same day as G1)
+
+Two of the soak-test prerequisites listed above got done the same day,
+both deliberately zero-risk (no ARP poisoning involved in either):
+
+**Phase A -- discovery re-verification.** Ran `controller` alone
+(discovery/rtnetlink/active_scan all enabled, the opposite of the G1
+override) with `arp-worker` present-but-idle and `--poll-interval=3600`
+as a deterministic hour-long safety window, instead of racing the
+default 5s reconciliation interval -- `nftables-manager` deliberately
+not started at all. 8 real household devices were discovered within 15
+seconds and held steady; all classified correctly (`ignored=0`,
+`is_authenticated=0`, the intended pending default). Every discovered
+device was bulk-marked `ignored=1` in one atomic update before anything
+else, well inside the safety window.
+
+Two real, non-dangerous findings from inspecting the raw data:
+- Bark Home's known spoofing MAC got recorded as bound to both its real
+  IP and the gateway's IP it's currently impersonating -- discovery
+  can't distinguish real ownership from active spoofing by design.
+  Not dangerous: `phase3/arp-worker`'s own `ValidateTargets` rejects
+  anything matching the configured gateway IP regardless of what the
+  DB says, independent of this.
+- A device that had changed IP earlier the same day showed two
+  simultaneously "active" bindings (a stale, not-yet-expired entry for
+  the old IP alongside the real one for the new IP) -- direct, concrete
+  confirmation of the DHCP-renewal auto-detection gap already noted as
+  deferred earlier the same day (Row 9's auto-detection half).
+
+**Captive portal + admin workflows -- live end-to-end check.** Brought
+up `proxy` + `dashboard` only (no `arp-worker`, no ARP poisoning
+possible) and exercised the real HTTP routes directly over the LAN
+(the captive portal binds `0.0.0.0:3131` by design; the admin dashboard
+stays `127.0.0.1`-only -- verified via real HTTP Basic Auth over SSH,
+not by temporarily exposing it further than necessary). All confirmed
+working against the real code, not mocked:
+- The "Sign in to use the internet" page genuinely renders for an
+  unauthenticated device, not open internet.
+- Regular sign-in (real user, real form submission) correctly set
+  `is_authenticated=1` and `user_id` on the calling device.
+- The portal's own admin-bypass form (real generated admin credentials)
+  correctly matched the calling device by its real source IP and set
+  `bypass_login=1` on it.
+- The dashboard's CSV bulk-import route (real multipart upload) created
+  a real device row correctly.
+
+**One near-miss worth recording honestly**: the imported device landed
+`is_authenticated=1` (fully authenticated, zero captive-portal gate),
+which was initially flagged as a likely regression of the exact bug
+`bypass_login` had before 2026-08-31 (see `docs/database/schema.md`'s
+`devices` section). It is NOT a bug -- the project owner clarified the
+real motivating case before anything was changed: several real
+household IoT devices (smart plugs, etc.) have no way to ever render a
+browser or complete the captive-portal login, so gating them the same
+way an auto-discovered MAC is gated would be a permanent, unrecoverable
+lockout with no path to fix it after the fact. An admin manually typing
+in or bulk-importing a MAC IS the vouching act, the same way "never
+seen this MAC before" is treated as not-vouched-for. Documented in
+`dashboard.py`'s `add_device()`/`import_devices()` directly (not just
+here) specifically so a future pass doesn't make the same near-miss for
+real.
 
 ### New database tables planned
 

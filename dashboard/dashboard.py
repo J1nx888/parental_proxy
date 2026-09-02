@@ -2716,6 +2716,21 @@ def devices():
 @app.route("/devices/add", methods=["POST"])
 @require_admin
 def add_device():
+    # Deliberately does NOT set is_authenticated -- it falls through to
+    # the devices table's own schema default of 1 (fully authenticated,
+    # zero captive-portal gate), unlike common/identity.py's
+    # _create_pending_device() which explicitly sets 0 for an
+    # auto-discovered MAC. This is NOT the same bug that path was fixed
+    # for -- verified live 2026-09-02 and confirmed intentional: an
+    # admin manually typing in a MAC IS the vouching act (the same way
+    # "never seen this MAC before" is treated as NOT vouched-for and
+    # gated), and it's the only way a browser-less device (a smart
+    # plug, a thermostat -- anything that can never render the captive
+    # portal's login page) can ever get online at all. Auto-discovered
+    # = unknown = gated; admin-entered = known = trusted. Do not "fix"
+    # this to match discovery's default without re-reading
+    # docs/database/schema.md's `devices` section first -- doing so
+    # would permanently lock out real household IoT devices.
     mac = normalize_mac(request.form.get("mac_address", ""))
     if mac is None:
         return flash_redirect(
@@ -2752,6 +2767,17 @@ def import_devices():
     desired profile/group" step this was asked for is just the existing
     Devices list's per-row Manage link; deliberately not a second,
     parallel assignment UI duplicating what's already there.
+
+    Also same as add_device() above: is_authenticated is never set here
+    either, so it falls through to the schema default of 1 -- verified
+    live 2026-09-02 that a bulk-imported device lands fully authenticated
+    with zero captive-portal gate, and confirmed intentional, not a gap.
+    This is the actual point of bulk import for a real household: a
+    browser-less IoT device (a smart plug, a thermostat) can never
+    render the captive portal's login page, so admin-imported = known/
+    trusted = immediate access is the only way such a device can ever
+    get online at all. See add_device()'s own comment and
+    docs/database/schema.md's `devices` section before changing this.
 
     CSV format: one row per device, `mac_address,label` (label
     optional). A header row is auto-detected and skipped -- if the
