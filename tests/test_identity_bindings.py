@@ -362,7 +362,14 @@ def test_record_binding_never_leaves_two_active_bindings_for_one_ip(conn, monkey
 
     t2 = threading.Thread(target=call_record_binding, args=(MAC_B,))
     t2.start()
-    t2.join(timeout=5)  # pre-fix: completes freely. Post-fix: blocked on BEGIN IMMEDIATE, still alive.
+    # Deliberately short relative to db.get_conn()'s 5s busy_timeout (common/db.py):
+    # pre-fix, an unblocked MAC_B finishes in milliseconds, so 1s is ample margin
+    # to observe that. Post-fix, MAC_B is parked inside BEGIN IMMEDIATE behind
+    # MAC_A's write lock and is still alive here. Using anything close to 5s would
+    # race MAC_B's own busy_timeout against release_mac_a.set() below and could
+    # make MAC_B's BEGIN IMMEDIATE time out for real on a loaded machine instead of
+    # waiting for MAC_A -- exactly the flake this margin avoids.
+    t2.join(timeout=1.0)
 
     release_mac_a.set()
     t1.join(timeout=10)
