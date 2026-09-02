@@ -211,8 +211,39 @@ def build_anti_doh_rules() -> list[str]:
     return [_domain_rule_unscoped(d) for d in _DOH_CANARY_DOMAINS + _DOH_PROVIDER_DOMAINS]
 
 
+def _fetch_eligible_devices(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Every currently-bound, non-BYPASS device -- the shared "who does
+    AdGuard-side enforcement apply to right now" query duplicated,
+    before 2026-09-02, between `_build_domain_deny_rules()` and
+    `build_category_deny_rules()` (identical query, identical
+    `classify_device() != PolicyClass.BYPASS` filter, copy-pasted).
+    `sync_once()` now calls this exactly once per cycle and threads the
+    result into all three callers via their own `eligible_devices`
+    parameter, instead of each independently re-querying and
+    re-classifying the full device list -- on a household of 15 devices
+    and 40 bump/splice domains, the nested per-domain/per-device
+    authorization check inside `_build_domain_deny_rules()` alone made
+    this query (and the classification pass over it) run 2-3x more than
+    necessary every single cycle."""
+    devices = conn.execute(
+        """
+        SELECT DISTINCT d.id, d.user_id, d.group_id, d.ignored, d.quarantined_at,
+               d.is_authenticated, d.bump_enabled, d.bypass_login, b.ipv4_address
+        FROM devices d
+        JOIN device_bindings b ON b.device_id = d.id AND b.active = 1
+        ORDER BY b.ipv4_address
+        """
+    ).fetchall()
+    return [row for row in devices if classify_device(row) != PolicyClass.BYPASS]
+
+
 def _build_domain_deny_rules(
-    conn: sqlite3.Connection, mode: str, *, require_bump_eligible: bool, block_page_ip: str | None = None,
+    conn: sqlite3.Connection,
+    mode: str,
+    *,
+    require_bump_eligible: bool,
+    block_page_ip: str | None = None,
+    eligible_devices: list[sqlite3.Row] | None = None,
 ) -> list[str]:
     """Shared engine behind `build_rules()` (`mode='bump'`) and
     `build_splice_deny_rules()` (`mode='splice'`) -- see each's own
@@ -286,6 +317,14 @@ def _build_domain_deny_rules(
     Returns an empty list when there are no domains of this mode
     configured at all, or no non-BYPASS device currently has a known IP
     -- both legitimate "nothing to deny yet" states, not errors.
+
+    `eligible_devices` (added 2026-09-02): pass the result of a single
+    `_fetch_eligible_devices(conn)` call to reuse it across multiple
+    builders in one `sync_once()` cycle instead of each re-querying and
+    re-classifying the full device list -- see that function's own
+    docstring. Defaults to `None`, which fetches it fresh (unchanged
+    behavior for any direct caller, e.g. existing tests, that doesn't
+    pass one in).
     """
     domains = conn.execute(
         "SELECT pattern, id, is_global FROM domains WHERE mode = ? ORDER BY id", (mode,)
@@ -293,16 +332,8 @@ def _build_domain_deny_rules(
     if not domains:
         return []
 
-    devices = conn.execute(
-        """
-        SELECT DISTINCT d.id, d.user_id, d.group_id, d.ignored, d.quarantined_at,
-               d.is_authenticated, d.bump_enabled, d.bypass_login, b.ipv4_address
-        FROM devices d
-        JOIN device_bindings b ON b.device_id = d.id AND b.active = 1
-        ORDER BY b.ipv4_address
-        """
-    ).fetchall()
-    eligible_devices = [row for row in devices if classify_device(row) != PolicyClass.BYPASS]
+    if eligible_devices is None:
+        eligible_devices = _fetch_eligible_devices(conn)
     if not eligible_devices:
         return []
 
@@ -320,7 +351,11 @@ def _build_domain_deny_rules(
     return rules
 
 
-def build_rules(conn: sqlite3.Connection, block_page_ip: str | None = None) -> list[str]:
+def build_rules(
+    conn: sqlite3.Connection,
+    block_page_ip: str | None = None,
+    eligible_devices: list[sqlite3.Row] | None = None,
+) -> list[str]:
     """The complete list of managed hard-deny rules for right now: one
     rule per `mode = 'bump'` domain, denying every device that isn't BOTH
     currently `bump_eligible()` (`common/policy_class.py`) AND actually
@@ -353,10 +388,16 @@ def build_rules(conn: sqlite3.Connection, block_page_ip: str | None = None) -> l
     at all, or no device needs denying -- both legitimate "nothing to
     deny yet" states, not errors.
     """
-    return _build_domain_deny_rules(conn, "bump", require_bump_eligible=True, block_page_ip=block_page_ip)
+    return _build_domain_deny_rules(
+        conn, "bump", require_bump_eligible=True, block_page_ip=block_page_ip, eligible_devices=eligible_devices
+    )
 
 
-def build_splice_deny_rules(conn: sqlite3.Connection, block_page_ip: str | None = None) -> list[str]:
+def build_splice_deny_rules(
+    conn: sqlite3.Connection,
+    block_page_ip: str | None = None,
+    eligible_devices: list[sqlite3.Row] | None = None,
+) -> list[str]:
     """One hard-deny rule per `mode = 'splice'` domain, scoped to every
     currently-bound device NOT authorized for it per
     `matching.device_domain_reason()` (common/matching.py) -- the DNS-tier
@@ -387,7 +428,9 @@ def build_splice_deny_rules(conn: sqlite3.Connection, block_page_ip: str | None 
     `_domain_rule()` call, same `$client=`-scoping, same optional
     `$dnsrewrite` block-page redirect.
     """
-    return _build_domain_deny_rules(conn, "splice", require_bump_eligible=False, block_page_ip=block_page_ip)
+    return _build_domain_deny_rules(
+        conn, "splice", require_bump_eligible=False, block_page_ip=block_page_ip, eligible_devices=eligible_devices
+    )
 
 
 def _category_domain_patterns(conn: sqlite3.Connection, category_id: int) -> list[str]:
@@ -412,7 +455,10 @@ def _category_domain_patterns(conn: sqlite3.Connection, category_id: int) -> lis
 
 
 def build_category_deny_rules(
-    conn: sqlite3.Connection, now: datetime | None = None, block_page_ip: str | None = None
+    conn: sqlite3.Connection,
+    now: datetime | None = None,
+    block_page_ip: str | None = None,
+    eligible_devices: list[sqlite3.Row] | None = None,
 ) -> list[str]:
     """DNS-tier enforcement for every category AT OR UNDER
     `matching.MAX_SCOPED_CATEGORY_DOMAINS` -- a category over that many
@@ -436,6 +482,12 @@ def build_category_deny_rules(
     `now` defaults to the current UTC instant; tests inject a fixed
     value, same convention as `controller/policy_state.py`'s
     `compute_desired_policy()`.
+
+    `eligible_devices` (added 2026-09-02): same shared-fetch parameter
+    as `_build_domain_deny_rules()`'s own -- see `_fetch_eligible_devices()`'s
+    docstring for why this exists. Defaults to `None`, which fetches it
+    fresh (unchanged behavior for any direct caller that doesn't pass
+    one in).
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -444,16 +496,8 @@ def build_category_deny_rules(
     if not categories:
         return []
 
-    devices = conn.execute(
-        """
-        SELECT DISTINCT d.id, d.user_id, d.group_id, d.ignored, d.quarantined_at,
-               d.is_authenticated, d.bump_enabled, d.bypass_login, b.ipv4_address
-        FROM devices d
-        JOIN device_bindings b ON b.device_id = d.id AND b.active = 1
-        ORDER BY b.ipv4_address
-        """
-    ).fetchall()
-    eligible_devices = [row for row in devices if classify_device(row) != PolicyClass.BYPASS]
+    if eligible_devices is None:
+        eligible_devices = _fetch_eligible_devices(conn)
     if not eligible_devices:
         return []
 
@@ -637,11 +681,18 @@ def sync_once(
     `build_anti_doh_rules()`'s fixed baseline is always included, so the
     minimum healthy count is `len(build_anti_doh_rules())`, not 0 --
     see that function's own docstring before assuming an empty managed
-    block still means "nothing to deny.\""""
+    block still means "nothing to deny.\"
+
+    Fetches the eligible-device list ONCE (2026-09-02, a real
+    efficiency gap found by code review) and shares it across all three
+    device-aware builders below, instead of each independently
+    re-querying and re-classifying the full device list -- see
+    `_fetch_eligible_devices()`'s own docstring for the before/after."""
+    eligible_devices = _fetch_eligible_devices(conn)
     managed = (
-        build_rules(conn, block_page_ip)
-        + build_splice_deny_rules(conn, block_page_ip)
-        + build_category_deny_rules(conn, block_page_ip=block_page_ip)
+        build_rules(conn, block_page_ip, eligible_devices=eligible_devices)
+        + build_splice_deny_rules(conn, block_page_ip, eligible_devices=eligible_devices)
+        + build_category_deny_rules(conn, block_page_ip=block_page_ip, eligible_devices=eligible_devices)
         + build_anti_doh_rules()
     )
     current = adguard_client.get_custom_rules(base_url, username, password)

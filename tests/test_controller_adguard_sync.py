@@ -333,6 +333,52 @@ def test_sync_once_pushes_both_bump_and_splice_rule_sets(conn, monkeypatch):
     assert any("use-application-dns" in r for r in managed)
 
 
+def test_sync_once_fetches_the_device_list_exactly_once(conn, monkeypatch):
+    """Regression test for a real efficiency gap (fixed 2026-09-02):
+    build_rules()/build_splice_deny_rules()/build_category_deny_rules()
+    each independently re-ran the identical devices JOIN device_bindings
+    query and re-classified every row, so one sync_once() cycle issued
+    that query 3 times instead of once. Confirms _fetch_eligible_devices()
+    -- the extracted, now-shared query -- is called exactly once per
+    cycle regardless of how many of the three builders end up needing
+    the result."""
+    _insert_domain(conn, "crunchyroll\\.com", mode="bump")
+    _insert_domain(conn, "example\\.com", mode="splice", is_global=False)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=False)
+
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_custom_rules", lambda *a, **k: [])
+    monkeypatch.setattr(adguard_sync.adguard_client, "get_safesearch_status", lambda *a, **k: {"enabled": False})
+    monkeypatch.setattr(adguard_sync.adguard_client, "set_custom_rules", lambda *a, **k: None)
+
+    calls = []
+    real_fetch = adguard_sync._fetch_eligible_devices
+
+    def counting_fetch(conn_arg):
+        calls.append(1)
+        return real_fetch(conn_arg)
+
+    monkeypatch.setattr(adguard_sync, "_fetch_eligible_devices", counting_fetch)
+
+    adguard_sync.sync_once(conn, "http://127.0.0.1:3000", "admin", "x")
+
+    assert len(calls) == 1, f"expected _fetch_eligible_devices() called exactly once per cycle, got {len(calls)}"
+
+
+def test_build_rules_and_build_splice_deny_rules_accept_a_shared_eligible_devices_list(conn):
+    """Confirms passing a pre-fetched eligible_devices list produces the
+    identical result to letting each function fetch its own -- the
+    actual property sync_once()'s sharing depends on."""
+    _insert_domain(conn, "crunchyroll\\.com", mode="bump")
+    _insert_domain(conn, "example\\.com", mode="splice", is_global=False)
+    _insert_device_with_binding(conn, "aa:bb:cc:dd:ee:01", "192.168.1.10", bump_enabled=False)
+
+    shared = adguard_sync._fetch_eligible_devices(conn)
+
+    assert adguard_sync.build_rules(conn, eligible_devices=shared) == adguard_sync.build_rules(conn)
+    assert adguard_sync.build_splice_deny_rules(conn, eligible_devices=shared) == adguard_sync.build_splice_deny_rules(conn)
+    assert adguard_sync.build_category_deny_rules(conn, eligible_devices=shared) == adguard_sync.build_category_deny_rules(conn)
+
+
 # ============================================================
 # _strip_managed_block
 # ============================================================
