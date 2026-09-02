@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import ipaddress
 import re
+import signal
 import sqlite3
 
 
@@ -37,6 +38,73 @@ def _path_regex(pattern: str) -> re.Pattern[str] | None:
         return None
 
 
+class _RegexTimedOut(Exception):
+    """Raised internally by _search_with_timeout()'s own alarm handler --
+    never escapes that function."""
+
+
+_PATH_MATCH_TIMEOUT_SECONDS = 0.5
+
+
+def _search_with_timeout(rx: re.Pattern[str], text: str) -> re.Match[str] | None:
+    """Same as rx.search(text), but bounded -- added 2026-09-02 after
+    code review flagged that domain_paths patterns are admin-supplied
+    and dashboard.py's own validation only confirms re.compile()
+    succeeds, never rejecting a catastrophic-backtracking shape (e.g. a
+    pattern with nested/overlapping quantifiers). Python's stdlib `re`
+    has no linear-time guarantee the way RE2 does, and this project's
+    common/ modules are deliberately stdlib-only (see common/auth.py's
+    own docstring on why -- the proxy container must never need pip),
+    so a third-party guaranteed-linear engine isn't an option here.
+
+    The actual attacker-facing risk: proxy/authz_helper.py's decide()
+    (the only real caller, via path_allowed() below) runs this against
+    the CLIENT-controlled request path on every bump-mode HTTP request,
+    inside one of Squid's pooled `children-max=20` helper subprocesses
+    -- a hung match there stalls that one child indefinitely, and
+    enough hung children measurably degrade every other in-flight
+    bump-mode decision.
+
+    Uses SIGALRM (Unix only, and only callable from the interpreter's
+    main thread) since that's the actual context this runs in --
+    authz_helper.py is a single-threaded subprocess reading stdin in a
+    loop, never multi-threaded. Falls back to an UNGUARDED search
+    (never silently skipping the match, just not time-bounding it) on
+    Windows (SIGALRM doesn't exist there -- fine, since proxy/ only
+    ever actually runs on Linux, see AGENTS.md) or if this is ever
+    called from a non-main thread (`signal.signal()` raises ValueError
+    there) -- e.g. a future test or caller from dashboard.py's
+    multi-threaded waitress workers. A timeout denies (fails closed),
+    consistent with this project's fail-closed convention (see
+    docs/architecture/overview.md's "everything is fail-closed by
+    convention" section) rather than treating an unmatchable-in-time
+    pattern as an allow.
+    """
+    if not hasattr(signal, "SIGALRM"):
+        return rx.search(text)
+
+    def _on_alarm(signum, frame):
+        raise _RegexTimedOut()
+
+    try:
+        previous_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    except ValueError:
+        # Not the main thread -- signal handlers can't be installed
+        # here at all. Search unguarded rather than raise or silently
+        # skip the check.
+        return rx.search(text)
+
+    try:
+        signal.setitimer(signal.ITIMER_REAL, _PATH_MATCH_TIMEOUT_SECONDS)
+        try:
+            return rx.search(text)
+        except _RegexTimedOut:
+            return None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def find_domain(conn: sqlite3.Connection, hostname: str) -> sqlite3.Row | None:
     """Return the first domains row whose pattern matches hostname, or None.
 
@@ -48,7 +116,14 @@ def find_domain(conn: sqlite3.Connection, hostname: str) -> sqlite3.Row | None:
         return None
     for row in conn.execute("SELECT * FROM domains ORDER BY id"):
         rx = _domain_regex(row["pattern"])
-        if rx is not None and rx.search(hostname):
+        # Same _search_with_timeout() guard as path_allowed() below, for
+        # consistency -- the practical exposure here is smaller (a
+        # hostname is DNS-length-bounded at 253 chars, unlike an
+        # arbitrary request path), but the underlying stdlib-`re`
+        # backtracking risk from an admin-supplied pattern is identical
+        # in kind, so this is guarded the same way rather than leaving
+        # one of the two domain-matching call sites unprotected.
+        if rx is not None and _search_with_timeout(rx, hostname):
             return row
     return None
 
@@ -59,7 +134,7 @@ def path_allowed(conn: sqlite3.Connection, domain_id: int, path: str) -> bool:
         "SELECT pattern FROM domain_paths WHERE domain_id = ?", (domain_id,)
     ):
         rx = _path_regex(row["pattern"])
-        if rx is not None and rx.search(path):
+        if rx is not None and _search_with_timeout(rx, path):
             return True
     return False
 

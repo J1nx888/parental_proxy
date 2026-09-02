@@ -1,6 +1,11 @@
 """common/matching.py: domain suffix matching, path matching, LAN check."""
 from __future__ import annotations
 
+import signal
+import time
+
+import pytest
+
 import db
 import matching
 
@@ -115,6 +120,48 @@ def test_path_allowed_skips_invalid_regex_pattern(conn):
     )
     conn.commit()
     assert matching.path_allowed(conn, domain["id"], "/anything") is False
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGALRM"), reason="SIGALRM timeout guard is Unix-only")
+def test_path_allowed_does_not_hang_on_catastrophic_backtracking(conn):
+    """Regression test for a real ReDoS risk (fixed 2026-09-02): an
+    admin-supplied domain_paths pattern is matched via re.search()
+    against the client-controlled request path with no backtracking-
+    safety check -- dashboard.py's own validation only confirms
+    re.compile() succeeds. A classic catastrophic-backtracking pattern
+    ((a+)+$) against a long run of a's with no terminating match takes
+    exponential time under Python's stdlib `re`; this confirms
+    path_allowed() now completes quickly (via _search_with_timeout's
+    SIGALRM guard) instead of hanging the calling process."""
+    domain = _add_domain(conn, r"example\.com", mode="bump")
+    conn.execute(
+        "INSERT INTO domain_paths (domain_id, pattern) VALUES (?, ?)", (domain["id"], r"(a+)+$")
+    )
+    conn.commit()
+    evil_path = "/" + "a" * 40 + "!"  # matches nothing -- forces full backtracking
+
+    start = time.monotonic()
+    result = matching.path_allowed(conn, domain["id"], evil_path)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0, f"path_allowed() took {elapsed:.2f}s against a catastrophic pattern -- the timeout guard did not fire"
+    assert result is False
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGALRM"), reason="SIGALRM timeout guard is Unix-only")
+def test_find_domain_does_not_hang_on_catastrophic_backtracking(conn):
+    """Same guard, same reasoning, for the other regex-matching call
+    site (find_domain's hostname match) -- see this file's own
+    docstring on why both are guarded identically."""
+    _add_domain(conn, r"(a+)+$", mode="bump")
+    evil_hostname = "a" * 40 + "!"
+
+    start = time.monotonic()
+    result = matching.find_domain(conn, evil_hostname)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0, f"find_domain() took {elapsed:.2f}s against a catastrophic pattern -- the timeout guard did not fire"
+    assert result is None
 
 
 # ---------------------------------------------------------- ip_in_configured_lan
