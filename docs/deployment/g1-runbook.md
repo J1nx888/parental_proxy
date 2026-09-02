@@ -1,14 +1,20 @@
 # G1 runbook — real-network ARP interception validation
 
-> **This is the one remaining gate before this project can replace Bark
-> Home.** Every other parity gap identified in the 2026-09-01 audit (G3,
-> G5, G6, G7) is resolved — see [Where things stand](#where-things-stand)
-> below. G1 has not been attempted at all yet: everything "verified" so
-> far is a Docker-bridge/veth harness, never the real Netgear Orbi RBR850
-> mesh this household actually runs. This runbook turns the design in
-> [RoadMap.md's "Mesh (Orbi) validation" section](../../RoadMap.md#mesh-orbi-validation--required-before-production-use)
-> into an actual step-by-step procedure, so running it doesn't require
-> re-deriving the plan from scratch.
+> **Result: GO, as of 2026-09-02.** Run against the real Netgear Orbi
+> RBR850 mesh this household actually runs, with real household devices
+> — not just the Docker-bridge/veth harnesses everything was previously
+> verified in. Every applicable matrix row (this mesh has one satellite,
+> so rows 5/6/8 don't apply) was confirmed directly or soundly inferred,
+> no no-go condition triggered on the highest-risk row or anywhere else.
+> Full detailed writeup, including two real incidents hit and fixed
+> along the way (both setup mistakes, not the ARP mechanism itself), is
+> in [RoadMap.md's dated G1 result](../../RoadMap.md#g1-result-go-2026-09-02-real-orbi-mesh-real-household-devices).
+> **Not yet done**: one full back-to-back pass through the matrix
+> without stopping between rows, the soak test (Milestone 10), and a
+> dedicated re-verification of full auto-discovery (disabled during this
+> pass after it caused one of the two incidents). This runbook's
+> procedure below is kept as-is for that follow-up work and for anyone
+> re-deriving the plan later — it's what was actually followed.
 
 ## Why this gates everything
 
@@ -31,7 +37,7 @@ watching.
 
 | Gap | Status |
 |---|---|
-| **G1** — no real-network evidence for the ARP mechanism | ⬜ **Not started — this runbook** |
+| **G1** — no real-network evidence for the ARP mechanism | ✅ **GO (2026-09-02)** — see RoadMap.md's dated result |
 | G2 — YouTube channel/creator filtering | ⬜ Not built (0%), not required for baseline Bark Home parity |
 | G3 — SafeSearch / YouTube Restricted Mode | ✅ Done (Phase 9) |
 | G4 — show approvals are user-only, not user-or-device | ⏸ Explicitly deferred by you to a later phase, not a G1 blocker |
@@ -40,7 +46,9 @@ watching.
 | G7 — cutover data step for existing household devices | ✅ Resolved by policy: start with zero pre-added devices, use the new CSV bulk-import feature once real MACs are known |
 | G8 — Bark's on-device ML content-scanning | Out of scope — an app/device feature, not achievable from a network box |
 
-**G1 is the only thing between here and a real deployment decision.**
+**G1 itself is done.** What's left before a real deployment decision:
+one full back-to-back matrix pass, the soak test (Milestone 10), and a
+dedicated re-verification of full auto-discovery.
 
 ## Before you start
 

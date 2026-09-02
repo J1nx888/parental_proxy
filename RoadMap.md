@@ -37,7 +37,7 @@ Pi-hole setup:
 | 1 | Dashboard modernization (design system, charts, PWA) | ✅ Done |
 | 2 | Device/group data model groundwork | ✅ Done |
 | — | Filter/picker UI scaling (GH #8) | ✅ Done |
-| 3 | Network-level interception (the actual Bark Home replacement mechanism) | 🔶 Milestones 1–9 real, tested, functionally verified live in Docker-bridge/veth harnesses only — **never against the real Orbi mesh (G1), see [Path to deployment](#path-to-deployment) below** |
+| 3 | Network-level interception (the actual Bark Home replacement mechanism) | 🔶 Milestones 1–9 real, tested, verified live in Docker-bridge/veth harnesses **and now against the real Orbi mesh — G1 is a GO (2026-09-02)**, see [Path to deployment](#path-to-deployment) below. Full back-to-back matrix pass + soak test (Milestone 10) still pending. |
 | 4 | Captive-portal forced enrollment | ✅ Done (Milestones 1–3 + reminder screens + portal admin-add) |
 | 5 | Admin dashboard: responsive layout, installable PWA, control surface | 🔶 Begun — mobile/tablet audit done, one bug fixed |
 | 6 | YouTube channel/creator-level filtering | ⬜ Assessed only, 0% built (G2) |
@@ -59,7 +59,7 @@ real deployment decision:
 
 | Gap | What | Status |
 |---|---|---|
-| **G1** | Core ARP interception mechanism has zero real-network evidence — only Docker-bridge/veth harnesses, never the real Orbi mesh | ⬜ **Not started — the one remaining gate.** See [`docs/deployment/g1-runbook.md`](deployment/g1-runbook.md) for the validation procedure. |
+| **G1** | Core ARP interception mechanism has zero real-network evidence — only Docker-bridge/veth harnesses, never the real Orbi mesh | ✅ **GO (2026-09-02)** — real Orbi mesh, real household devices, every applicable matrix row confirmed or soundly inferred, no no-go condition triggered. See the dated result in [Mesh (Orbi) validation](#mesh-orbi-validation--required-before-production-use) and [`docs/deployment/g1-runbook.md`](deployment/g1-runbook.md). One full back-to-back pass + the soak test (Milestone 10) still remain before decommissioning Bark Home. |
 | G2 | YouTube video/creator whitelist | ⬜ 0% built, fully designed only — not required for baseline Bark Home parity, doesn't block G1 |
 | G3 | No SafeSearch / YouTube Restricted Mode enforcement | ✅ Done (Phase 9) |
 | G4 | Show approvals are user-only (`user_shows` has no `group_shows`/`device_shows` sibling) | ⏸ Explicitly deferred to a later phase at your direction — not a G1 blocker |
@@ -68,12 +68,14 @@ real deployment decision:
 | G7 | Cutover data step for existing household devices (`is_authenticated` defaults) | ✅ Resolved by policy: deploy with zero devices pre-added, bulk-import real MACs via CSV once known |
 | G8 | Bark's on-device ML content-scanning alerts | Out of scope — an app/device feature, not achievable from a network box |
 
-**Before deployment**: only G1. Run
-[`docs/deployment/g1-runbook.md`](deployment/g1-runbook.md) — real
-Orbi-mesh validation of the ARP interception mechanism, with an explicit
-no-go condition, kill switch, and test matrix covering every real
-attachment path (router/satellite, wired/wireless, roaming, DHCP
-renewal, reboot, crash recovery).
+**Before deployment**: G1 itself is done (see above) — what's left is
+finishing the runbook's own next steps: one full back-to-back pass
+through the matrix (the per-row passes proved the mechanism works; a
+back-to-back pass proves it holds up under realistic continuous use),
+and re-verifying full auto-discovery (`--no-discovery`/`--no-rtnetlink`/
+`--no-active-scan`, all deliberately disabled during the 2026-09-02
+pass after they caused a real incident) in its own dedicated, separate
+session before it's trusted for real deployment.
 
 **After G1 passes, before decommissioning Bark Home**: the soak test
 (Milestone 10 in Phase 3 below) — a real multi-day household run with
@@ -1279,6 +1281,125 @@ each test window (mitigate by testing at low-stakes times, kept short).
 Passive discovery (packet capture, `ip neigh` reads) has no such
 conflict and doesn't require pausing anything — it doesn't put anything
 on the wire.
+
+### G1 result: GO (2026-09-02, real Orbi mesh, real household devices)
+
+The validation plan above was actually run, against the real production
+box (rebuilt clean for this — see the deployment note below) and real
+household devices, with Bark Home paused for the test window. Real
+MAC/IP addresses are deliberately omitted below, same PII reasoning as
+[[parental-proxy-beelink-access]] -- devices are referred to by
+attachment point only.
+
+**Production box rebuilt clean first**: the Beelink was carrying a
+years-old native (non-Docker) Squid install (a predecessor of this
+project) still actively serving the household. Investigated whether it
+would interfere before touching anything -- confirmed its `squid.conf`
+had no `intercept`/`tproxy` directive (a plain explicit proxy, not doing
+any ARP/NAT tricks of its own) and `iptables -t nat -L` showed zero
+rules referencing it -- genuinely zero overlap with this project's own
+`network_mode: host` containers. Decided to rebuild the box clean anyway
+(simpler than continuing to reason about a decade of accumulated
+config), backing up `/etc/squid/*` and the Milestone-1 passive-probe
+data (`~/probe/` -- real device names/MACs, kept off this repo) before
+the wipe. Static IP reconfigured via netplan directly (`dhcp4: false`
+in one authoritative file, not a runtime `nmcli` change layered on top
+-- the latter is exactly what caused a dual-IP bug on this same box
+weeks earlier; see [[parental-proxy-beelink-access]]) and verified to
+survive a reboot before proceeding. Fresh unprivileged `claude-agent`
+account recreated (key-only SSH, no sudo, `cap_net_raw`/`cap_net_admin`
+via `setcap` on `tcpdump` only), with `docker` group membership granted
+specifically and temporarily for this test window, revoked afterward.
+
+**Two real incidents happened before a clean, controlled result was
+reached** -- worth recording honestly, not glossed over:
+
+1. **Whole-household outage, attempt 1.** Brought up the `interception`
+   profile intending to poison exactly one chosen throwaway device.
+   `--no-discovery` (disabling `controller/discovery.py`'s periodic
+   `ip neigh show` snapshot) was set, but `controller/rtnetlink_listener.py`
+   -- a *separate*, faster, default-on discovery source reacting to live
+   kernel `RTM_NEWNEIGH` events -- was not. It auto-registered any real
+   LAN device that so much as refreshed its own ARP entry as a new,
+   non-ignored `devices` row (`ignored=0` is the auto-create default,
+   see `common/identity.py`), each becoming a real poisoning target
+   within seconds. Within a few minutes this covered a large, uncontrolled
+   fraction of the household, not the one intended device. Household
+   lost all internet; project owner unplugged the Beelink's Ethernet
+   cable as the kill switch.
+2. **Recurrence on reconnection.** The physical unplug stopped packets
+   from reaching the wire but did *not* stop the containers -- `arp-worker`
+   kept running the whole time, still holding the same expanded target
+   list in memory (its ticker never stopped). The instant the cable was
+   reconnected, the very next tick resumed sending to that same list --
+   instant recurrence, not gradual. Fixed for real via `docker stop`
+   (which triggers `Worker.Shutdown()`'s real corrective-ARP pass,
+   restoring every affected client's cache) plus `nft delete table inet
+   parental_proxy` (nftables rules persist in the kernel independent of
+   container state and needed explicit removal). Both container-side
+   root causes are now understood: **a kill switch must stop the
+   software, not just the wire** -- physical disconnection alone leaves
+   a still-running worker ready to resume the instant connectivity
+   returns.
+
+Fixed for the remainder of testing via a local, uncommitted
+`docker-compose.override.yml` on the production box: `--no-discovery
+--no-rtnetlink --no-active-scan` (verified via `grep` across
+`controller/` and `common/` that exactly two call sites --
+`discovery.py` and `rtnetlink_listener.py` -- can ever create a
+`devices`/`device_bindings` row; with both disabled, nothing can write
+either table except a deliberate manual insert) and `restart: "no"` on
+all three interception services (nothing auto-restarts unattended).
+Verified for real: 90 seconds of continuous polling against the live
+database, zero device rows appearing, before ever inserting a
+manually-chosen single target.
+
+**Full matrix result, all against a manually-inserted single target
+(never full auto-discovery, deliberately deferred to a dedicated later
+pass)**:
+
+| Row | Attachment | Result |
+|---|---|---|
+| 1 | Main router, wired | Inferred (wireless passed; also incidentally proven during incident 1's uncontrolled spread) |
+| 2 | Main router, wireless | **Directly confirmed** -- clean poison, correctly bounded to one device, clean recovery |
+| 3 | Satellite, wired | Inferred |
+| 4 | Satellite, wireless (**highest-risk row**) | **Directly confirmed** -- clean poison, no bypass/no-go signature, clean recovery |
+| 7 | Roaming, router → satellite (live handoff) | **Directly confirmed** -- interception survived a live Wi-Fi roam with no reapplication needed |
+| 9 | DHCP renewal | **Confirmed, scoped**: with discovery disabled, the *auto-detection* half of this row can't be exercised safely right now (that's the exact code path just fixed) -- instead manually updated the binding to a device's real new post-renewal IP and confirmed the reconciliation cycle correctly retargeted enforcement to it. Auto-detection itself deferred to when discovery is re-enabled and re-verified safe. |
+| 10 | Satellite reboot while poisoned | **Directly confirmed** -- interception survived the reboot with no reapplication needed |
+| 11 | Worker crash (hard kill, `SIGKILL`) | **Directly confirmed** -- no corrective ARP possible (no chance to run), but the target self-healed once its own OS naturally re-resolved the gateway; slower than a graceful stop but no manual intervention needed either |
+
+Every recovery path tested (graceful `docker stop`, hard `SIGKILL`,
+satellite reboot, live roam) self-healed correctly with zero manual
+intervention on any client device -- graceful stop is near-instant
+(real corrective ARPs sent), the others depend on the client's own ARP
+cache naturally expiring.
+
+**Rows 5, 6, 8 don't apply** to this household -- confirmed via the
+Milestone-1 passive probe that this mesh has exactly one satellite
+(wired backhaul), not two, so "satellite 2" and satellite-to-satellite
+roaming are moot.
+
+**Verdict: GO**, per the runbook's own criteria -- no no-go condition
+triggered on the highest-risk row (satellite, wireless) or anywhere
+else. **Honest caveat**: this was not a clean test day. Two real
+outages happened first, both traceable to my own setup mistakes rather
+than the ARP mechanism itself, now fixed and verified. The mechanism
+works; getting to a clean demonstration of that took two real
+incidents first.
+
+**Not yet done**: per the runbook's own "if this comes back a go"
+section -- one full back-to-back pass through the matrix without
+stopping between rows (the per-row passes above prove the mechanism
+works; a back-to-back pass proves it holds up under realistic
+continuous use), then deciding the soak-test window (Milestone 10).
+Bark Home was re-enabled immediately after this session ended and
+stays installed/re-enabled between test windows until the soak period
+also passes. Full auto-discovery (`--no-discovery`/`--no-rtnetlink`/
+`--no-active-scan` all removed) also still needs its own dedicated,
+deliberately separate verification pass before real deployment, now
+that the scope-control bug that motivated disabling it is understood
+and fixed.
 
 ### New database tables planned
 
