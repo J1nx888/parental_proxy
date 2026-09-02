@@ -377,7 +377,18 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
             self._send_html(200, _render("Incorrect username or password.", groups=_fetch_groups(conn)))
             return
 
-        _LOGIN_LIMITER.clear(client_ip)
+        # Deliberately NOT clearing _LOGIN_LIMITER here (fixed 2026-09-02,
+        # a real bug found by code review): this limiter is shared with
+        # _handle_admin_action() below on purpose, but that means a
+        # success on ONE surface used to wipe out failures recorded
+        # against the OTHER -- a household member's normal kid login
+        # succeeding from a shared/NAT'd IP would silently hand an
+        # in-progress admin-password guesser a fresh 5-attempt budget,
+        # exactly defeating the "shared, more conservative budget"
+        # reasoning this sharing exists for in the first place. Recorded
+        # failures now simply age out of the window on their own
+        # (_WINDOW_SECONDS) rather than being reset by an unrelated
+        # credential domain's success.
 
         # Grants DNS-tier access ONLY -- never bump_enabled, matching
         # Phase 4's design sketch exactly (RoadMap.md). COALESCE so a
@@ -435,7 +446,11 @@ class _CaptivePortalHandler(BaseHTTPRequestHandler):
             )
             return
 
-        _LOGIN_LIMITER.clear(client_ip)
+        # See the matching comment in _handle_login() above -- this
+        # limiter is deliberately shared between both forms, so clearing
+        # it here on an admin success would also wipe out failures
+        # recorded against the kid-login form (and vice versa), reopening
+        # the exact cross-surface reset this fix closes.
 
         device = resolve_device(conn, client_ip)
         if device is None:

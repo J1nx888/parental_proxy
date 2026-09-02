@@ -367,7 +367,7 @@ def test_successful_kid_login_logs_no_system_event(server, conn):
     assert count == 0, "system_events is deliberately not a firehose -- a normal successful login isn't an event"
 
 
-def test_a_successful_login_clears_the_failure_count(server, conn):
+def test_one_attempt_below_the_limit_still_succeeds_with_the_right_password(server, conn):
     identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
     _add_user(conn, "kid1", "correcthorse")
 
@@ -376,7 +376,39 @@ def test_a_successful_login_clears_the_failure_count(server, conn):
     status, body = _post(server, "kid1", "correcthorse")
     assert "signed in" in body.lower(), "one attempt below the limit must still succeed with the right password"
 
-    assert captive_portal_server._LOGIN_LIMITER.is_limited(IP_1) is False
+
+def test_a_success_does_not_reset_the_shared_failure_count(server, conn):
+    """Regression test for a real bug (fixed 2026-09-02): _LOGIN_LIMITER
+    is deliberately shared between the kid-login form and the portal
+    admin-action form (see _handle_admin_action's own comment), but a
+    prior version cleared it on EITHER surface's success -- so a normal
+    household member's kid login succeeding from a shared/NAT'd IP
+    would silently hand an in-progress admin-password guesser a fresh
+    budget. Neither surface may clear the other's (or even its own)
+    accumulated failures on success anymore; failures only age out of
+    the window on their own."""
+    identity.record_binding(conn, MAC_A, IP_1, source="rtnetlink")
+    _add_user(conn, "kid1", "correcthorse")
+    _set_admin_credentials(conn)
+
+    for _ in range(captive_portal_server._MAX_ATTEMPTS - 1):  # 4 wrong admin guesses
+        _post_admin(server, "admin", "wrongpassword", "bypass")
+
+    # A normal household member logs in successfully from the same IP.
+    status, body = _post(server, "kid1", "correcthorse")
+    assert "signed in" in body.lower()
+
+    # One more wrong admin guess is the 5th recorded failure overall --
+    # if the kid's success above had wrongly reset the counter, this
+    # would still be comfortably under the limit.
+    _post_admin(server, "admin", "wrongpassword", "bypass")
+
+    # So the NEXT admin attempt must be rate-limited, even with the
+    # correct password this time.
+    status, body = _post_admin(server, "admin", "adminpw", "bypass")
+    assert "too many attempts" in body.lower()
+    row = conn.execute("SELECT bypass_login FROM devices WHERE mac_address = ?", (MAC_A,)).fetchone()
+    assert row["bypass_login"] == 0
 
 
 # ============================================================
