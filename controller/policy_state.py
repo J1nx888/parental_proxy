@@ -82,7 +82,26 @@ def compute_desired_policy(
         if policy_class != PolicyClass.BYPASS and is_full_lockout_active(conn, row, now):
             policy_class = PolicyClass.QUARANTINE
         policy[to_set_name(policy_class)].append(row["ipv4_address"])
-        if bump_eligible(row):
+        # Fixed 2026-09-02, a real bug found by code review:
+        # bump_eligible(row) re-derives classify_device(row) internally
+        # from the RAW row, blind to the QUARANTINE overlay just applied
+        # above -- so a bump-enabled, otherwise-AUTHENTICATED device
+        # caught in an active lockout_all schedule used to land in BOTH
+        # the quarantine set AND the bump set for this cycle, violating
+        # bump_eligible()'s own documented invariant ("never true ...
+        # for BYPASS, QUARANTINE, or PREAUTH"). phase3/nftables-manager's
+        # resolveBump() does drop the conflicting membership before it
+        # reaches the kernel (so this was never an actual filter
+        # bypass), but it logged a policy-conflict warning every cycle
+        # for as long as the window stayed open, and any FUTURE overlay
+        # added the same way would hit the identical trap. Gating on the
+        # post-overlay policy_class here, not just the row-derived
+        # signal bump_eligible() computes internally, is the fix -- in
+        # the normal (no-overlay) case this is a no-op, since
+        # bump_eligible() already requires classify_device(row) ==
+        # AUTHENTICATED internally, which is exactly what policy_class
+        # already equals whenever no overlay fired.
+        if policy_class == PolicyClass.AUTHENTICATED and bump_eligible(row):
             policy[_BUMP_SET_NAME].append(row["ipv4_address"])
 
     for ips in policy.values():

@@ -217,6 +217,29 @@ def test_manually_quarantined_device_is_unaffected_by_schedule_state_either_way(
     assert policy["quarantine"] == ["192.168.1.23"]
 
 
+def test_bump_enabled_device_under_an_active_lockout_is_excluded_from_bump(conn):
+    """Regression test for a real bug (fixed 2026-09-02): the bump_v4
+    membership check used to be computed from the device's raw
+    classify_device() result, blind to the QUARANTINE overlay this
+    function applies for an active lockout_all schedule -- so a
+    bump-enabled, otherwise-authenticated device caught in a bedtime
+    lockout used to land in BOTH the quarantine set AND the bump set at
+    once, violating bump_eligible()'s own documented invariant."""
+    _add_lockout_schedule(conn)
+    _add_device(conn, "aa:bb:cc:dd:ee:06", is_authenticated=1, bump_enabled=1)
+    _bind(conn, "aa:bb:cc:dd:ee:06", "192.168.1.26")
+
+    policy = compute_desired_policy(conn, now=_DURING_LOCKOUT)
+    assert policy["quarantine"] == ["192.168.1.26"]
+    assert policy["bump"] == [], "a quarantined-by-schedule device must never also be in the bump set"
+
+    # Outside the lockout window, the exact same device is bump-eligible
+    # again -- confirms this fix didn't just disable bump for it outright.
+    policy = compute_desired_policy(conn, now=_OUTSIDE_LOCKOUT)
+    assert policy["authenticated"] == ["192.168.1.26"]
+    assert policy["bump"] == ["192.168.1.26"]
+
+
 def test_non_lockout_schedule_never_triggers_the_quarantine_overlay(conn):
     conn.execute(
         "INSERT INTO schedules (name, days_of_week, start_time, end_time, time_zone, "
