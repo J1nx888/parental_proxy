@@ -1665,10 +1665,21 @@ def delete_path():
     path_id = request.form.get("path_id", "")
     conn = get_db()
     row = conn.execute("SELECT domain_id FROM domain_paths WHERE id = ?", (path_id,)).fetchone()
+    if row is None:
+        # Fixed 2026-09-02, a real bug found by code review: this used
+        # to fall through to flash_redirect("domain_detail", ...,
+        # domain_id=None) below, and domain_detail's route requires an
+        # <int:domain_id> -- url_for() raises an unhandled
+        # werkzeug.routing.BuildError for a None value there (confirmed
+        # by reproducing it directly), turning a harmless double-click
+        # or stale-page click into an unhandled 500. Every sibling
+        # delete route (delete_category_domain, delete_category_override)
+        # already redirects to the LIST page with a "no longer exists"
+        # flash for the identical situation -- matching that here.
+        return flash_redirect("domains", "That path no longer exists.", error=True)
     conn.execute("DELETE FROM domain_paths WHERE id = ?", (path_id,))
     conn.commit()
-    domain_id = row["domain_id"] if row else None
-    return flash_redirect("domain_detail", "Path removed.", domain_id=domain_id)
+    return flash_redirect("domain_detail", "Path removed.", domain_id=row["domain_id"])
 
 
 # ==========================================================

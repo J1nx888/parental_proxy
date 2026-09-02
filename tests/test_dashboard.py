@@ -317,6 +317,21 @@ def test_add_path_and_delete_path(client, db_conn):
     assert db_conn.execute("SELECT * FROM domain_paths WHERE id = ?", (path_row["id"],)).fetchone() is None
 
 
+def test_delete_path_on_an_already_deleted_row_does_not_500(client, db_conn):
+    """Regression test for a real bug (fixed 2026-09-02): deleting a
+    path_id with no matching row used to fall through to
+    flash_redirect("domain_detail", domain_id=None), and Flask's
+    url_for() raises an unhandled BuildError for a None value against a
+    route requiring <int:domain_id> -- reproduced directly before this
+    fix. A double-clicked Remove button, or a stale Domain-detail page
+    where the path was already removed elsewhere, must get the same
+    graceful "no longer exists" flash every sibling delete route gives,
+    not a 500."""
+    resp = client.post("/domains/paths/delete", data={"path_id": 999999}, headers=_auth_header())
+    assert resp.status_code < 500
+    assert resp.status_code in (302, 303)
+
+
 # ============================================================
 # REPORT / APPROVE
 # ============================================================
